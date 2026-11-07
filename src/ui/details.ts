@@ -1,5 +1,5 @@
 import type { AppState } from "../state/store";
-import type { FileView, PeerView, TorrentSnapshot, TorrentState } from "../api/types";
+import type { FileView, TorrentSnapshot, TorrentState } from "../api/types";
 import {
   basename,
   fmtBytes,
