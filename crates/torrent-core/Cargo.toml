@@ -1,0 +1,24 @@
+[package]
+name = "torrent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Движок торрент-клиента Torrenta: bencode, метаинформация, трекеры, peer wire protocol, движок загрузки"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip"] }
+sha1 = "0.10"
+rand = "0.8"
+percent-encoding = "2"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+serde_json = "1"
+# Нужен E2E-тестам: считают SHA-1 кусков и info-hash тестового торрента.
+sha1 = "0.10"

@@ -1,0 +1,88 @@
+name: Сборка
+
+# Проверка и сборка проекта на Windows: типы и контраст интерфейса,
+# тесты ядра, релизный бинарник. Установщики собираются локально
+# через build-windows.ps1 — подписи кода в CI нет.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Сборка (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Получение исходников
+        uses: actions/checkout@v4
+
+      - name: Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Rust (стабильный, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Кэш Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Версии инструментов
+        shell: pwsh
+        run: |
+          rustc -V
+          cargo -V
+          rustup show
+          node -v
+          npm -v
+
+      - name: Справка скрипта сборки
+        shell: pwsh
+        run: .\build-windows.ps1 -Help
+
+      - name: Зависимости фронтенда
+        run: npm ci
+
+      - name: Контраст палитры
+        run: npm run check:contrast
+
+      # Порядок важен: dist (frontendDist) нужен на этапе компиляции Rust,
+      # поэтому интерфейс собирается до cargo test и cargo build.
+      - name: Сборка интерфейса
+        run: npm run build
+
+      - name: Тесты
+        run: cargo test --workspace
+
+      - name: Релизная сборка
+        run: cargo build --release
+
+      - name: Артефакт torrenta.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrenta-windows-x64
+          path: target/release/torrenta.exe
+          if-no-files-found: error
+          retention-days: 14

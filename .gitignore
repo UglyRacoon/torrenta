@@ -1,0 +1,33 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+*.pdb
+
+# Node / фронтенд
+node_modules/
+/dist
+/dist-ssr
+*.local
+npm-debug.log*
+.vite/
+
+# Tauri
+/src-tauri/gen
+/src-tauri/target
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Артефакты и данные
+*.torrent.rejected
+/downloads
+*.log
+.env
+.env.*
+!.env.example

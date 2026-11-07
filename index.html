@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0F1319" />
+    <meta
+      name="description"
+      content="Torrenta — лёгкий торрент-клиент на Rust и Tauri: загрузка .torrent и magnet-ссылок, статистика в реальном времени."
+    />
+    <title>Torrenta</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      // Тема применяется до первой отрисовки, чтобы не мигало при загрузке.
+      (function () {
+        try {
+          var saved = localStorage.getItem("torrenta:theme");
+          if (saved === "light" || saved === "dark") {
+            document.documentElement.dataset.theme = saved;
+            if (saved === "light") {
+              var meta = document.querySelector('meta[name="theme-color"]');
+              if (meta) meta.setAttribute("content", "#F2F5F9");
+            }
+          }
+        } catch (_) {
+          /* localStorage может быть недоступен — остаёмся на тёмной теме */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside id="sidebar" class="sidebar" aria-label="Навигация по торрентам"></aside>
+      <main id="main" class="main" aria-label="Список торрентов">
+        <section id="list" class="list-region" aria-label="Торренты"></section>
+      </main>
+      <aside id="details" class="details" aria-label="Детали торрента"></aside>
+      <footer id="statusbar" class="statusbar"></footer>
+    </div>
+
+    <div id="toasts" class="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+    <div id="modal-root" class="modal-root"></div>
+
+    <div id="drop-overlay" class="drop-overlay" hidden>
+      <div class="drop-overlay__card">
+        <div class="drop-overlay__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v11" />
+            <path d="m8 10 4 4 4-4" />
+            <path d="M4.5 15.5c0 3 3.4 4.5 7.5 4.5s7.5-1.5 7.5-4.5" />
+          </svg>
+        </div>
+        <p class="drop-overlay__title">Отпустите файл, чтобы добавить торрент</p>
+        <p class="drop-overlay__hint">Поддерживаются файлы <span class="mono">.torrent</span></p>
+      </div>
+    </div>
+
+    <noscript>
+      <p style="padding: 24px; color: #e8eef6; font-family: system-ui, sans-serif">
+        Для работы Torrenta нужен JavaScript. Включите его в настройках WebView2.
+      </p>
+    </noscript>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

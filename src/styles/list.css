@@ -1,0 +1,485 @@
+/* --- Тулбар ------------------------------------------------------------ */
+
+.toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 20px 13px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.toolbar__titles {
+  min-width: 0;
+}
+
+.toolbar__title {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar__sub {
+  margin-top: 2px;
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar__tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 236px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-faint);
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.search:focus-within {
+  border-color: var(--color-focus);
+  outline: 1px solid var(--color-focus);
+  outline-offset: 0;
+}
+
+.search__icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.search__input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  background: none;
+  color: var(--color-text);
+  font-size: 12.5px;
+}
+
+.search__input::placeholder {
+  color: var(--color-text-faint);
+}
+
+.search__input:focus-visible {
+  outline: none;
+}
+
+.search__input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.search__clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: var(--radius-xs);
+  color: var(--color-text-faint);
+}
+
+.search__clear:hover {
+  background: var(--color-surface-3);
+  color: var(--color-text);
+}
+
+.sort {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding-left: 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  cursor: pointer;
+}
+
+.sort:hover {
+  border-color: var(--color-text-faint);
+}
+
+.sort__label {
+  color: var(--color-text-faint);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.sort__select {
+  height: 100%;
+  padding: 0 24px 0 6px;
+  border: 0;
+  background: none;
+  color: var(--color-text);
+  font-size: 12.5px;
+  appearance: none;
+  cursor: pointer;
+}
+
+.sort__select:focus-visible {
+  outline: none;
+}
+
+.sort:focus-within {
+  border-color: var(--color-focus);
+  outline: 1px solid var(--color-focus);
+}
+
+.sort__chevron {
+  position: absolute;
+  right: 7px;
+  display: inline-flex;
+  color: var(--color-text-faint);
+  pointer-events: none;
+}
+
+.sort__select option {
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+/* --- Список ------------------------------------------------------------ */
+
+.list-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+}
+
+.list {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0 12px;
+}
+
+.list:focus-visible {
+  outline: none;
+}
+
+/* --- Строка торрента --------------------------------------------------- */
+
+.torrent {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  padding: 9px 20px 10px;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid var(--color-border);
+  cursor: default;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.torrent:hover {
+  background: var(--color-bg-elevated);
+}
+
+.torrent[aria-selected="true"] {
+  background: var(--color-surface);
+  border-left-color: var(--color-accent);
+}
+
+.torrent:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+}
+
+.torrent__main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name name"
+    "meta meta"
+    "progress progress";
+  row-gap: 3px;
+  min-width: 0;
+}
+
+.torrent__name {
+  grid-area: name;
+  font-size: 13px;
+  font-weight: 550;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.torrent[aria-selected="true"] .torrent__name {
+  color: var(--color-text);
+}
+
+.torrent__meta {
+  grid-area: meta;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+}
+
+.torrent__meta-main,
+.torrent__meta-status {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.torrent__meta-main {
+  flex: none;
+}
+
+.torrent__meta-status {
+  flex: 1;
+}
+
+.torrent__meta-status:empty {
+  display: none;
+}
+
+.torrent[data-state="error"] .torrent__meta-status {
+  color: var(--color-danger);
+}
+
+.torrent[data-state="seeding"] .torrent__meta-status,
+.torrent[data-state="completed"] .torrent__meta-status {
+  color: var(--color-success);
+}
+
+.torrent__progress {
+  grid-area: progress;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 3px;
+}
+
+.torrent__bar {
+  position: relative;
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--color-track);
+  overflow: hidden;
+}
+
+.torrent__bar-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--color-bar-from), var(--color-bar-to));
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform var(--dur) var(--ease);
+}
+
+.torrent[data-state="paused"] .torrent__bar-fill {
+  background: var(--color-text-faint);
+}
+
+.torrent[data-state="error"] .torrent__bar-fill {
+  background: var(--color-danger);
+}
+
+.torrent[data-state="metadata"] .torrent__bar {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--color-border) 0 4px,
+    transparent 4px 8px
+  );
+}
+
+.torrent[data-state="metadata"] .torrent__bar-fill {
+  background: var(--color-info);
+  opacity: 0.55;
+}
+
+.torrent__percent {
+  flex: none;
+  width: 42px;
+  color: var(--color-text-muted);
+  font-size: 11.5px;
+  font-weight: 550;
+  text-align: right;
+}
+
+/* --- Числовые колонки -------------------------------------------------- */
+
+.torrent__stats {
+  display: grid;
+  grid-template-columns: repeat(3, 74px);
+  gap: 10px;
+}
+
+.torrent__stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  text-align: right;
+}
+
+.torrent__stat-key {
+  color: var(--color-text-faint);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.torrent__stat-value {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.torrent[data-state="downloading"] .torrent__stat:first-child .torrent__stat-value,
+.torrent[data-state="seeding"] .torrent__stat:nth-child(2) .torrent__stat-value {
+  color: var(--color-text);
+}
+
+/* --- Действия ---------------------------------------------------------- */
+
+.torrent__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+.torrent:hover .torrent__actions,
+.torrent:focus-within .torrent__actions,
+.torrent[aria-selected="true"] .torrent__actions {
+  opacity: 1;
+}
+
+.torrent__pause:hover {
+  color: var(--color-accent);
+}
+
+/* --- Пустые состояния -------------------------------------------------- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 40px 24px 64px;
+  text-align: center;
+}
+
+.empty__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  margin-bottom: 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-faint);
+}
+
+.empty__title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.empty__text {
+  max-width: 380px;
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+}
+
+.empty__hint {
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+}
+
+.empty__action {
+  margin-top: 10px;
+}
+
+/* --- Адаптив ----------------------------------------------------------- */
+
+@media (max-width: 1180px) {
+  .torrent__stats {
+    grid-template-columns: repeat(2, 74px);
+  }
+
+  .torrent__stat:nth-child(3) {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .search {
+    width: 180px;
+  }
+
+  .toolbar {
+    padding: 14px 16px 12px;
+  }
+
+  .torrent {
+    padding-inline: 16px;
+  }
+}
+
+@media (max-width: 780px) {
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .toolbar__tools {
+    flex-wrap: wrap;
+  }
+
+  .search {
+    flex: 1;
+    width: auto;
+  }
+
+  .sort {
+    order: 3;
+  }
+
+  .torrent {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .torrent__stats {
+    display: none;
+  }
+}

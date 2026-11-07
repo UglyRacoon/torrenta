@@ -1,0 +1,453 @@
+/* --- Модальные окна ---------------------------------------------------- */
+
+.modal-root {
+  position: relative;
+  z-index: 60;
+}
+
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 20px;
+  background: color-mix(in srgb, var(--color-overlay) 62%, transparent);
+  backdrop-filter: blur(2px);
+  animation: scrim-in var(--dur) var(--ease);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 100%);
+  max-height: 100%;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-floating);
+  animation: modal-in var(--dur) var(--ease);
+  overflow: hidden;
+}
+
+.modal--settings {
+  width: min(600px, 100%);
+}
+
+.modal--confirm {
+  width: min(430px, 100%);
+}
+
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.modal__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px 12px 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.modal__title {
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.modal__close {
+  flex: none;
+}
+
+.modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 18px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.modal__foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
+}
+
+.modal__hint {
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.modal__hint kbd,
+.empty__hint kbd {
+  padding: 1px 4px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.modal__text {
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.modal__text-name {
+  color: var(--color-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.modal__divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--color-text-faint);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.modal__divider::before,
+.modal__divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+
+/* --- Форма добавления -------------------------------------------------- */
+
+.add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 22px 18px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.dropzone:hover {
+  border-color: var(--color-text-faint);
+  background: var(--color-surface-2);
+}
+
+.dropzone.is-over {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.dropzone__icon {
+  display: inline-flex;
+  margin-bottom: 4px;
+  color: var(--color-accent);
+}
+
+.dropzone__title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dropzone__hint {
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+}
+
+.dropzone__button {
+  margin-top: 10px;
+}
+
+/* --- Настройки --------------------------------------------------------- */
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* --- Блокировка интерфейса во время операции --------------------------- */
+
+html.is-busy {
+  cursor: progress;
+}
+
+.modal.is-busy {
+  opacity: 0.75;
+}
+
+.modal.is-busy::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.modal.is-busy .modal__body,
+.modal.is-busy .modal__foot {
+  pointer-events: none;
+}
+
+/* --- Уведомления ------------------------------------------------------- */
+
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: calc(var(--statusbar-h) + 14px);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(330px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  padding: 10px 10px 10px 11px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  box-shadow: var(--shadow-floating);
+  pointer-events: auto;
+  animation: toast-in var(--dur) var(--ease);
+}
+
+.toast--out {
+  animation: toast-out 160ms var(--ease) forwards;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.toast__icon {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  color: var(--color-text-muted);
+}
+
+.toast--success .toast__icon {
+  color: var(--color-success);
+}
+
+.toast--error .toast__icon {
+  color: var(--color-danger);
+}
+
+.toast--info .toast__icon {
+  color: var(--color-info);
+}
+
+.toast__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.toast__title {
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.toast__message {
+  color: var(--color-text-muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.toast__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: -1px;
+  border-radius: var(--radius-xs);
+  color: var(--color-text-faint);
+}
+
+.toast__close:hover {
+  background: var(--color-surface-3);
+  color: var(--color-text);
+}
+
+/* --- Контекстное меню -------------------------------------------------- */
+
+.menu {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  min-width: 186px;
+  padding: 4px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-floating);
+}
+
+.menu__item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 29px;
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.menu__item:hover,
+.menu__item:focus-visible {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+}
+
+.menu__item--danger {
+  color: var(--color-danger);
+}
+
+.menu__item--danger:hover,
+.menu__item--danger:focus-visible {
+  background: var(--color-danger-soft);
+  color: var(--color-danger-ink);
+}
+
+.menu__separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--color-border);
+}
+
+/* --- Оверлей перетаскивания файлов ------------------------------------- */
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: color-mix(in srgb, var(--color-bg) 78%, transparent);
+  backdrop-filter: blur(3px);
+  animation: scrim-in var(--dur-fast) var(--ease);
+}
+
+.drop-overlay__card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: min(420px, 100%);
+  padding: 34px 24px;
+  border: 1.5px dashed var(--color-accent);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface);
+  text-align: center;
+  box-shadow: var(--shadow-floating);
+}
+
+.drop-overlay__icon {
+  display: inline-flex;
+  margin-bottom: 6px;
+  color: var(--color-accent);
+}
+
+.drop-overlay__title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.drop-overlay__hint {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+/* --- Адаптив ----------------------------------------------------------- */
+
+@media (max-width: 620px) {
+  .modal-scrim {
+    padding: 12px;
+    align-items: flex-end;
+  }
+
+  .modal {
+    width: 100%;
+    border-radius: var(--radius-lg);
+  }
+
+  .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .toasts {
+    right: 10px;
+    left: 10px;
+    width: auto;
+  }
+}

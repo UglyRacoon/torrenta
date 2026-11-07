@@ -1,0 +1,129 @@
+/*
+ * Torrenta — дизайн-токены.
+ *
+ * Палитра описана двумя блоками с маркерами `@theme` — их разбирает
+ * `scripts/check-contrast.mjs`, чтобы проверить контраст WCAG AA в обеих темах.
+ * Поэтому все `--color-*` заданы только hex-значениями (без rgb()/var()).
+ */
+
+/* @theme dark */
+:root {
+  color-scheme: dark;
+
+  /* Фон и поверхности */
+  --color-bg: #0f1319;
+  --color-bg-elevated: #121923;
+  --color-surface: #1a2130;
+  --color-surface-2: #202940;
+  --color-surface-3: #263248;
+  --color-border: #232c3b;
+  --color-border-strong: #64738c;
+  --color-track: #232c3b;
+  --color-bar-from: #14b8a6;
+  --color-bar-to: #2dd4bf;
+
+  /* Текст */
+  --color-text: #e8eef6;
+  --color-text-muted: #a3b0c2;
+  --color-text-faint: #8b98ab;
+
+  /* Акцент (бирюза) */
+  --color-accent: #2dd4bf;
+  --color-accent-strong: #5eead4;
+  --color-on-accent: #04312c;
+  --color-accent-soft: #123b37;
+  --color-accent-soft-ink: #6fe7d8;
+
+  /* Статусы */
+  --color-success: #34d399;
+  --color-success-soft: #123528;
+  --color-success-ink: #6ee7b7;
+
+  --color-warning: #fbbf24;
+  --color-warning-soft: #3a2a0c;
+  --color-warning-ink: #fcd34d;
+
+  --color-danger: #f87171;
+  --color-danger-soft: #3b1820;
+  --color-danger-ink: #fda4af;
+
+  --color-info: #60a5fa;
+  --color-info-soft: #16283f;
+  --color-info-ink: #93c5fd;
+
+  --color-focus: #5eead4;
+  --color-overlay: #05070a;
+
+  --shadow-floating: 0 18px 44px -14px rgb(0 0 0 / 0.7), 0 2px 10px rgb(0 0 0 / 0.4);
+  --shadow-drawer: -28px 0 56px -28px rgb(0 0 0 / 0.7);
+
+  /* Типографика и геометрия */
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+
+  --sidebar-w: 236px;
+  --details-w: 352px;
+  --statusbar-h: 30px;
+
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* @theme light */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* Фон и поверхности */
+  --color-bg: #f2f5f9;
+  --color-bg-elevated: #e9eff6;
+  --color-surface: #ffffff;
+  --color-surface-2: #f5f8fc;
+  --color-surface-3: #e7f4f2;
+  --color-border: #d9e2ec;
+  --color-border-strong: #7c8da3;
+  --color-track: #dfe7f0;
+  --color-bar-from: #0f766e;
+  --color-bar-to: #14b8a6;
+
+  /* Текст */
+  --color-text: #0e1720;
+  --color-text-muted: #4a5768;
+  --color-text-faint: #5f6e80;
+
+  /* Акцент (бирюза) */
+  --color-accent: #0b7268;
+  --color-accent-strong: #0f766e;
+  --color-on-accent: #ffffff;
+  --color-accent-soft: #dff3f0;
+  --color-accent-soft-ink: #0f5f58;
+
+  /* Статусы */
+  --color-success: #15803d;
+  --color-success-soft: #e3f5ea;
+  --color-success-ink: #14532d;
+
+  --color-warning: #b45309;
+  --color-warning-soft: #fdf0d5;
+  --color-warning-ink: #78350f;
+
+  --color-danger: #b91c1c;
+  --color-danger-soft: #fbe4e4;
+  --color-danger-ink: #7f1d1d;
+
+  --color-info: #1d4ed8;
+  --color-info-soft: #e3ecfb;
+  --color-info-ink: #1e3a8a;
+
+  --color-focus: #0f766e;
+  --color-overlay: #0b1220;
+
+  --shadow-floating: 0 18px 40px -16px rgb(15 23 42 / 0.3), 0 2px 8px rgb(15 23 42 / 0.1);
+  --shadow-drawer: -24px 0 48px -26px rgb(15 23 42 / 0.25);
+}
