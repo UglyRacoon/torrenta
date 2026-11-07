@@ -2,18 +2,16 @@
 
 **Лёгкий торрент-клиент для Windows на Rust и Tauri.** Собственное ядро протокола BitTorrent, компактный интерфейс в одном окне и нативный `.exe` с установщиком — без Electron и без сторонних торрент-движков.
 
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions%20%C2%B7%20windows--latest-2DD4BF?style=flat-square&logo=githubactions&logoColor=white)](.github/workflows/build.yml)
+[![CI](https://github.com/UglyRacoon/torrenta/actions/workflows/build.yml/badge.svg)](https://github.com/UglyRacoon/torrenta/actions/workflows/build.yml)
+[![Последний выпуск](https://img.shields.io/github/v/release/UglyRacoon/torrenta?style=flat-square&color=2DD4BF&label=release)](https://github.com/UglyRacoon/torrenta/releases/latest)
 [![Лицензия: MIT](https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-MIT-2DD4BF?style=flat-square)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-2DD4BF?style=flat-square&logo=rust&logoColor=white)](Cargo.toml)
 [![Windows x64](https://img.shields.io/badge/platform-windows%20x64-2DD4BF?style=flat-square&logo=windows&logoColor=white)](#требования)
 
-<!-- После публикации репозитория статический бейдж CI можно заменить живым:
-[![CI](https://github.com/UglyRacoon/torrenta/actions/workflows/build.yml/badge.svg)](https://github.com/UglyRacoon/torrenta/actions/workflows/build.yml)
--->
-
 ## Содержание
 
 - [О проекте](#о-проекте)
+- [Скачать](#скачать)
 - [Возможности](#возможности)
 - [Интерфейс](#интерфейс)
 - [Архитектура](#архитектура)
@@ -33,6 +31,18 @@ Torrenta — настольное приложение для Windows 10/11 x64,
 В проекте нет готовых торрент-библиотек: bencode, метаданные, трекеры, обмен кусками и проверка SHA-1 реализованы в этом репозитории.
 
 **Что не нужно:** Electron, внешний демон, аккаунт, телеметрия. Приложение работает локально и ничего никуда не отправляет, кроме announce-запросов на трекеры вашего торрента.
+
+## Скачать
+
+Готовые сборки лежат в разделе [Releases](https://github.com/UglyRacoon/torrenta/releases/latest) — собирать ничего не нужно:
+
+| Файл | Что это |
+| --- | --- |
+| `Torrenta_1.0.0_x64-setup.exe` | Установщик NSIS для текущего пользователя, русский и английский интерфейс (4,11 МиБ) |
+| `Torrenta_1.0.0_x64_ru-RU.msi` | MSI-пакет с русским интерфейсом для тихой установки через групповые политики (5,45 МиБ) |
+| `Torrenta_1.0.0_x64_en-US.msi` | То же с английским интерфейсом (5,45 МиБ) |
+
+Установщики не подписаны сертификатом, поэтому SmartScreen может показать предупреждение «Неизвестный издатель» — это ожидаемо для сборки без подписи кода. Системные требования: Windows 10/11 x64 и WebView2 (Runtime уже есть в Windows 11, в Windows 10 установщик дотянет его через загрузчик Microsoft).
 
 ## Возможности
 
@@ -92,6 +102,8 @@ src/  ──invoke──▶  src-tauri/  ──прямые вызовы──�
 ## Быстрый старт
 
 ```powershell
+git clone https://github.com/UglyRacoon/torrenta.git
+cd torrenta
 npm install
 npm run tauri dev
 ```
