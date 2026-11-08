@@ -399,6 +399,25 @@ impl MockTracker {
     /// Поднимает трекер, который отвечает по очереди: `replies[0]` на первый
     /// announce, `replies[1]` на второй и так далее, последний ответ повторяется.
     pub async fn start_script(replies: Vec<TrackerReply>, interval: u32) -> MockTracker {
+        MockTracker::start_script_delayed(replies, interval, Duration::ZERO).await
+    }
+
+    /// Поднимает трекер с фиксированным ответом, своим `interval` и задержкой
+    /// ответа: движок в это время остаётся внутри `announce`, а не ждёт побудки.
+    pub async fn start_with_interval_and_delay(
+        reply: TrackerReply,
+        interval: u32,
+        delay: Duration,
+    ) -> MockTracker {
+        MockTracker::start_script_delayed(vec![reply], interval, delay).await
+    }
+
+    /// Как [`MockTracker::start_script`], но каждый ответ отдаётся через `delay`.
+    pub async fn start_script_delayed(
+        replies: Vec<TrackerReply>,
+        interval: u32,
+        delay: Duration,
+    ) -> MockTracker {
         assert!(!replies.is_empty(), "mock-трекер: нужен хотя бы один ответ");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -433,7 +452,7 @@ impl MockTracker {
                 let body = bodies[position].clone();
                 let recorded = recorded.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = serve_tracker(stream, body, recorded).await {
+                    if let Err(err) = serve_tracker(stream, body, recorded, delay).await {
                         eprintln!("mock-трекер: {err}");
                     }
                 });
@@ -500,10 +519,15 @@ fn tracker_body(reply: &TrackerReply, interval: u32) -> Vec<u8> {
 }
 
 /// Отвечает на один HTTP-запрос трекера.
+///
+/// Параметры announce попадают в журнал сразу при получении запроса, ещё до
+/// ответа: так тесты видят, что движок уже занят объявлением, и могут проверить
+/// поведение в этом окне. `delay` откладывает ответ — «медленный трекер».
 async fn serve_tracker(
     mut stream: TcpStream,
     body: Vec<u8>,
     log: Arc<Mutex<Vec<TrackerAnnounce>>>,
+    delay: Duration,
 ) -> io::Result<()> {
     let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -522,6 +546,13 @@ async fn serve_tracker(
             break;
         }
     }
+    let announce = parse_announce_query(&request);
+    log.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(announce);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
         body.len()
@@ -529,10 +560,6 @@ async fn serve_tracker(
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&body).await?;
     stream.flush().await?;
-    let announce = parse_announce_query(&request);
-    log.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(announce);
     Ok(())
 }
 

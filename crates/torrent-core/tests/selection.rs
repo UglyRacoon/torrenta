@@ -479,6 +479,104 @@ async fn narrowing_selection_announces_completed_without_waiting_interval() {
     manager.shutdown().await;
 }
 
+/// Побудка не теряется, пока ответ трекера ещё в пути.
+///
+/// На медленном CI объявление завершения терялось ровно в этом окне: движок
+/// ждёт ответа, уведомление уходит в пустоту, и `completed` приходит только
+/// через интервал (30 с). Здесь окно делается явным: трекер отвечает с
+/// задержкой 1.5 с, сужение выбора будит цикл, пока ответ ещё не отдан, а
+/// перепроверка готового торрента будит его ещё раз — уже внутри следующего
+/// запроса. Без починки объявление ждало бы интервал мока (30 с).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wake_is_not_lost_while_announce_is_in_flight() {
+    let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
+    let sample = three_files();
+    let seeder = MockSeeder::start(sample.clone(), Corruption::None).await;
+    // Каждый ответ идёт 1.5 с: цикл объявлений занят запросом, а не ждёт.
+    let tracker = MockTracker::start_with_interval_and_delay(
+        TrackerReply::Peers(vec![seeder.addr]),
+        30,
+        Duration::from_millis(1500),
+    )
+    .await;
+    let manager = TorrentManager::new(test_config(&temp.path().join("downloads")));
+
+    // Выбраны два файла, и оба целиком лежат на диске к моменту сужения выбора.
+    let id = manager
+        .add_file_with(
+            sample.torrent_bytes(&tracker.url()),
+            AddOptions {
+                save_path: None,
+                files: Some(vec![0, 1]),
+            },
+        )
+        .await
+        .expect("торрент с выбором файлов должен добавиться");
+
+    wait_announce(&tracker, Duration::from_secs(20), "started", |log| {
+        log.iter()
+            .find(|announce| announce.event.as_deref() == Some("started"))
+            .cloned()
+    })
+    .await;
+    wait_for(
+        &manager,
+        id,
+        Duration::from_secs(60),
+        "выбранные файлы скачаны и проверены",
+        |item| item.pieces_have == 2 && item.files[1].downloaded == PIECE_LENGTH as u64,
+    )
+    .await;
+
+    // Сужение до первого файла делает торрент готовым: побудка уходит в цикл,
+    // который сейчас ждёт ответа трекера (в полёте — до 1.5 с).
+    manager
+        .set_file_selection(id, vec![0])
+        .expect("смена выбора должна принять корректный список файлов");
+    wait_announce(
+        &tracker,
+        Duration::from_secs(20),
+        "completed в пути",
+        |log| {
+            log.iter()
+                .find(|announce| announce.event.as_deref() == Some("completed"))
+                .cloned()
+        },
+    )
+    .await;
+
+    // Второй раз будим цикл внутри того же запроса: перепроверка готового
+    // торрента завершается «скачано» и просит объявление.
+    let sent = tracker.log().len();
+    manager
+        .recheck(id)
+        .expect("перепроверка готового торрента должна запуститься");
+
+    // Побудка сработала → следующее объявление сразу после ответа трекера.
+    // Потерянная побудка ждала бы интервал объявлений 30 с. Нижняя граница
+    // проверяет, что ответ действительно был в пути: цикл не мог отправить
+    // запрос раньше, чем трекер отдал предыдущий ответ (≈1.4 с).
+    let started_at = std::time::Instant::now();
+    let next = wait_announce(
+        &tracker,
+        Duration::from_secs(8),
+        "следующее после побудки",
+        |log| log.get(sent).cloned(),
+    )
+    .await;
+    let elapsed = started_at.elapsed();
+    assert_eq!(
+        next.left, 0,
+        "готовый торрент объявляет нулевой остаток (запись #{sent}: {next:?})"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "объявление пришло через {elapsed:?}: ответа трекера ещё не было, окно не воспроизведено"
+    );
+
+    manager.shutdown().await;
+}
+
 /// Действующий лимит — минимум из глобального и локального, 0 значит «без лимита».
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn effective_limit_is_min_of_global_and_torrent() {

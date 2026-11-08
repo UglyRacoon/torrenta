@@ -288,9 +288,11 @@ pub(crate) struct Runtime {
     down_limiter: Mutex<RateLimiter>,
     up_limiter: Mutex<RateLimiter>,
     completed_announced: AtomicBool,
-    /// Будит циклы трекеров, когда состояние изменилось не по расписанию
-    /// (например, завершение из-за смены выбора файлов).
-    announce_now: tokio::sync::Notify,
+    /// Просит циклы трекеров объявиться раньше интервала, когда состояние
+    /// изменилось не по расписанию (например, завершение из-за смены выбора
+    /// файлов). Флаг, а не `Notify`, чтобы побудка не терялась, пока цикл
+    /// занят запросом к трекеру.
+    announce_pending: AtomicBool,
 }
 
 impl Runtime {
@@ -327,7 +329,7 @@ impl Runtime {
             down_limiter: Mutex::new(RateLimiter::new()),
             up_limiter: Mutex::new(RateLimiter::new()),
             completed_announced: AtomicBool::new(false),
-            announce_now: tokio::sync::Notify::new(),
+            announce_pending: AtomicBool::new(false),
         })
     }
 
@@ -466,8 +468,18 @@ impl Runtime {
         });
         if complete {
             // Трекеру мог понадобиться `event=completed` — сообщаем сразу.
-            self.announce_now.notify_waiters();
+            self.wake_announcer();
         }
+    }
+
+    /// Будит циклы объявлений, не теряя побудку.
+    ///
+    /// Одного `notify_waiters()` мало: он не оставляет permit, поэтому побудка
+    /// пропадает, если цикл в этот момент не ждёт (например, ответ трекера ещё
+    /// в пути) — и `event=completed` уходил бы только через интервал. Флаг
+    /// переживает такую гонку.
+    pub(crate) fn wake_announcer(&self) {
+        self.announce_pending.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn max_peers(&self) -> usize {
@@ -989,6 +1001,14 @@ impl Runtime {
                 message,
             });
         }
+        // Всё нужное уже на диске: будим цикл объявлений, чтобы трекер
+        // получил актуальный `left` (и `event=completed` при первом выходе в
+        // готовность) сразу, а не через интервал. Побудка нужна и тогда, когда
+        // состояние не меняется: раздающий торрент после сужения выбора
+        // объявляет новый остаток тем же состоянием `Seeding`.
+        if complete {
+            self.wake_announcer();
+        }
         let current = *lk(&self.stats.state);
         if current == next {
             return;
@@ -998,11 +1018,6 @@ impl Runtime {
             id: self.id,
             state: next,
         });
-        // Всё нужное уже на диске, а трекер ещё не знает: будим циклы
-        // объявлений, чтобы `event=completed` ушёл без ожидания интервала.
-        if complete && !self.completed_announced.load(Ordering::Relaxed) {
-            self.announce_now.notify_waiters();
-        }
     }
 
     // -- отдача -------------------------------------------------------------
@@ -1215,10 +1230,7 @@ impl Runtime {
                     let interval = response.interval.clamp(30, 1800);
                     // Завершение из-за смены выбора файлов будит нас раньше,
                     // чтобы `event=completed` ушёл сразу, а не через интервал.
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
-                        _ = self.announce_now.notified() => {}
-                    }
+                    wait_wake(&self.announce_pending, Duration::from_secs(interval)).await;
                 }
                 Err(err) => {
                     failures = failures.saturating_add(1);
@@ -1229,12 +1241,44 @@ impl Runtime {
                         self.report_tracker_failure(&err.to_string());
                     }
                     let wait = (30u64 * failures as u64).min(300);
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    // Побудка (завершение, смена выбора) сокращает и эту паузу:
+                    // `event=completed` не должен ждать конца серии ошибок.
+                    wait_wake(&self.announce_pending, Duration::from_secs(wait)).await;
                 }
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ожидание побудки
+// ---------------------------------------------------------------------------
+
+/// Ждёт побудки не дольше `limit`, не теряя её, если она пришла раньше.
+///
+/// `Notify::notify_waiters()` — не буфер: если адресат в этот момент не ждёт
+/// (`notified()` ещё не создан), уведомление просто пропадает. Цикл объявлений
+/// как раз часто занят: пока ответ трекера в пути, ожидание не создано, и
+/// `event=completed` задерживался бы на весь интервал (30–1800 с). Поэтому
+/// единственный канал побудки — флаг, который проверяется не реже, чем раз в
+/// [`WAKE_POLL`]: уведомление не может потеряться, а цена — не более одного
+/// короткого пробуждения таймера на этот интервал.
+pub(crate) async fn wait_wake(pending: &AtomicBool, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        if pending.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(WAKE_POLL)).await;
+    }
+}
+
+/// Как часто перепроверяем флаг побудки, пока ждём интервал трекера.
+const WAKE_POLL: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Установка торрента и получение метаданных magnet
@@ -1487,5 +1531,60 @@ mod tests {
         assert!(!peer.am_choking);
         assert!(!peer.am_interested);
         assert_eq!(peer.have.len(), 10);
+    }
+
+    /// Побудка не теряется, если пришла до того, как цикл начал ждать.
+    ///
+    /// Ровно эта гонка роняла `selection` на медленном CI: `notify_waiters()`
+    /// в такой ситуации пропадает, и `event=completed` ждал бы полный интервал
+    /// трекера (30 с), хотя всё нужное уже на диске.
+    #[tokio::test]
+    async fn wake_before_waiting_is_not_lost() {
+        let pending = AtomicBool::new(true);
+        let started = Instant::now();
+        wait_wake(&pending, Duration::from_secs(60)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "побудка потерялась: {waited:?}"
+        );
+        assert!(!pending.load(Ordering::Relaxed), "флаг побудки не снят");
+    }
+
+    /// Побудка из другой задачи будит уже ожидающий цикл, а не ждёт лимит.
+    #[tokio::test]
+    async fn wake_from_other_task_wakes_waiter() {
+        let pending = Arc::new(AtomicBool::new(false));
+        let flag = pending.clone();
+        let started = Instant::now();
+        let waiter = tokio::spawn(async move {
+            wait_wake(&flag, Duration::from_secs(60)).await;
+        });
+        // Даём циклу встать в ожидание, затем ставим флаг.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pending.store(true, Ordering::Relaxed);
+        waiter.await.expect("цикл ожидания упал");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(3),
+            "флаг не разбудил цикл: {waited:?}"
+        );
+    }
+
+    /// Без побудки ожидание честно длится весь лимит и не виснет дольше.
+    #[tokio::test]
+    async fn wait_returns_after_limit() {
+        let pending = AtomicBool::new(false);
+        let started = Instant::now();
+        wait_wake(&pending, Duration::from_millis(120)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "проснулись раньше: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "переждали лимит: {waited:?}"
+        );
     }
 }
