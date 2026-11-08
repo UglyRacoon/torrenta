@@ -287,20 +287,38 @@
 .file-row {
   position: relative;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   padding: 6px 0;
   border-bottom: 1px solid var(--color-border);
-  cursor: pointer;
+  cursor: default;
 }
 
 .file-row:hover .file-row__name {
   color: var(--color-text);
 }
 
-.file-row:has(.checkbox__input:not(:checked)) .file-row__name {
+/* Приоритет «не скачивать» приглушает строку, но не скрывает её. */
+.file-row[data-priority="skip"] .file-row__name,
+.file-row[data-priority="skip"] .file-row__icon {
   color: var(--color-text-faint);
+}
+
+/* Компактный селект приоритета: строка файла, а не поле формы. */
+.file-row__priority {
+  flex: none;
+}
+
+.file-row__priority .select__button {
+  gap: 4px;
+  min-height: 24px;
+  padding: 0 6px 0 8px;
+  font-size: 11px;
+}
+
+.file-row__priority .select__value {
+  font-size: 11px;
 }
 
 .file-row:last-child {

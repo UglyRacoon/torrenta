@@ -23,6 +23,10 @@ pub const SETTINGS_FILE_NAME: &str = "settings.json";
 pub const DEFAULT_MAX_PEERS: u32 = 50;
 /// Верхняя граница числа пиров на торрент.
 pub const MAX_PEERS_LIMIT: u32 = 500;
+/// Верхняя граница одновременно активных загрузок и раздач.
+///
+/// `0` означает «без ограничения» и тоже допустим — зажимается только верх.
+pub const MAX_ACTIVE_LIMIT: u32 = 100;
 /// Верхняя граница лимита скорости — 1 ГиБ/с (в КиБ/с).
 pub const MAX_RATE_LIMIT_KIB: u32 = 1_048_576;
 /// Верхняя граница listen-порта: `0` означает «выбрать свободный».
@@ -43,6 +47,12 @@ pub struct SettingsDto {
     pub download_dir: String,
     /// Максимальное число пиров на торрент (1..=500).
     pub max_peers: u32,
+    /// Сколько торрентов одновременно могут скачиваться (0..=100, `0` — без
+    /// ограничения). Остальные ждут в очереди с состоянием «В очереди».
+    pub max_active_downloads: u32,
+    /// Сколько торрентов одновременно могут раздаваться (0..=100, `0` — без
+    /// ограничения). Завершённые сверх лимита тоже ждут в очереди.
+    pub max_active_seeds: u32,
     /// Ограничение скорости загрузки в КиБ/с, `0` — без лимита.
     pub download_limit_kib: u32,
     /// Ограничение скорости отдачи в КиБ/с, `0` — без лимита.
@@ -81,6 +91,8 @@ impl Default for SettingsDto {
         Self {
             download_dir: String::new(),
             max_peers: DEFAULT_MAX_PEERS,
+            max_active_downloads: 0,
+            max_active_seeds: 0,
             download_limit_kib: 0,
             upload_limit_kib: 0,
             listen_port: 0,
@@ -110,6 +122,8 @@ impl SettingsDto {
     pub fn normalize(&mut self) {
         self.download_dir = self.download_dir.trim().to_string();
         self.max_peers = clamp_peers(self.max_peers);
+        self.max_active_downloads = clamp_active(self.max_active_downloads);
+        self.max_active_seeds = clamp_active(self.max_active_seeds);
         self.download_limit_kib = clamp_rate(self.download_limit_kib);
         self.upload_limit_kib = clamp_rate(self.upload_limit_kib);
         self.theme = normalize_theme(&self.theme);
@@ -135,6 +149,11 @@ pub fn clamp_peers(value: u32) -> u32 {
 /// Зажимает лимит скорости в допустимый диапазон (`0` = без лимита).
 pub fn clamp_rate(value: u32) -> u32 {
     value.min(MAX_RATE_LIMIT_KIB)
+}
+
+/// Зажимает лимит одновременно активных торрентов (`0` = без ограничения).
+pub fn clamp_active(value: u32) -> u32 {
+    value.min(MAX_ACTIVE_LIMIT)
 }
 
 /// Приводит название темы к одному из [`THEMES`]; всё неизвестное — `dark`.
@@ -207,6 +226,8 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
         upload_limit_kib: dto.upload_limit_kib,
         listen_port: dto.listen_port,
         seed_after_complete: dto.seed_after_complete,
+        max_active_downloads: dto.max_active_downloads as usize,
+        max_active_seeds: dto.max_active_seeds as usize,
     }
 }
 
@@ -226,6 +247,12 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         upload_limit_kib: clamp_rate(config.upload_limit_kib),
         listen_port: config.listen_port,
         seed_after_complete: config.seed_after_complete,
+        max_active_downloads: clamp_active(
+            u32::try_from(config.max_active_downloads).unwrap_or(MAX_ACTIVE_LIMIT),
+        ),
+        max_active_seeds: clamp_active(
+            u32::try_from(config.max_active_seeds).unwrap_or(MAX_ACTIVE_LIMIT),
+        ),
         auto_shutdown,
         autostart: false,
         start_minimized: false,
@@ -343,6 +370,8 @@ mod tests {
         SettingsDto {
             download_dir: "C:\\Torrents".to_string(),
             max_peers: 80,
+            max_active_downloads: 4,
+            max_active_seeds: 2,
             download_limit_kib: 4096,
             upload_limit_kib: 512,
             listen_port: 51413,
@@ -359,6 +388,8 @@ mod tests {
     fn defaults_are_sane() {
         let dto = SettingsDto::default();
         assert_eq!(dto.max_peers, DEFAULT_MAX_PEERS);
+        assert_eq!(dto.max_active_downloads, 0);
+        assert_eq!(dto.max_active_seeds, 0);
         assert_eq!(dto.download_limit_kib, 0);
         assert_eq!(dto.upload_limit_kib, 0);
         assert_eq!(dto.listen_port, 0);
@@ -377,6 +408,8 @@ mod tests {
         let mut dto = SettingsDto {
             download_dir: "   C:\\Torrents   ".to_string(),
             max_peers: 0,
+            max_active_downloads: u32::MAX,
+            max_active_seeds: MAX_ACTIVE_LIMIT + 1,
             download_limit_kib: u32::MAX,
             upload_limit_kib: MAX_RATE_LIMIT_KIB + 1,
             listen_port: 65_535,
@@ -390,6 +423,8 @@ mod tests {
         dto.normalize();
         assert_eq!(dto.download_dir, "C:\\Torrents");
         assert_eq!(dto.max_peers, 1);
+        assert_eq!(dto.max_active_downloads, MAX_ACTIVE_LIMIT);
+        assert_eq!(dto.max_active_seeds, MAX_ACTIVE_LIMIT);
         assert_eq!(dto.download_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.upload_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.theme, "light");
@@ -490,6 +525,8 @@ mod tests {
         assert_eq!(config.upload_limit_kib, 512);
         assert_eq!(config.listen_port, 51413);
         assert!(!config.seed_after_complete);
+        assert_eq!(config.max_active_downloads, 4);
+        assert_eq!(config.max_active_seeds, 2);
 
         let back = from_engine_config(&config, &dto.theme, dto.auto_shutdown);
         // «Оконные» флаги не входят в `EngineConfig`: обратное преобразование
@@ -515,21 +552,59 @@ mod tests {
             upload_limit_kib: MAX_RATE_LIMIT_KIB + 1,
             listen_port: 0,
             seed_after_complete: true,
+            max_active_downloads: usize::MAX,
+            max_active_seeds: 5000,
         };
         let dto = from_engine_config(&config, "unknown", false);
         assert_eq!(dto.max_peers, MAX_PEERS_LIMIT);
+        assert_eq!(dto.max_active_downloads, MAX_ACTIVE_LIMIT);
+        assert_eq!(dto.max_active_seeds, MAX_ACTIVE_LIMIT);
         assert_eq!(dto.download_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.upload_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert_eq!(dto.download_dir, "D:\\Torrents");
         assert!(!dto.auto_shutdown);
 
+        // `0` = «без ограничения»: clamp не должен превращать его в 1.
         let config = EngineConfig {
             download_dir: PathBuf::from("D:\\Torrents"),
             max_peers_per_torrent: 0,
+            max_active_downloads: 0,
+            max_active_seeds: 0,
             ..EngineConfig::default()
         };
-        assert_eq!(from_engine_config(&config, "dark", false).max_peers, 1);
+        let dto = from_engine_config(&config, "dark", false);
+        assert_eq!(dto.max_peers, 1);
+        assert_eq!(dto.max_active_downloads, 0);
+        assert_eq!(dto.max_active_seeds, 0);
+    }
+
+    #[test]
+    fn active_limits_use_snake_case_keys() {
+        let dir = test_dir("active-limits-keys");
+        let path = settings_path(&dir);
+        save(&path, &sample()).expect("настройки должны сохраняться");
+        let text = fs::read_to_string(&path).expect("файл настроек должен читаться");
+        assert!(
+            text.contains("\"max_active_downloads\": 4"),
+            "нет ключа лимита загрузок: {text}"
+        );
+        assert!(
+            text.contains("\"max_active_seeds\": 2"),
+            "нет ключа лимита раздач: {text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_active_limits_are_unlimited() {
+        let dto = SettingsDto::default().normalized();
+        assert_eq!(dto.max_active_downloads, 0);
+        assert_eq!(dto.max_active_seeds, 0);
+        let config = to_engine_config(&dto);
+        assert_eq!(config.max_active_downloads, 0);
+        assert_eq!(config.max_active_seeds, 0);
+        assert_eq!(from_engine_config(&config, "dark", false), dto);
     }
 
     #[test]
@@ -575,6 +650,14 @@ mod tests {
             "закрытие в трей должно быть выключено"
         );
         assert_eq!(loaded.max_peers, 60);
+        assert_eq!(
+            loaded.max_active_downloads, 0,
+            "старый settings.json означает «без ограничения загрузок»"
+        );
+        assert_eq!(
+            loaded.max_active_seeds, 0,
+            "старый settings.json означает «без ограничения раздач»"
+        );
         assert_eq!(loaded.upload_limit_kib, 100);
         assert!(loaded.seed_after_complete);
         assert_eq!(loaded.theme, "dark");

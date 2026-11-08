@@ -109,14 +109,7 @@ async fn run(
     }
     if remote.supports_extended() {
         let payload = our_extended_handshake(&runtime);
-        send(
-            &mut writer,
-            &Message::Extended {
-                ext_id: 0,
-                payload,
-            },
-        )
-        .await?;
+        send(&mut writer, &Message::Extended { ext_id: 0, payload }).await?;
     }
 
     // Чтение вынесено в отдельную задачу: `read_exact` не переживает
@@ -149,10 +142,7 @@ async fn run(
 
 fn our_extended_handshake(runtime: &Runtime) -> Vec<u8> {
     let mut extensions = BTreeMap::new();
-    extensions.insert(
-        b"ut_metadata".to_vec(),
-        Value::Int(OUR_UT_METADATA as i64),
-    );
+    extensions.insert(b"ut_metadata".to_vec(), Value::Int(OUR_UT_METADATA as i64));
     let mut dict = BTreeMap::new();
     dict.insert(b"m".to_vec(), Value::Dict(extensions));
     dict.insert(
@@ -240,24 +230,12 @@ async fn handle_message(
             // протокола: запрос просто игнорируется, соединение остаётся живым.
             if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
-                send(
-                    writer,
-                    &Message::Piece {
-                        index,
-                        begin,
-                        data,
-                    },
-                )
-                .await?;
+                send(writer, &Message::Piece { index, begin, data }).await?;
                 *last_write = Instant::now();
                 runtime.add_uploaded(id, sent);
             }
         }
-        Message::Piece {
-            index,
-            begin,
-            data,
-        } => {
+        Message::Piece { index, begin, data } => {
             let ready = runtime.on_block(id, index, begin, data)?;
             if let Some((index, full)) = ready {
                 if runtime.complete_piece(index, &full)? {
@@ -387,10 +365,7 @@ async fn send(writer: &mut OwnedWriteHalf, message: &Message) -> Result<(), Stri
         .map_err(|err| format!("запись: {err}"))
 }
 
-async fn read_message(
-    reader: &mut OwnedReadHalf,
-    timeout: Duration,
-) -> Result<Message, String> {
+async fn read_message(reader: &mut OwnedReadHalf, timeout: Duration) -> Result<Message, String> {
     let mut head = [0u8; 4];
     read_exact_timeout(reader, &mut head, timeout)
         .await
@@ -582,5 +557,3 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
     }
     Ok(deadline - now)
 }
-
-

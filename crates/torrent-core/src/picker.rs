@@ -8,6 +8,11 @@ use std::collections::HashSet;
 
 use crate::bitfield::Bitfield;
 
+/// Уровень приоритета куска «обычный» (значение по умолчанию).
+const LEVEL_NORMAL: u8 = 1;
+/// Уровень приоритета куска «высокий»; всё, что больше, обрезается до него.
+const LEVEL_HIGH: u8 = 2;
+
 /// Состояние одного куска.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceStatus {
@@ -32,6 +37,8 @@ pub struct PiecePicker {
     max_in_progress: usize,
     /// Нужные куски (пересекаются с выбранными файлами): только их и отдаём.
     wanted: Bitfield,
+    /// Уровень приоритета каждого куска: 0 — низкий, 1 — обычный, 2 — высокий.
+    levels: Vec<u8>,
 }
 
 impl PiecePicker {
@@ -45,6 +52,7 @@ impl PiecePicker {
             in_progress_count: 0,
             max_in_progress: (piece_count / 40).clamp(4, 64),
             wanted: Bitfield::all_set(piece_count),
+            levels: vec![LEVEL_NORMAL; piece_count],
         }
     }
 
@@ -120,6 +128,23 @@ impl PiecePicker {
         self.wanted.get(index)
     }
 
+    /// Задаёт уровни приоритета кусков (0 — низкий, 1 — обычный, 2 — высокий).
+    ///
+    /// Длина среза может не совпадать с числом кусков: лишние значения
+    /// отбрасываются, недостающие считаются обычными.
+    pub fn set_levels(&mut self, levels: &[u8]) {
+        let mut next = vec![LEVEL_NORMAL; self.piece_count];
+        for (index, level) in levels.iter().take(self.piece_count).enumerate() {
+            next[index] = (*level).min(LEVEL_HIGH);
+        }
+        self.levels = next;
+    }
+
+    /// Уровень приоритета куска (0 — низкий, 1 — обычный, 2 — высокий).
+    pub fn level(&self, index: usize) -> u8 {
+        self.levels.get(index).copied().unwrap_or(LEVEL_NORMAL)
+    }
+
     pub fn status(&self, index: usize) -> PieceStatus {
         self.status
             .get(index)
@@ -137,6 +162,16 @@ impl PiecePicker {
         }
         self.status[index] = PieceStatus::Have;
         self.have.set(index);
+    }
+
+    /// Сбрасывает отметки «кусок есть» перед полной перепроверкой данных.
+    ///
+    /// Набор нужных кусков и их приоритеты сохраняются: перепроверка не меняет
+    /// выбор файлов, только фактическое содержимое на диске.
+    pub fn reset_have(&mut self) {
+        self.have.clear();
+        self.in_progress_count = 0;
+        self.status.fill(PieceStatus::Missing);
     }
 
     /// Возвращает кусок в пул (проверка не прошла или пир отключился).
@@ -217,30 +252,48 @@ impl PiecePicker {
         self.claim(index)
     }
 
-    /// Лучший кандидат: rarest-first, на старте — последовательно с начала.
+    /// Лучший кандидат: сначала высокий приоритет, затем обычный, затем низкий;
+    /// внутри уровня — rarest-first, на старте — последовательно с начала.
     fn best(
         &self,
         peer_have: &Bitfield,
         exclude: &HashSet<usize>,
         wanted: &Bitfield,
     ) -> Option<usize> {
+        for level in (0..=LEVEL_HIGH).rev() {
+            if let Some(index) = self.best_level(peer_have, exclude, wanted, level) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Лучший кандидат среди кусков одного уровня приоритета.
+    fn best_level(
+        &self,
+        peer_have: &Bitfield,
+        exclude: &HashSet<usize>,
+        wanted: &Bitfield,
+        level: u8,
+    ) -> Option<usize> {
         // Две трети — rarest-first, оставшаяся треть — последовательно с начала,
         // чтобы уже скачанные данные были полезны сразу (можно смотреть/раздавать).
         let sequential_bias = self.in_progress_count == 0;
         let mut best: Option<(usize, u32)> = None;
         for i in 0..self.piece_count {
-            if !wanted.get(i) || !self.peer_has(i) || exclude.contains(&i) || !peer_have.get(i) {
+            if self.level(i) != level
+                || !wanted.get(i)
+                || !self.peer_has(i)
+                || exclude.contains(&i)
+                || !peer_have.get(i)
+            {
                 continue;
             }
             let avail = self.availability[i];
             best = match best {
                 None => Some((i, avail)),
                 Some((bi, ba)) => {
-                    let better = if sequential_bias {
-                        i < bi
-                    } else {
-                        avail < ba
-                    };
+                    let better = if sequential_bias { i < bi } else { avail < ba };
                     if better {
                         Some((i, avail))
                     } else {
@@ -269,6 +322,50 @@ impl PiecePicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_priority_pieces_come_before_low() {
+        let mut picker = PiecePicker::new(3);
+        // Куски 0 и 2 — низкий, 1 — высокий; доступность у всех одинаковая.
+        picker.set_levels(&[0, 2, 0]);
+        let mut peer = Bitfield::new(3);
+        for i in 0..3 {
+            peer.set(i);
+        }
+        // Высокий приоритет важнее последовательного старта с нулевого куска.
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(1));
+        // Затем — низкие куски по прежней логике.
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(0));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(2));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn low_priority_used_when_no_higher_candidates() {
+        let mut picker = PiecePicker::new(2);
+        picker.set_levels(&[0, 0]);
+        let mut peer = Bitfield::new(2);
+        peer.set(1);
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(1));
+    }
+
+    #[test]
+    fn levels_default_to_normal() {
+        let picker = PiecePicker::new(4);
+        assert_eq!(picker.level(0), LEVEL_NORMAL);
+        // Лишние значения отбрасываются, а не паникуют.
+        let mut picker = PiecePicker::new(2);
+        picker.set_levels(&[2, 2, 2]);
+        assert_eq!(picker.level(1), LEVEL_HIGH);
+        // Недостающие куски остаются обычными.
+        let mut picker = PiecePicker::new(3);
+        picker.set_levels(&[2]);
+        assert_eq!(picker.level(0), LEVEL_HIGH);
+        assert_eq!(picker.level(2), LEVEL_NORMAL);
+        // Большие значения обрезаются до высокого уровня.
+        picker.set_levels(&[9, 9, 9]);
+        assert_eq!(picker.level(0), LEVEL_HIGH);
+    }
 
     #[test]
     fn complete_torrent_picks_nothing() {
@@ -323,7 +420,10 @@ mod tests {
         let mut picked = 0;
         while picker.pick(&peer, &HashSet::new()).is_some() {
             picked += 1;
-            assert!(picked <= 64, "окно одновременно загружаемых кусков должно быть ограничено");
+            assert!(
+                picked <= 64,
+                "окно одновременно загружаемых кусков должно быть ограничено"
+            );
         }
         assert!(picked > 0);
     }

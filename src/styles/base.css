@@ -445,6 +445,12 @@ a:hover {
   min-width: 0;
 }
 
+.field__hint {
+  margin: 0;
+  color: var(--color-text-faint);
+  font-size: 11px;
+}
+
 .field__row .input {
   flex: 1;
 }
@@ -600,7 +606,8 @@ a:hover {
   color: var(--color-success-ink);
 }
 
-.badge--metadata {
+.badge--metadata,
+.badge--checking {
   background: var(--color-info-soft);
   color: var(--color-info-ink);
 }

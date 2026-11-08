@@ -168,6 +168,13 @@
   padding: 6px 0 12px;
 }
 
+/* Список и пустое состояние делят одну ячейку сетки: пустое состояние
+   центрируется по всей свободной площади, а не встаёт вторым рядом под списком. */
+.list-body > .list,
+.list-body > .empty {
+  grid-area: 1 / 1;
+}
+
 .list:focus-visible {
   outline: none;
 }
@@ -384,8 +391,11 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  justify-content: safe center;
   gap: 6px;
-  padding: 40px 24px 64px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: clamp(16px, 6vh, 56px) 24px;
   text-align: center;
 }
 

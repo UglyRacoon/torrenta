@@ -76,7 +76,10 @@ async fn magnet_metadata_is_fetched_from_mock_peer() {
     );
     assert_eq!(snapshot.error, None, "ошибок быть не должно");
     assert!(
-        matches!(snapshot.state, TorrentState::Downloading | TorrentState::Seeding),
+        matches!(
+            snapshot.state,
+            TorrentState::Downloading | TorrentState::Seeding
+        ),
         "после метаданных ожидался Downloading, получено {:?}",
         snapshot.state
     );
@@ -87,7 +90,10 @@ async fn magnet_metadata_is_fetched_from_mock_peer() {
     );
     assert_eq!(snapshot.files[0].path, "m.bin");
 
-    manager.remove(id, false).await.expect("удаление magnet-торрента");
+    manager
+        .remove(id, false)
+        .await
+        .expect("удаление magnet-торрента");
     assert!(manager.snapshot().is_empty());
     manager.shutdown().await;
 }
@@ -127,7 +133,10 @@ async fn magnet_without_peers_stays_in_metadata_and_engine_survives() {
 
     // Движок жив: снимок читается, операции не паникуют.
     assert_eq!(manager.totals().torrents, 1);
-    manager.remove(id, false).await.expect("удаление magnet-торрента");
+    manager
+        .remove(id, false)
+        .await
+        .expect("удаление magnet-торрента");
     assert!(manager.snapshot().is_empty());
     manager.shutdown().await;
 }

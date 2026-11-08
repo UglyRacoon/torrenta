@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, State};
 use tauri_plugin_dialog::{DialogExt as _, FilePath};
 use tauri_plugin_opener as opener;
@@ -236,6 +237,63 @@ pub async fn set_file_selection(
     state
         .manager
         .set_file_selection(id, files)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Приоритет файла торрента так, как его присылает фронтенд.
+///
+/// В JSON — строки `"skip" | "low" | "normal" | "high"` (контракт 1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilePriorityDto {
+    /// Файл не скачивается вовсе.
+    Skip,
+    /// Низкий приоритет: качается, только когда нет кандидатов выше.
+    Low,
+    /// Обычный приоритет (поведение 1.2).
+    Normal,
+    /// Высокий приоритет: куски запрашиваются раньше остальных.
+    High,
+}
+
+impl From<FilePriorityDto> for torrent_core::engine::FilePriority {
+    fn from(dto: FilePriorityDto) -> Self {
+        match dto {
+            FilePriorityDto::Skip => torrent_core::engine::FilePriority::Skip,
+            FilePriorityDto::Low => torrent_core::engine::FilePriority::Low,
+            FilePriorityDto::Normal => torrent_core::engine::FilePriority::Normal,
+            FilePriorityDto::High => torrent_core::engine::FilePriority::High,
+        }
+    }
+}
+
+/// Перепроверяет файлы торрента на диске (состояние «Проверка»).
+///
+/// Повторный вызов во время проверки движок игнорирует (no-op `Ok`), готовность
+/// торрента к перепроверке проверяет сам движок (`EngineError::NotReady`).
+#[tauri::command]
+pub async fn recheck_torrent(state: State<'_, AppEngine>, id: u64) -> Result<(), String> {
+    state
+        .manager
+        .recheck(id)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Меняет приоритеты файлов торрента.
+///
+/// `priorities` — по одному значению на файл в порядке файлов снапшота; длина
+/// должна совпадать с числом файлов (иначе движок вернёт ошибку выбора).
+#[tauri::command]
+pub async fn set_file_priorities(
+    state: State<'_, AppEngine>,
+    id: u64,
+    priorities: Vec<FilePriorityDto>,
+) -> Result<(), String> {
+    let priorities: Vec<torrent_core::engine::FilePriority> =
+        priorities.into_iter().map(Into::into).collect();
+    state
+        .manager
+        .set_file_priorities(id, priorities)
         .map_err(|err| engine_error_text(&err))
 }
 
@@ -667,5 +725,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_priority_dto_uses_lowercase_json_names() {
+        for (dto, json) in [
+            (FilePriorityDto::Skip, "\"skip\""),
+            (FilePriorityDto::Low, "\"low\""),
+            (FilePriorityDto::Normal, "\"normal\""),
+            (FilePriorityDto::High, "\"high\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&dto).expect("приоритет должен сериализоваться"),
+                json
+            );
+            assert_eq!(
+                serde_json::from_str::<FilePriorityDto>(json).expect("приоритет должен читаться"),
+                dto
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_file_priority_is_rejected() {
+        assert!(
+            serde_json::from_str::<FilePriorityDto>("\"urgent\"").is_err(),
+            "неизвестный приоритет должен отклоняться парсером"
+        );
+        assert!(serde_json::from_str::<FilePriorityDto>("\"Skip\"").is_err());
+        assert!(serde_json::from_str::<Vec<FilePriorityDto>>("[\"normal\",\"bogus\"]").is_err());
+    }
+
+    #[test]
+    fn file_priority_dto_converts_to_core() {
+        let converted: Vec<torrent_core::engine::FilePriority> = vec![
+            FilePriorityDto::Skip,
+            FilePriorityDto::Low,
+            FilePriorityDto::Normal,
+            FilePriorityDto::High,
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(
+            converted,
+            vec![
+                torrent_core::engine::FilePriority::Skip,
+                torrent_core::engine::FilePriority::Low,
+                torrent_core::engine::FilePriority::Normal,
+                torrent_core::engine::FilePriority::High,
+            ]
+        );
     }
 }

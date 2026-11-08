@@ -1,5 +1,5 @@
 import type { AppState } from "../state/store";
-import type { FileView, TorrentSnapshot, TorrentState } from "../api/types";
+import type { FilePriority, FileView, TorrentSnapshot, TorrentState } from "../api/types";
 import {
   basename,
   fmtBytes,
@@ -12,12 +12,14 @@ import {
 } from "../lib/format";
 import { h, setAttr, setScaleX, setText } from "../lib/dom";
 import { icon } from "../lib/icons";
+import { createSelect, type SelectControl, type SelectOption } from "./select";
 
 const BADGES: Record<TorrentState, { label: string; cls: string }> = {
   queued: { label: "В очереди", cls: "queued" },
   metadata: { label: "Метаданные", cls: "metadata" },
   downloading: { label: "Загрузка", cls: "downloading" },
   seeding: { label: "Раздача", cls: "seeding" },
+  checking: { label: "Проверка", cls: "checking" },
   paused: { label: "Пауза", cls: "paused" },
   completed: { label: "Завершено", cls: "completed" },
   error: { label: "Ошибка", cls: "error" },
@@ -32,6 +34,14 @@ const TABS = [
 
 type TabKey = (typeof TABS)[number]["key"];
 
+/** Приоритеты файла (1.3): «не скачивать» = skip, остальные — порядок загрузки. */
+const PRIORITY_OPTIONS: SelectOption[] = [
+  { value: "high", label: "Высокий" },
+  { value: "normal", label: "Обычный" },
+  { value: "low", label: "Низкий" },
+  { value: "skip", label: "Не скачивать" },
+];
+
 const PIECE_COLS = 32;
 const PIECE_MAX_BUCKETS = PIECE_COLS * 6;
 
@@ -41,8 +51,8 @@ export interface DetailsOptions {
   onReveal(id: number): void;
   onRemove(id: number): void;
   onOpenExternal(url: string): void;
-  /** Изменение набора загружаемых файлов; отклонение промиса означает ошибку движка. */
-  onFileSelection(id: number, files: number[]): Promise<void>;
+  /** Изменение приоритетов файлов; отклонение промиса означает ошибку движка. */
+  onFilePriorities(id: number, priorities: FilePriority[]): Promise<void>;
 }
 
 export interface DetailsPanel {
@@ -55,6 +65,8 @@ function toggleLabel(state: TorrentState): { label: string; icon: "pause" | "pla
       return { label: "Продолжить", icon: "play" };
     case "completed":
       return { label: "Раздать", icon: "play" };
+    case "checking":
+      return { label: "Проверка…", icon: "refresh" };
     case "error":
       return { label: "Повторить", icon: "refresh" };
     default:
@@ -75,6 +87,10 @@ function progressText(torrent: TorrentSnapshot): string {
   const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
   switch (torrent.state) {
     case "downloading":
+      if (torrent.wanted_bytes === 0 && torrent.files.length > 0) {
+        // Все файлы исключены: качать нечего, но торрент снят не с паузы.
+        return "Файлы не выбраны";
+      }
       return torrent.eta_seconds === null
         ? `осталось ${fmtBytes(remaining)}`
         : `осталось ${fmtBytes(remaining)} · ${fmtEta(torrent.eta_seconds)}`;
@@ -83,9 +99,15 @@ function progressText(torrent: TorrentSnapshot): string {
     case "queued":
       return "Ожидает запуска";
     case "paused":
+      if (torrent.wanted_bytes === 0 && torrent.files.length > 0) {
+        // Все файлы исключены: пауза тут ничего не меняет.
+        return "Файлы не выбраны";
+      }
       return remaining > 0 ? `осталось ${fmtBytes(remaining)}` : "Загрузка завершена";
     case "seeding":
       return "Раздаётся · прогресс полный";
+    case "checking":
+      return "Проверка целостности";
     case "completed":
       return "Загрузка завершена";
     case "error":
@@ -354,10 +376,16 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   });
 
   // --- Ключевые строки ---------------------------------------------------
-  const fileRows = new Map<
-    string,
-    { el: HTMLElement; name: HTMLElement; meta: HTMLElement; size: HTMLElement; check: HTMLInputElement }
-  >();
+  interface FileRow {
+    el: HTMLElement;
+    name: HTMLElement;
+    meta: HTMLElement;
+    size: HTMLElement;
+    select: SelectControl;
+    /** Текущий приоритет строки — источник правды до ответа движка. */
+    priority: FilePriority;
+  }
+  const fileRows = new Map<string, FileRow>();
   const peerRows = new Map<
     string,
     { el: HTMLElement; addr: HTMLElement; meta: HTMLElement; progress: HTMLElement; down: HTMLElement; up: HTMLElement }
@@ -365,6 +393,9 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   const trackerRows = new Map<string, { el: HTMLElement; url: HTMLElement }>();
 
   function clearKeyed(): void {
+    for (const row of fileRows.values()) {
+      row.select.destroy();
+    }
     fileRows.clear();
     peerRows.clear();
     trackerRows.clear();
@@ -372,54 +403,65 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     peersList.replaceChildren();
     trackersList.replaceChildren();
     currentFiles = [];
-    lastKnownSelection = [];
+    lastKnownPriorities = [];
     filesHead.hidden = true;
+  }
+
+  function createFileRow(path: string): FileRow {
+    const fileName = h("span", { class: "file-row__name" });
+    const fileMeta = h("span", { class: "file-row__meta" });
+    const fileSize = h("span", { class: "file-row__size num" });
+    const iconEl = h("span", { class: "file-row__icon" }, icon("file", 15));
+    const mainEl = h("div", { class: "file-row__main" }, fileName, fileMeta);
+    const el = h("div", {
+      class: "file-row",
+      attrs: { role: "listitem", "data-priority": "normal" },
+    });
+    const row: FileRow = {
+      el,
+      name: fileName,
+      meta: fileMeta,
+      size: fileSize,
+      priority: "normal",
+      select: createSelect({
+        label: `Приоритет файла ${basename(path)}`,
+        options: PRIORITY_OPTIONS,
+        value: "normal",
+        className: "file-row__priority",
+        menuWidth: 176,
+        onChange: (value) => {
+          // Меняется только эта строка; движку уходит весь массив по порядку файлов.
+          row.priority = value as FilePriority;
+          setAttr(row.el, "data-priority", row.priority);
+          commitFilePriorities();
+        },
+      }),
+    };
+    el.append(iconEl, mainEl, row.select.element, fileSize);
+    return row;
   }
 
   function renderFiles(files: FileView[]): void {
     currentFiles = files;
-    lastKnownSelection = files.map((file) => file.selected);
+    lastKnownPriorities = files.map((file) => file.priority);
     const seen = new Set<string>();
     let previous: HTMLElement | null = null;
     for (const file of files) {
       seen.add(file.path);
       let row = fileRows.get(file.path);
       if (!row) {
-        const fileName = h("span", { class: "file-row__name" });
-        const fileMeta = h("span", { class: "file-row__meta" });
-        const fileSize = h("span", { class: "file-row__size num" });
-        const check = h("input", {
-          class: "checkbox__input",
-          attrs: { type: "checkbox" },
-        });
-        const box = h("span", { class: "checkbox__box" });
-        const iconEl = h("span", { class: "file-row__icon" }, icon("file", 15));
-        const mainEl = h("div", { class: "file-row__main" }, fileName, fileMeta);
-        const el = h(
-          "label",
-          { class: "file-row", attrs: { role: "listitem" } },
-          check,
-          box,
-          iconEl,
-          mainEl,
-          fileSize,
-        );
-        check.addEventListener("change", () => commitFileSelection());
-        row = { el, name: fileName, meta: fileMeta, size: fileSize, check };
+        row = createFileRow(file.path);
         fileRows.set(file.path, row);
       }
       setText(row.name, basename(file.path));
       setAttr(row.name, "title", file.path);
       setText(row.meta, file.downloaded >= file.length ? "готово" : `скачано ${fmtBytes(file.downloaded)}`);
       setText(row.size, fmtBytes(file.length));
-      if (row.check.checked !== file.selected) {
-        row.check.checked = file.selected;
+      if (row.priority !== file.priority) {
+        row.priority = file.priority;
+        row.select.setValue(file.priority);
       }
-      setAttr(
-        row.check,
-        "aria-label",
-        `${file.selected ? "Не скачивать" : "Скачивать"}: ${basename(file.path)}`,
-      );
+      setAttr(row.el, "data-priority", file.priority);
       const reference: Node | null = previous ? previous.nextSibling : filesList.firstChild;
       if (reference !== row.el) {
         filesList.insertBefore(row.el, reference);
@@ -428,6 +470,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     }
     for (const [path, row] of fileRows) {
       if (!seen.has(path)) {
+        row.select.destroy();
         row.el.remove();
         fileRows.delete(path);
       }
@@ -441,55 +484,58 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
 
   /** Набор файлов из последнего снимка движка — база для отката при ошибке. */
   let currentFiles: FileView[] = [];
-  let lastKnownSelection: boolean[] = [];
+  let lastKnownPriorities: FilePriority[] = [];
 
   function refreshFilesSummary(): void {
     let count = 0;
     let bytes = 0;
     for (const file of currentFiles) {
-      if (fileRows.get(file.path)?.check.checked) {
+      const row = fileRows.get(file.path);
+      if (row && row.priority !== "skip") {
         count += 1;
         bytes += file.length;
       }
     }
-    setText(filesSummary, `Выбрано ${count} из ${currentFiles.length} · ${fmtBytes(bytes)}`);
+    setText(filesSummary, `Скачивается ${count} из ${currentFiles.length} · ${fmtBytes(bytes)}`);
   }
 
-  function restoreFileSelection(values: boolean[]): void {
+  function restoreFilePriorities(values: FilePriority[]): void {
     currentFiles.forEach((file, index) => {
       const row = fileRows.get(file.path);
-      if (row) {
-        row.check.checked = values[index] ?? false;
+      const value = values[index] ?? file.priority;
+      if (row && row.priority !== value) {
+        row.priority = value;
+        row.select.setValue(value);
+        setAttr(row.el, "data-priority", value);
       }
     });
     refreshFilesSummary();
   }
 
-  function commitFileSelection(): void {
+  function commitFilePriorities(): void {
     const id = currentId;
     refreshFilesSummary();
     if (id === null) {
       return;
     }
-    const indices = currentFiles
-      .map((file, index) => (fileRows.get(file.path)?.check.checked ? index : -1))
-      .filter((index) => index >= 0);
-    // Пустой набор не принимается движком — покажем это через тост и откат.
-    void options.onFileSelection(id, indices).catch(() => restoreFileSelection(lastKnownSelection));
+    // Движок принимает только полный набор приоритетов в порядке файлов.
+    const priorities = currentFiles.map((file) => fileRows.get(file.path)?.priority ?? file.priority);
+    void options
+      .onFilePriorities(id, priorities)
+      .catch(() => restoreFilePriorities(lastKnownPriorities));
   }
 
-  selectAllButton.addEventListener("click", () => {
+  function applyPriority(priority: FilePriority): void {
     for (const row of fileRows.values()) {
-      row.check.checked = true;
+      row.priority = priority;
+      row.select.setValue(priority);
+      setAttr(row.el, "data-priority", priority);
     }
-    commitFileSelection();
-  });
-  selectNoneButton.addEventListener("click", () => {
-    for (const row of fileRows.values()) {
-      row.check.checked = false;
-    }
-    commitFileSelection();
-  });
+    commitFilePriorities();
+  }
+
+  selectAllButton.addEventListener("click", () => applyPriority("normal"));
+  selectNoneButton.addEventListener("click", () => applyPriority("skip"));
 
   function renderTrackers(trackers: string[]): void {
     const seen = new Set<string>();
@@ -736,6 +782,8 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
       setText(toggleLabelEl, actionState.label);
       setAttr(toggle, "aria-label", `${actionState.label}: ${torrent.name}`);
     }
+    // Во время перепроверки движок не принимает паузу (1.3).
+    toggle.disabled = torrent.state === "checking";
 
     setScaleX(fill, torrent.progress, scale);
     setText(percent, fmtPercent(torrent.progress));
@@ -743,10 +791,17 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     setAttr(bar, "aria-valuenow", String(Math.round(torrent.progress * 100)));
 
     const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
+    // Все файлы исключены (1.3): качать нечего, поэтому «осталось 0» — это ещё не «завершено».
+    const allSkipped = torrent.wanted_bytes === 0 && torrent.files.length > 0;
     setText(downloaded.value, fmtBytes(torrent.downloaded_bytes));
     setText(
       downloaded.sub,
-      torrent.wanted_bytes > 0 ? `из ${fmtBytes(torrent.wanted_bytes)}` : "размер неизвестен",
+      torrent.wanted_bytes > 0
+        ? `из ${fmtBytes(torrent.wanted_bytes)}`
+        : torrent.total_bytes > 0
+          ? // Все файлы исключены: размер известен, но скачивать нечего.
+            `из ${fmtBytes(torrent.total_bytes)}`
+          : "размер неизвестен",
     );
     setText(uploaded.value, fmtBytes(torrent.uploaded_bytes));
     setText(uploaded.sub, "за сессию");
@@ -755,7 +810,13 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     setText(left.value, remaining > 0 ? fmtBytes(remaining) : "—");
     setText(
       left.sub,
-      remaining > 0 && torrent.eta_seconds !== null ? fmtEta(torrent.eta_seconds) : "завершено",
+      remaining > 0
+        ? torrent.eta_seconds !== null
+          ? fmtEta(torrent.eta_seconds)
+          : "осталось неизвестно"
+        : allSkipped
+          ? "файлы не выбраны"
+          : "завершено",
     );
 
     renderFiles(torrent.files);

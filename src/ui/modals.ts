@@ -795,6 +795,22 @@ export function createModalHost(root: HTMLElement): ModalHost {
       settings.seed_after_complete,
     );
 
+    // 1.3: очередь — сколько торрентов качать и раздавать одновременно.
+    const maxActiveDowns = numberInput(settings.max_active_downloads, { min: "0", max: "100", step: "1" });
+    const maxActiveSeeds = numberInput(settings.max_active_seeds, { min: "0", max: "100", step: "1" });
+    const queueGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Очередь и активность" }),
+      h(
+        "div",
+        { class: "field-row" },
+        field("Одновременно скачивать", maxActiveDowns),
+        field("Одновременно раздавать", maxActiveSeeds),
+      ),
+      h("p", { class: "field__hint", text: "0 — без ограничения." }),
+    );
+
     // 1.2: автозагрузка и поведение окна в трее.
     const autostart = checkboxRow(
       "Запускать при входе в Windows",
@@ -852,6 +868,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Пиров на торрент", maxPeers),
       ),
       seed.row,
+      queueGroup,
       trayGroup,
       themeField,
       errorEl,
@@ -878,6 +895,14 @@ export function createModalHost(root: HTMLElement): ModalHost {
       }
       if (!Number.isFinite(peers) || !Number.isInteger(peers) || peers < 1 || peers > 500) {
         return "Пиров на торрент — целое число от 1 до 500";
+      }
+      const activeDowns = readNumber(maxActiveDowns);
+      const activeSeeds = readNumber(maxActiveSeeds);
+      if (!Number.isFinite(activeDowns) || !Number.isInteger(activeDowns) || activeDowns < 0 || activeDowns > 100) {
+        return "Одновременно скачивать — целое число от 0 до 100";
+      }
+      if (!Number.isFinite(activeSeeds) || !Number.isInteger(activeSeeds) || activeSeeds < 0 || activeSeeds > 100) {
+        return "Одновременно раздавать — целое число от 0 до 100";
       }
       return null;
     }
@@ -916,6 +941,8 @@ export function createModalHost(root: HTMLElement): ModalHost {
         upload_limit_kib: upLimit,
         listen_port: Math.round(readNumber(port)),
         seed_after_complete: seed.input.checked,
+        max_active_downloads: Math.round(readNumber(maxActiveDowns)),
+        max_active_seeds: Math.round(readNumber(maxActiveSeeds)),
         autostart: autostart.input.checked,
         start_minimized: startMinimized.input.checked,
         close_to_tray: closeToTray.input.checked,

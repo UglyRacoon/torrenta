@@ -20,6 +20,7 @@ const BADGES: Record<TorrentState, { label: string; cls: string }> = {
   metadata: { label: "Метаданные", cls: "metadata" },
   downloading: { label: "Загрузка", cls: "downloading" },
   seeding: { label: "Раздача", cls: "seeding" },
+  checking: { label: "Проверка", cls: "checking" },
   paused: { label: "Пауза", cls: "paused" },
   completed: { label: "Завершено", cls: "completed" },
   error: { label: "Ошибка", cls: "error" },
@@ -96,6 +97,9 @@ function actionFor(state: TorrentState): ActionKind | null {
     case "metadata":
     case "queued":
       return "pause";
+    case "checking":
+      // Во время перепроверки движок не принимает паузу.
+      return null;
     default:
       return null;
   }
@@ -120,6 +124,10 @@ function metaMainText(torrent: TorrentSnapshot): string {
 function metaStatusText(torrent: TorrentSnapshot): string {
   switch (torrent.state) {
     case "downloading":
+      // Все файлы исключены приоритетом «не скачивать»: качать нечего.
+      if (torrent.wanted_bytes === 0 && torrent.files.length > 0) {
+        return "файлы не выбраны";
+      }
       return torrent.eta_seconds === null ? "ETA неизвестно" : `осталось ${fmtEta(torrent.eta_seconds)}`;
     case "seeding":
       return `отдано ${fmtBytes(torrent.uploaded_bytes)}`;
@@ -129,6 +137,8 @@ function metaStatusText(torrent: TorrentSnapshot): string {
       return "ожидает запуска";
     case "metadata":
       return "ожидание метаданных";
+    case "checking":
+      return `проверка данных · ${fmtPercent(torrent.progress)}`;
     case "paused":
       return "приостановлен";
     case "error":

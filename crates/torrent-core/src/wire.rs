@@ -376,10 +376,7 @@ mod tests {
         // Трейлер после handshake допустим (дальше идут сообщения).
         let mut with_tail = encoded.clone();
         with_tail.extend_from_slice(&Message::Interested.encode());
-        assert_eq!(
-            Handshake::parse(&with_tail).unwrap().info_hash,
-            hash(2)
-        );
+        assert_eq!(Handshake::parse(&with_tail).unwrap().info_hash, hash(2));
     }
 
     #[test]
@@ -447,10 +444,7 @@ mod tests {
     fn decode_rejects_unknown_and_malformed() {
         assert_eq!(decode(&[99]).unwrap_err(), WireError::UnknownId(99));
         // choke с лишним байтом.
-        assert_eq!(
-            decode(&[0, 0]).unwrap_err(),
-            WireError::Malformed("choke")
-        );
+        assert_eq!(decode(&[0, 0]).unwrap_err(), WireError::Malformed("choke"));
         // have короче 5 байт.
         assert_eq!(decode(&[4, 0, 0]).unwrap_err(), WireError::Short);
         // request короче 13 байт.
@@ -462,7 +456,10 @@ mod tests {
         assert_eq!(decode(&[7, 0, 0, 0]).unwrap_err(), WireError::Short);
         // port ровно 3 байта обязателен.
         assert_eq!(decode(&[9, 0x1a]).unwrap_err(), WireError::Short);
-        assert_eq!(decode(&[9, 0x1a, 0xe1, 0x00]).unwrap_err(), WireError::Malformed("port"));
+        assert_eq!(
+            decode(&[9, 0x1a, 0xe1, 0x00]).unwrap_err(),
+            WireError::Malformed("port")
+        );
         // extended без ext_id.
         assert_eq!(decode(&[20]).unwrap_err(), WireError::Short);
     }

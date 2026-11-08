@@ -17,10 +17,10 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 | `tracker` | `AnnounceEvent`, `AnnounceRequest`, `AnnounceResponse`, `PeerAddr`, `TrackerError`, `build_http_url`, `http_announce`, `udp_announce`, `parse_response`, `parse_compact_peers`, `announce` | protocol |
 | `bitfield` | `Bitfield` | lead |
 | `peerid` | `generate_peer_id`, `client_name` | lead |
-| `storage` | `Storage` | lead |
-| `picker` | `PiecePicker`, `PieceStatus` | lead |
-| `selection` | `Selection`, `wanted_pieces`, `wanted_downloaded`, `effective_limit` (crate-private) | core |
-| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `AddOptions`, `TorrentPreview`, ... | core |
+| `storage` | `Storage`, `release_writes`/`acquire_writes`/`writes_released`, общий режим доступа к файлам | lead |
+| `picker` | `PiecePicker`, `PieceStatus`, `set_levels`/`level`/`reset_have` | lead |
+| `selection` | `Selection`, `wanted_pieces`, `wanted_downloaded`, `effective_limit`, `piece_levels`/`level_of` (crate-private) | core |
+| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `AddOptions`, `TorrentPreview`, `FilePriority`, `FileView`, `PlanKind`/`plan` (crate-private) | core |
 
 ## `bencode`
 
@@ -182,14 +182,20 @@ pub struct EngineConfig {
     pub upload_limit_kib: u32,          // 0 = без лимита
     pub listen_port: u16,               // 0 = свободный порт
     pub seed_after_complete: bool,      // по умолчанию true
+    pub max_active_downloads: usize,    // 1.3: 0 = без ограничения
+    pub max_active_seeds: usize,        // 1.3: 0 = без ограничения
 }
 impl Default for EngineConfig { ... }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum TorrentState { Queued, Metadata, Downloading, Seeding, Paused, Completed, Error }
+pub enum TorrentState { Queued, Metadata, Checking, Downloading, Seeding, Paused, Completed, Error }
 
-#[derive(Serialize, Clone)] pub struct FileView { pub path: String, pub length: u64, pub downloaded: u64, pub selected: bool }
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FilePriority { Skip, Low, #[default] Normal, High }
+
+#[derive(Serialize, Clone)] pub struct FileView { pub path: String, pub length: u64, pub downloaded: u64, pub selected: bool, pub priority: FilePriority }
 #[derive(Serialize, Clone)] pub struct PeerView { pub addr: String, pub client: String, pub down_rate: f64, pub up_rate: f64, pub progress: f64, pub is_seed: bool }
 #[derive(Serialize, Clone)] pub struct TorrentSnapshot {
     pub id: u64,
@@ -244,7 +250,8 @@ pub struct AddOptions { pub save_path: Option<PathBuf>, pub files: Option<Vec<us
     #[error("ошибка ввода-вывода: {0}")] Io(String),
     #[error("торрент {0} не найден")] NotFound(u64),
     #[error("торрент уже добавлен: {0}")] Duplicate(String),
-    #[error("некорректный выбор файлов: {0}")] Selection(String),
+    #[error("не выбран ни один файл")] Selection,
+    #[error("торрент ещё не готов к перепроверке")] NotReady,
 }
 
 pub struct TorrentManager { /* private */ }
@@ -260,6 +267,8 @@ impl TorrentManager {
     pub async fn add_magnet(&self, link: &str, save_path: Option<PathBuf>) -> Result<u64, EngineError>;
     pub async fn add_magnet_with(&self, link: &str, options: AddOptions) -> Result<u64, EngineError>;
     pub fn set_file_selection(&self, id: u64, files: Vec<usize>) -> Result<(), EngineError>;
+    pub fn set_file_priorities(&self, id: u64, priorities: Vec<FilePriority>) -> Result<(), EngineError>;
+    pub fn recheck(&self, id: u64) -> Result<(), EngineError>;
     pub fn set_limits(&self, id: u64, down_kib: u32, up_kib: u32) -> Result<(), EngineError>;
     pub fn pause(&self, id: u64) -> Result<(), EngineError>;
     pub fn resume(&self, id: u64) -> Result<(), EngineError>;
@@ -296,6 +305,13 @@ pub enum EngineEvent {
   announce и подключение к пирам. Дополнительно `resume` возвращает в очередь
   подключения уже известные адреса (`Runtime::requeue_peers`), поэтому загрузка
   возобновляется сразу, не дожидаясь следующего объявления трекера (30–1800 с).
+  Ручная пауза запоминается (`flags.user_paused`): такой торрент очередь не
+  запускает, а `resume` лишь снимает флаг — окончательное решение снова за
+  `schedule`, поэтому при заполненном лимите он может уйти в `Queued`.
+* Ограничения `max_active_downloads`/`max_active_seeds` применяются внутри
+  движка: `schedule` вызывается после каждого изменения и раз в тик, лишние
+  торренты паркуются в `Queued`, освободившийся слот достаётся самому раннему по
+  `added_at`/`id`. Загрузки и раздачи считаются отдельно, `0` — без ограничения.
 * Испорченный кусок (несовпадение SHA-1) не блокирует торрент: он освобождается
   и откладывается на `1500 мс × число неудач` (не более 10 с), а `next_requests`
   выбирает другие куски. Когда отложенных не осталось, берутся и «остывающие» —
@@ -325,9 +341,10 @@ files)` меняет выбор на лету:
   выбрасываются, запросы у пиров снимаются, куски возвращаются в раздачу;
 * уже скачанные данные не удаляются и остаются «на диске»; после расширения
   выбора они не перекачиваются (кусок считается готовым по битфилду);
-* `progress`, `eta_seconds` и `FileView.downloaded` считаются по выбранным
-  файлам; `total_bytes` остаётся полным размером торрента, `wanted_bytes` —
-  объём выбора, `pieces_have`/`pieces_total` — по всему торренту;
+* `progress`, `eta_seconds` и `wanted_bytes` считаются по выбранным файлам;
+  `total_bytes` остаётся полным размером торрента, `pieces_have`/`pieces_total` —
+  по всему торренту. `FileView.downloaded` пока всегда `0`: прогресс отдаётся
+  только суммарно по торренту, отдельного учёта скачанного по файлам нет;
 * завершение наступает, когда скачаны все **нужные** куски: состояние
   `Seeding`/`Completed`, даже если `pieces_have < piece_count`;
 * `Selection` и его хелперы (`wanted_pieces`, `wanted_downloaded`,
@@ -354,3 +371,65 @@ files)` меняет выбор на лету:
 остаётся. Ошибка по таймауту: «не удалось получить метаданные за отведённое
 время». Ограничение: метаданные ищутся только у пиров с трекеров (без DHT/PEX),
 а у magnet-ссылки без списка файлов `add_magnet_with` получает полный выбор.
+
+## Приоритеты, очередь и перепроверка (1.3)
+
+**Приоритеты файлов.** `FilePriority` (`Skip`, `Low`, `Normal`, `High`) — сериализуется
+в нижнем регистре (`"skip"`, `"low"`, `"normal"`, `"high"`), по умолчанию `Normal`.
+`set_file_priorities(id, priorities)` принимает вектор **длиной ровно в число файлов**
+торрента (иначе `EngineError::Selection`, неизвестный id — `NotFound`) и меняет
+набор нужных кусков вместе с порядком их выдачи:
+
+* `Skip` — файл не скачивается (то же, что снять выбор); `selected` в `FileView`
+  всегда согласован: `priority != Skip`;
+* `Low`/`Normal`/`High` превращаются в уровни кусков `0/1/2`
+  (`selection::level_of`), общий кусок нескольких файлов получает **максимальный**
+  уровень; `picker` перебирает уровни от старшего к младшему, внутри уровня
+  сохраняется rarest-first;
+* приоритет меняет только порядок загрузки, а не скорость: лимиты и общий пул
+  аренд прежние, скачанное не перекачивается и не удаляется;
+* смена приоритетов пересчитывает `wanted_bytes`/`progress`/`eta` и отправляет
+  трекеру свежий `left` так же, как смена выбора;
+* для magnet до получения метаданных приоритеты откладываются
+  (`pending_priorities`) и применяются автоматически, когда `Metainfo` готов;
+* `AddOptions` приоритеты не принимает: при добавлении задаётся только выбор
+  файлов, приоритеты — отдельным вызовом после добавления.
+
+**Очередь и лимиты активности.** `EngineConfig.max_active_downloads` и
+`max_active_seeds` (`0` — без ограничения, значения ограничены сверху
+`MAX_ACTIVE_LIMIT = 500`, в настройках Tauri — 100). `schedule` строит план
+(`PlanKind`: `Download`/`Seed`/`Idle`) по состояниям и лимитам, считая загрузки и
+раздачи отдельно:
+
+* кандидаты сортируются по `added_at`, затем `id`; активные получают слот,
+  остальные паркуются — состояние `Queued`, пауза движка, файлы только на чтение;
+* `Idle` (ручная пауза, `Checking`, `Error`, удаление, завершённый при выключенной
+  раздаче) слот не занимает и в очередь не ставится;
+* завершившийся торрент переезжает из слота загрузки в слот раздачи; освободившееся
+  место тут же достаётся следующему, потому что `schedule` вызывается и на тике;
+* `recheck` слот не занимает: пока идёт проверка, место может занять другой торрент.
+
+**Перепроверка.** `recheck(id)`:
+
+* magnet без метаданных → `EngineError::NotReady`; повторный вызов во время
+  проверки — идемпотентный `Ok(())`;
+* состояние → `Checking`, `pieces_have` обнуляется и растёт по мере проверки,
+  `eta_seconds = 0`, обмен останавливается, запись на диск отпускается;
+* `verify_all` читает каждый кусок из `Storage`, считает SHA-1 и сравнивает с
+  эталоном, восстанавливая битовую карту; при остановке менеджера проверка
+  прерывается;
+* итоговое состояние — `Seeding`/`Completed`, `Downloading` (если нужны ещё куски)
+  или `Paused`, если пользователь поставил паузу до проверки;
+* если торрент продолжает качать, запись забирается обратно (`acquire_writes`);
+* при завершении отправляется `announce_now` с `event=completed`; пиры не
+  переподключаются, известные адреса сохраняются.
+
+**Доступ к файлам (Windows).** `Storage` открывает файлы с общим доступом
+`read | write | delete`, поэтому дескриптор торрента не блокирует запуск `.exe`.
+Запись держится только пока идёт загрузка; на паузе, в `Queued`, после завершения
+и во время проверки файлы переоткрываются только на чтение
+(`release_writes`), а перед записью — возвращаются в режим записи
+(`acquire_writes`). Запись в файл после `release_writes` возвращает
+`PermissionDenied` — это ожидаемое поведение, а не сбой. Проверки при добавлении
+торрента по-прежнему нет: диск не хэшируется, пока пользователь явно не вызовет
+`recheck`.

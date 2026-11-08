@@ -356,6 +356,120 @@ impl Runtime {
         lk(&self.state).picker.is_complete()
     }
 
+    /// Закрывает файлы на запись, оставляя их читаемыми для других программ.
+    ///
+    /// Windows не даёт запустить `.exe` и открыть файл, пока на нём висит
+    /// дескриптор с правом записи, поэтому завершённые, приостановленные и
+    /// стоящие в очереди торренты держат файлы только для чтения.
+    pub(crate) fn release_writes(&self) -> Result<(), String> {
+        let mut storage = lk(&self.storage);
+        storage
+            .release_writes()
+            .map_err(|err| format!("не удалось освободить файлы: {err}"))
+    }
+
+    /// Снова открывает файлы на запись: торрент продолжает загрузку.
+    pub(crate) fn acquire_writes(&self) -> Result<(), String> {
+        let mut storage = lk(&self.storage);
+        storage
+            .acquire_writes()
+            .map_err(|err| format!("не удалось открыть файлы для записи: {err}"))
+    }
+
+    /// Перепроверяет все куски на диске по SHA-1 и восстанавливает битовую карту.
+    ///
+    /// Вызывается ручной перепроверкой (`TorrentManager::recheck`): на время
+    /// работы обмен с пирами остановлен, прогресс растёт в `pieces_have`, а по
+    /// завершении состояние приводится в соответствие с тем, что реально
+    /// лежит на диске.
+    pub(crate) async fn verify_all(self: &Arc<Self>) {
+        let piece_count = self.meta.info.piece_count();
+        // Обмен остановлен, поэтому очереди запросов и недоделанные буферы
+        // можно выбросить целиком: после проверки они всё равно не нужны.
+        {
+            let mut state = lk(&self.state);
+            state.buffers.clear();
+            state.pending.clear();
+            state.cooldown.clear();
+            for peer in state.peers.values_mut() {
+                peer.owned_piece = None;
+                peer.inflight.clear();
+            }
+            state.picker.reset_have();
+        }
+        self.stats.pieces_have.store(0, Ordering::Relaxed);
+        self.stats.have_bytes.store(0, Ordering::Relaxed);
+        let mut good_bytes = 0u64;
+        for index in 0..piece_count {
+            if self.stopping() {
+                // Движок останавливается или торрент удаляют — прерываемся.
+                return;
+            }
+            let size = self.meta.info.piece_size(index) as usize;
+            let offset = self.meta.info.piece_offset(index);
+            let read = {
+                let storage = lk(&self.storage);
+                storage.read_at(offset, size)
+            };
+            let valid = match read {
+                // Длина должна совпасть: недлинное чтение означает дыру в файлах.
+                Ok(data) if data.len() == size => {
+                    let expected = self.meta.info.pieces[index];
+                    let mut hasher = Sha1::new();
+                    hasher.update(&data);
+                    hasher.finalize().as_slice() == expected.as_bytes().as_slice()
+                }
+                // Файла или куска на диске нет — данных нет.
+                _ => false,
+            };
+            if valid {
+                good_bytes += size as u64;
+                lk(&self.state).picker.mark_have(index);
+                self.stats.pieces_have.fetch_add(1, Ordering::Relaxed);
+                let _ = self.have_tx.send(index as u32);
+            }
+            // Уступаем поток другим задачам: проверка большого торрента не
+            // должна держать рантайм на несколько секунд.
+            tokio::task::yield_now().await;
+        }
+        // Байт «на диске» — сумма проверенных кусков: это правда, а не сессия.
+        self.stats.have_bytes.store(good_bytes, Ordering::Relaxed);
+        let complete = self.is_complete();
+        let seed = rd(&self.env.config).seed_after_complete;
+        let mut next = match (complete, seed) {
+            (true, true) => TorrentState::Seeding,
+            (true, false) => TorrentState::Completed,
+            (false, _) => TorrentState::Downloading,
+        };
+        // Пользовательская пауза сильнее результата проверки: торрент так и
+        // остаётся на паузе, пока его не снимут с неё.
+        if self.flags.user_paused() {
+            next = TorrentState::Paused;
+        }
+        if next == TorrentState::Downloading {
+            if let Err(message) = self.acquire_writes() {
+                let _ = self.env.events.send(EngineEvent::Error {
+                    id: self.id,
+                    message,
+                });
+            }
+        } else if let Err(message) = self.release_writes() {
+            let _ = self.env.events.send(EngineEvent::Error {
+                id: self.id,
+                message,
+            });
+        }
+        *lk(&self.stats.state) = next;
+        let _ = self.env.events.send(EngineEvent::StateChanged {
+            id: self.id,
+            state: next,
+        });
+        if complete {
+            // Трекеру мог понадобиться `event=completed` — сообщаем сразу.
+            self.announce_now.notify_waiters();
+        }
+    }
+
     pub(crate) fn max_peers(&self) -> usize {
         rd(&self.env.config).max_peers_per_torrent.clamp(1, 200)
     }
@@ -477,7 +591,11 @@ impl Runtime {
         if index as usize >= self.meta.info.piece_count() {
             return;
         }
-        match state.peers.get(&id).map(|peer| peer.have.get(index as usize)) {
+        match state
+            .peers
+            .get(&id)
+            .map(|peer| peer.have.get(index as usize))
+        {
             Some(false) => {}
             _ => return,
         }
@@ -548,7 +666,13 @@ impl Runtime {
         // при этом глобальное ведро общее для всей сессии.
         let global = rd(&self.env.config).download_limit_kib;
         let local = rd(&self.env.limits).down_kib;
-        grant_download(&self.down_limiter, &self.env.shared.down, global, local, want)
+        grant_download(
+            &self.down_limiter,
+            &self.env.shared.down,
+            global,
+            local,
+            want,
+        )
     }
 
     /// Подбирает блоки, которые надо запросить у пира.
@@ -574,7 +698,8 @@ impl Runtime {
             // на испорченном куске зацикливается всё, а остальные голодают.
             let now = Instant::now();
             state.cooldown.retain(|_, entry| entry.until > now);
-            let mut exclude: HashSet<usize> = state.cooldown.keys().map(|index| *index as usize).collect();
+            let mut exclude: HashSet<usize> =
+                state.cooldown.keys().map(|index| *index as usize).collect();
             let mut picked = state.picker.pick(&peer_have, &exclude);
             if picked.is_none() && !exclude.is_empty() {
                 // Все доступные куски на паузе — лучше попробовать снова, чем
@@ -632,6 +757,11 @@ impl Runtime {
         begin: u32,
         data: Vec<u8>,
     ) -> Result<Option<(u32, Vec<u8>)>, String> {
+        // Торрент на паузе или в очереди: файлы открыты только для чтения,
+        // поэтому поздний блок просто выбрасываем (кусок докачаем позже).
+        if self.flags.paused() {
+            return Ok(None);
+        }
         let mut state = lk(&self.state);
         if let Some(peer) = state.peers.get_mut(&id) {
             peer.down_bytes += data.len() as u64;
@@ -675,7 +805,11 @@ impl Runtime {
     }
 
     /// Проверяет SHA-1 куска, пишет его на диск и обновляет состояние.
-    pub(crate) fn complete_piece(self: &Arc<Self>, index: u32, data: &[u8]) -> Result<bool, String> {
+    pub(crate) fn complete_piece(
+        self: &Arc<Self>,
+        index: u32,
+        data: &[u8],
+    ) -> Result<bool, String> {
         let expected = match self.meta.info.pieces.get(index as usize) {
             Some(hash) => *hash,
             None => return Err("кусок за пределами торрента".to_string()),
@@ -707,9 +841,7 @@ impl Runtime {
                         strikes: 0,
                     });
                 entry.strikes = entry.strikes.saturating_add(1);
-                let pause = 1500u64
-                    .saturating_mul(entry.strikes as u64)
-                    .min(10_000);
+                let pause = 1500u64.saturating_mul(entry.strikes as u64).min(10_000);
                 entry.until = Instant::now() + Duration::from_millis(pause);
             }
         }
@@ -718,7 +850,14 @@ impl Runtime {
         }
         let offset = self.meta.info.piece_offset(index as usize);
         {
-            let storage = lk(&self.storage);
+            let mut storage = lk(&self.storage);
+            if storage.writes_released() {
+                // Файлы успели закрыть на запись (пауза, завершение, перепроверка):
+                // перед записью куска возвращаем дескрипторы в режим записи.
+                storage
+                    .acquire_writes()
+                    .map_err(|err| format!("не удалось открыть файлы для записи: {err}"))?;
+            }
             storage
                 .write_at(offset, data)
                 .map_err(|err| format!("не удалось записать кусок {index}: {err}"))?;
@@ -742,6 +881,15 @@ impl Runtime {
     }
 
     fn mark_complete(self: &Arc<Self>) {
+        // Всё нужное скачано: файлы больше не пишутся, поэтому отпускаем их,
+        // чтобы Windows разрешила запускать `.exe` и открывать их в других
+        // программах. Раздача продолжает работать — чтение не блокируется.
+        if let Err(message) = self.release_writes() {
+            let _ = self.env.events.send(EngineEvent::Error {
+                id: self.id,
+                message,
+            });
+        }
         let seed = rd(&self.env.config).seed_after_complete;
         let state = if seed {
             TorrentState::Seeding
@@ -749,15 +897,15 @@ impl Runtime {
             TorrentState::Completed
         };
         *lk(&self.stats.state) = state;
-        let _ = self.env.events.send(EngineEvent::StateChanged {
-            id: self.id,
-            state,
-        });
+        let _ = self
+            .env
+            .events
+            .send(EngineEvent::StateChanged { id: self.id, state });
         let name = rd(&self.stats.name).clone();
-        let _ = self.env.events.send(EngineEvent::Completed {
-            id: self.id,
-            name,
-        });
+        let _ = self
+            .env
+            .events
+            .send(EngineEvent::Completed { id: self.id, name });
     }
 
     // -- выбор файлов -------------------------------------------------------
@@ -768,6 +916,9 @@ impl Runtime {
         let mut state = lk(&self.state);
         let wanted = selection.pieces();
         state.picker.set_wanted(wanted);
+        // Приоритеты файлов задают порядок загрузки кусков: высокий приоритет
+        // качается первым, низкий — когда другого выбора нет.
+        state.picker.set_levels(selection.levels());
         // Ненужные куски возвращаем в пул и выбрасываем недоделанные буферы;
         // уже полученные данные при этом остаются на диске.
         let mut dropped: Vec<u32> = Vec::new();
@@ -823,6 +974,21 @@ impl Runtime {
             (true, false) => TorrentState::Completed,
             (false, _) => TorrentState::Downloading,
         };
+        // Запись нужна только пока идёт загрузка. Завершённый или раздающий
+        // торрент держит файлы только для чтения (см. `release_writes`).
+        if next == TorrentState::Downloading {
+            if let Err(message) = self.acquire_writes() {
+                let _ = self.env.events.send(EngineEvent::Error {
+                    id: self.id,
+                    message,
+                });
+            }
+        } else if let Err(message) = self.release_writes() {
+            let _ = self.env.events.send(EngineEvent::Error {
+                id: self.id,
+                message,
+            });
+        }
         let current = *lk(&self.stats.state);
         if current == next {
             return;
@@ -1078,10 +1244,16 @@ impl Runtime {
 pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(), String> {
     // Выбор файлов: заданный заранее (для magnet — после метаданных) или
     // полный по умолчанию.
-    let selection = match lk(&handle.pending_files).take() {
-        Some(files) => Selection::from_files(&meta.info, Some(&files))
+    let pending_files = lk(&handle.pending_files).take();
+    let pending_priorities = lk(&handle.pending_priorities).take();
+    let selection = match (pending_files, pending_priorities) {
+        // Явный список файлов важнее приоритетов, которые могли задать раньше.
+        (Some(files), _) => Selection::from_files(&meta.info, Some(&files))
             .ok_or_else(|| "не выбран ни один файл".to_string())?,
-        None => {
+        // Приоритеты задают и набор нужных файлов, и порядок их загрузки.
+        (None, Some(priorities)) => Selection::from_priorities(&meta.info, &priorities)
+            .ok_or_else(|| "неверное число приоритетов файлов".to_string())?,
+        (None, None) => {
             let existing = rd(&handle.selection).clone();
             if existing.is_empty() {
                 Selection::all(&meta.info)
@@ -1163,7 +1335,8 @@ async fn metadata_task(handle: Arc<TorrentHandle>) {
                     key: None,
                 };
                 if let Ok(response) =
-                    tracker::announce(&handle.env.http, url, &request, Duration::from_secs(20)).await
+                    tracker::announce(&handle.env.http, url, &request, Duration::from_secs(20))
+                        .await
                 {
                     for peer in response.peers {
                         let addr = SocketAddr::new(peer.ip, peer.port);

@@ -104,8 +104,8 @@ const UDP_ACTION_ERROR: u32 = 3;
 /// `info_hash` и `peer_id` кодируются как сырые байты (percent-encoding),
 /// поэтому нельзя использовать обычный urlencode строки.
 pub fn build_http_url(base: &str, req: &AnnounceRequest) -> Result<String, TrackerError> {
-    let mut url = url::Url::parse(base)
-        .map_err(|err| TrackerError::Unsupported(format!("{base}: {err}")))?;
+    let mut url =
+        url::Url::parse(base).map_err(|err| TrackerError::Unsupported(format!("{base}: {err}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -193,8 +193,8 @@ pub async fn udp_announce(
     req: &AnnounceRequest,
     timeout: Duration,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let url = url::Url::parse(base)
-        .map_err(|err| TrackerError::Unsupported(format!("{base}: {err}")))?;
+    let url =
+        url::Url::parse(base).map_err(|err| TrackerError::Unsupported(format!("{base}: {err}")))?;
     if url.scheme() != "udp" {
         return Err(TrackerError::Unsupported(format!(
             "{base}: ожидалась схема udp"
@@ -264,7 +264,12 @@ pub async fn udp_announce(
     packet.extend_from_slice(&req.downloaded.to_be_bytes());
     packet.extend_from_slice(&req.left.to_be_bytes());
     packet.extend_from_slice(&req.uploaded.to_be_bytes());
-    packet.extend_from_slice(&req.event.map(|e| e.as_udp_code()).unwrap_or(0).to_be_bytes());
+    packet.extend_from_slice(
+        &req.event
+            .map(|e| e.as_udp_code())
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
     packet.extend_from_slice(&0u32.to_be_bytes()); // ip: 0.0.0.0 = «пусть трекер угадает»
     packet.extend_from_slice(&req.key.unwrap_or(0).to_be_bytes());
     packet.extend_from_slice(&req.num_want.map(|n| n as i32).unwrap_or(-1).to_be_bytes());
@@ -350,7 +355,9 @@ pub fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     }
 
     let mut response = AnnounceResponse {
-        interval: dict_int(dict, "interval").map(non_negative_u64).unwrap_or(0),
+        interval: dict_int(dict, "interval")
+            .map(non_negative_u64)
+            .unwrap_or(0),
         min_interval: dict_int(dict, "min interval").map(non_negative_u64),
         warning: dict_str(dict, "warning message"),
         seeds: dict_int(dict, "complete").map(non_negative_u32),
@@ -576,13 +583,11 @@ mod tests {
 
     // ---------- build_http_url ----------
 
-
     #[test]
     fn build_http_url_percent_encodes_raw_hash_bytes() {
         let mut req = request();
         req.info_hash = InfoHash::new([
-            0x00, 0xFF, b' ', b'+', b'&', b'=', 0x80, 0x7F, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-            12,
+            0x00, 0xFF, b' ', b'+', b'&', b'=', 0x80, 0x7F, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
         ]);
         let url = build_http_url("http://tracker.example/announce", &req).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -592,7 +597,10 @@ mod tests {
 
         let query = parsed.query().unwrap();
         // Ровно те байты, что в info-hash: '%' не должен перекодироваться в '%25'.
-        assert!(query.contains("info_hash=%00%FF%20%2B%26%3D%80%7F"), "{query}");
+        assert!(
+            query.contains("info_hash=%00%FF%20%2B%26%3D%80%7F"),
+            "{query}"
+        );
 
         let mut seen = 0;
         for pair in query.split('&') {
@@ -696,8 +704,8 @@ mod tests {
     #[test]
     fn parse_response_compact_with_all_fields() {
         let peers = [127u8, 0, 0, 1, 0x1a, 0xe1, 10, 0, 0, 3, 0x1f, 0x90];
-        let mut body = b"d8:completei5e10:incompletei3e8:intervali1800e12:min intervali60e5:peers"
-            .to_vec();
+        let mut body =
+            b"d8:completei5e10:incompletei3e8:intervali1800e12:min intervali60e5:peers".to_vec();
         body.extend_from_slice(format!("{}:", peers.len()).as_bytes());
         body.extend_from_slice(&peers);
         body.extend_from_slice(b"15:warning message4:oops");
@@ -839,7 +847,10 @@ mod tests {
                 u64::from_be_bytes(buf[56..64].try_into().unwrap()),
                 req.downloaded
             );
-            assert_eq!(u64::from_be_bytes(buf[64..72].try_into().unwrap()), req.left);
+            assert_eq!(
+                u64::from_be_bytes(buf[64..72].try_into().unwrap()),
+                req.left
+            );
             assert_eq!(
                 u64::from_be_bytes(buf[72..80].try_into().unwrap()),
                 req.uploaded
@@ -857,7 +868,10 @@ mod tests {
                 u32::from_be_bytes(buf[92..96].try_into().unwrap()),
                 req.num_want.unwrap()
             );
-            assert_eq!(u16::from_be_bytes(buf[96..98].try_into().unwrap()), req.port);
+            assert_eq!(
+                u16::from_be_bytes(buf[96..98].try_into().unwrap()),
+                req.port
+            );
 
             let mut reply = Vec::new();
             reply.extend_from_slice(&UDP_ACTION_ANNOUNCE.to_be_bytes());
@@ -939,9 +953,13 @@ mod tests {
 
     #[tokio::test]
     async fn udp_announce_requires_udp_scheme() {
-        let err = udp_announce("http://t.example/announce", &request(), Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err = udp_announce(
+            "http://t.example/announce",
+            &request(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TrackerError::Unsupported(_)), "{err:?}");
     }
 
@@ -996,7 +1014,10 @@ mod tests {
         assert_eq!(resp.peers.len(), 1);
         assert_eq!(resp.peers[0].to_string(), "127.0.0.1:6881");
         let first_line = wire_request.lines().next().unwrap();
-        assert!(first_line.starts_with("GET /announce?info_hash="), "{first_line}");
+        assert!(
+            first_line.starts_with("GET /announce?info_hash="),
+            "{first_line}"
+        );
         assert!(wire_request.contains("compact=1"), "{wire_request}");
     }
 
@@ -1055,4 +1076,3 @@ mod tests {
         assert_eq!(resp.peers[0].to_string(), "10.0.0.7:80");
     }
 }
-

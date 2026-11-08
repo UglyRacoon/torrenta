@@ -7,7 +7,14 @@ export type TorrentState =
   | "seeding"
   | "paused"
   | "completed"
+  | "checking"
   | "error";
+
+/**
+ * Приоритет файла (1.3). Не скачивать = "skip": такой файл не входит
+ * в wanted_bytes, поэтому selected всегда равен `priority !== "skip"`.
+ */
+export type FilePriority = "skip" | "low" | "normal" | "high";
 
 /** Файл внутри торрента. selected — выбран ли файл для скачивания. */
 export interface FileView {
@@ -15,6 +22,7 @@ export interface FileView {
   length: number;
   downloaded: number;
   selected: boolean;
+  priority: FilePriority;
 }
 
 export interface PeerView {
@@ -81,6 +89,10 @@ export interface SettingsDto {
   start_minimized: boolean;
   /** Крестик окна сворачивает в трей, а не закрывает приложение (1.2). */
   close_to_tray: boolean;
+  /** Сколько торрентов одновременно скачивать (1.3); 0 — без ограничения. */
+  max_active_downloads: number;
+  /** Сколько торрентов одновременно раздавать (1.3); 0 — без ограничения. */
+  max_active_seeds: number;
   theme: ThemeName;
 }
 

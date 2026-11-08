@@ -190,7 +190,9 @@ impl Metainfo {
             announce_list: announce_list_of(dict),
             comment: dict_str(dict, "comment"),
             created_by: dict_str(dict, "created by"),
-            creation_date: dict.get(b"creation date".as_slice()).and_then(Value::as_int),
+            creation_date: dict
+                .get(b"creation date".as_slice())
+                .and_then(Value::as_int),
             info,
             info_hash,
             raw_info,
@@ -296,7 +298,8 @@ fn top_level_spans(data: &[u8]) -> Result<BTreeMap<Vec<u8>, (usize, usize)>, Met
                 };
                 pos += key_len;
                 let start = pos;
-                let (_, value_len) = bencode::decode(&data[pos..]).map_err(MetainfoError::Bencode)?;
+                let (_, value_len) =
+                    bencode::decode(&data[pos..]).map_err(MetainfoError::Bencode)?;
                 pos += value_len;
                 spans.insert(key, (start, pos));
             }
@@ -384,15 +387,12 @@ fn parse_info(raw_info: &[u8], name_hint: Option<&str>) -> Result<Info, Metainfo
         let mut files = Vec::with_capacity(entries.len());
         let mut offset: u64 = 0;
         for entry in entries {
-            let file_dict = entry
-                .as_dict()
-                .ok_or(MetainfoError::InvalidInfo("files"))?;
+            let file_dict = entry.as_dict().ok_or(MetainfoError::InvalidInfo("files"))?;
             let length = file_dict
                 .get(b"length".as_slice())
                 .and_then(Value::as_int)
                 .filter(|v| *v >= 0)
-                .ok_or(MetainfoError::InvalidInfo("file length"))?
-                as u64;
+                .ok_or(MetainfoError::InvalidInfo("file length"))? as u64;
             let path = file_path(file_dict)?;
             files.push(FileEntry {
                 path,
@@ -472,14 +472,8 @@ mod tests {
         Value::Dict(BTreeMap::from([
             (b"length".to_vec(), Value::int(700_000)),
             (b"name".to_vec(), Value::string("ubuntu.iso")),
-            (
-                b"piece length".to_vec(),
-                Value::int(PIECE_LEN as i64),
-            ),
-            (
-                b"pieces".to_vec(),
-                Value::bytes(piece_hashes(3, 0x11)),
-            ),
+            (b"piece length".to_vec(), Value::int(PIECE_LEN as i64)),
+            (b"pieces".to_vec(), Value::bytes(piece_hashes(3, 0x11))),
         ]))
     }
 
@@ -499,14 +493,8 @@ mod tests {
     fn multi_file_torrent() -> Vec<u8> {
         let info = Value::Dict(BTreeMap::from([
             (b"name".to_vec(), Value::string("collection")),
-            (
-                b"piece length".to_vec(),
-                Value::int(PIECE_LEN as i64),
-            ),
-            (
-                b"pieces".to_vec(),
-                Value::bytes(piece_hashes(4, 0x40)),
-            ),
+            (b"piece length".to_vec(), Value::int(PIECE_LEN as i64)),
+            (b"pieces".to_vec(), Value::bytes(piece_hashes(4, 0x40))),
             (
                 b"files".to_vec(),
                 Value::List(vec![
@@ -519,10 +507,7 @@ mod tests {
                     ])),
                     Value::Dict(BTreeMap::from([
                         (b"length".to_vec(), Value::int(2048)),
-                        (
-                            b"path".to_vec(),
-                            Value::List(vec![Value::string("b.bin")]),
-                        ),
+                        (b"path".to_vec(), Value::List(vec![Value::string("b.bin")])),
                     ])),
                 ]),
             ),
@@ -552,7 +537,10 @@ mod tests {
         assert_eq!(metainfo.info.files[0].path, "ubuntu.iso");
         assert_eq!(metainfo.info.files[0].offset, 0);
         assert_eq!(metainfo.info.files[0].length, 700_000);
-        assert_eq!(metainfo.announce.as_deref(), Some("http://tracker.example/announce"));
+        assert_eq!(
+            metainfo.announce.as_deref(),
+            Some("http://tracker.example/announce")
+        );
         assert_eq!(metainfo.comment.as_deref(), Some("demo torrent"));
         assert_eq!(metainfo.created_by.as_deref(), Some("torrenta tests"));
         assert_eq!(metainfo.creation_date, Some(1_700_000_000));
@@ -826,7 +814,10 @@ mod tests {
     fn raw_info_spans_survive_unknown_top_level_fields() {
         let torrent = bencode::encode(&Value::Dict(BTreeMap::from([
             (b"announce".to_vec(), Value::string("http://t/announce")),
-            (b"zzz".to_vec(), Value::List(vec![Value::int(1), Value::int(2)])),
+            (
+                b"zzz".to_vec(),
+                Value::List(vec![Value::int(1), Value::int(2)]),
+            ),
             (b"info".to_vec(), single_file_info()),
         ])));
         let metainfo = Metainfo::parse(&torrent).unwrap();

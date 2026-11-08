@@ -4,6 +4,7 @@ import type {
   AppInfoDto,
   AppPayload,
   AutoShutdownState,
+  FilePriority,
   FileView,
   GlobalTotals,
   PeerView,
@@ -30,6 +31,10 @@ interface Runtime {
   upTarget: number;
   phase: number;
   metaUntil: number;
+  /** Торрент вытеснен лимитом активности (1.3) и ждёт свободный слот. */
+  waiting?: "download" | "seed" | null;
+  /** Идёт перепроверка (1.3): к чему вернуться и сколько кусков пройдено. */
+  check?: { resume: TorrentState; total: number; done: number } | null;
 }
 
 function delay(ms: number): Promise<void> {
@@ -79,11 +84,18 @@ function peer(
   return { addr, client, down_rate: down, up_rate: up, progress, is_seed: isSeed };
 }
 
+/** Приоритет и выбор файла всегда согласованы: «не скачивать» = skip. */
+function setPriority(file: FileView, priority: FilePriority): void {
+  file.priority = priority;
+  file.selected = priority !== "skip";
+}
+
 interface FixtureFile {
   path: string;
   length: number;
   downloaded: number;
   selected?: boolean;
+  priority?: FilePriority;
 }
 
 interface FixtureOptions {
@@ -110,8 +122,11 @@ interface FixtureOptions {
 
 function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
   const files: FileView[] = options.files.map((file) => ({
-    ...file,
+    path: file.path,
+    length: file.length,
+    downloaded: file.downloaded,
     selected: file.selected ?? true,
+    priority: file.priority ?? (file.selected === false ? "skip" : "normal"),
   }));
   const wanted =
     files.length > 0
@@ -438,12 +453,14 @@ export async function createMockApi(): Promise<EngineApi> {
     autostart: false,
     start_minimized: false,
     close_to_tray: false,
+    max_active_downloads: 0,
+    max_active_seeds: 0,
     theme: "dark",
   };
 
   const app: AppInfoDto = {
     name: "Torrenta",
-    version: "1.2.0",
+    version: "1.3.0",
     engine: "torrent-core 0.2.0",
     listen_port: 51413,
     platform: "windows",
@@ -565,6 +582,40 @@ export async function createMockApi(): Promise<EngineApi> {
     }
   }
 
+  /** Пересчёт прогресса после смены выбора/приоритетов файлов (как в бэкенде). */
+  function applyFileChange(torrent: TorrentSnapshot, before: number[]): void {
+    syncWanted(torrent);
+    if (torrent.wanted_bytes <= 0 && torrent.files.length > 0) {
+      // Ничего не выбрано: качать нечего, поэтому обнуляем прогресс и скорости.
+      torrent.downloaded_bytes = 0;
+      torrent.progress = 0;
+      torrent.pieces_have = 0;
+      torrent.down_rate = 0;
+      torrent.up_rate = 0;
+      torrent.eta_seconds = null;
+      for (const file of torrent.files) {
+        file.downloaded = 0;
+      }
+      return;
+    }
+    const kept = torrent.files.reduce(
+      (sum, file, index) => sum + (file.selected ? Math.min(file.length, before[index]) : 0),
+      0,
+    );
+    torrent.downloaded_bytes = Math.min(kept, torrent.wanted_bytes);
+    syncFiles(torrent);
+    refreshProgress(torrent);
+    if (torrent.wanted_bytes > 0 && torrent.downloaded_bytes >= torrent.wanted_bytes) {
+      complete(torrent);
+    } else if (torrent.state === "completed" || torrent.state === "seeding") {
+      // Часть файлов отключили — загрузка вернулась в незавершённое состояние.
+      torrent.state = "paused";
+      torrent.down_rate = 0;
+      torrent.up_rate = 0;
+      torrent.eta_seconds = null;
+    }
+  }
+
   function autoState(): AutoShutdownState {
     return { enabled: settings.auto_shutdown, pending_seconds: autoPending };
   }
@@ -649,8 +700,20 @@ export async function createMockApi(): Promise<EngineApi> {
     torrent.up_rate = runtime.upTarget;
     torrent.eta_seconds = Math.ceil(2_400_000_000 / runtime.downTarget);
     torrent.files = [
-      { path: "Архив документации 2024.pdf", length: 1_850_000_000, downloaded: 0, selected: true },
-      { path: "Приложения/Справочник.djv", length: 550_000_000, downloaded: 0, selected: true },
+      {
+        path: "Архив документации 2024.pdf",
+        length: 1_850_000_000,
+        downloaded: 0,
+        selected: true,
+        priority: "normal",
+      },
+      {
+        path: "Приложения/Справочник.djv",
+        length: 550_000_000,
+        downloaded: 0,
+        selected: true,
+        priority: "normal",
+      },
     ];
     syncWanted(torrent);
     torrent.wanted_bytes = 2_400_000_000;
@@ -659,14 +722,103 @@ export async function createMockApi(): Promise<EngineApi> {
     }
   }
 
+  /**
+   * Лимиты активности (1.3): одновременно качают/раздают не больше N торрентов,
+   * остальные ждут в очереди и возвращаются сами, как только слот освободится.
+   * 0 — без ограничения, как в бэкенде.
+   */
+  function applyActiveLimits(): void {
+    const downCap =
+      settings.max_active_downloads > 0 ? settings.max_active_downloads : Number.POSITIVE_INFINITY;
+    const seedCap =
+      settings.max_active_seeds > 0 ? settings.max_active_seeds : Number.POSITIVE_INFINITY;
+    let downloading = 0;
+    let seeding = 0;
+    for (const torrent of torrents) {
+      const runtime = runtimes.get(torrent.id);
+      if (!runtime) {
+        continue;
+      }
+      const waitsForDown = torrent.state === "queued" && runtime.waiting === "download";
+      const waitsForSeed = torrent.state === "queued" && runtime.waiting === "seed";
+      if (torrent.state === "downloading" || waitsForDown) {
+        if (downloading < downCap) {
+          downloading += 1;
+          if (waitsForDown) {
+            runtime.waiting = null;
+            torrent.state = "downloading";
+          }
+        } else if (torrent.state === "downloading") {
+          runtime.waiting = "download";
+          torrent.state = "queued";
+          torrent.down_rate = 0;
+          torrent.up_rate = 0;
+          torrent.eta_seconds = null;
+        }
+        continue;
+      }
+      if (torrent.state === "seeding" || waitsForSeed) {
+        if (seeding < seedCap) {
+          seeding += 1;
+          if (waitsForSeed) {
+            runtime.waiting = null;
+            torrent.state = "seeding";
+          }
+        } else if (torrent.state === "seeding") {
+          runtime.waiting = "seed";
+          torrent.state = "queued";
+          torrent.down_rate = 0;
+          torrent.up_rate = 0;
+        }
+      }
+    }
+  }
+
+  /** Перепроверка (1.3): прогресс считается по кускам, затем возврат в прежнее состояние. */
+  function startRecheck(torrent: TorrentSnapshot): void {
+    const runtime =
+      runtimes.get(torrent.id) ??
+      { downTarget: 6_000_000, upTarget: 400_000, phase: 0, metaUntil: 0 };
+    runtimes.set(torrent.id, runtime);
+    runtime.waiting = null;
+    runtime.check = {
+      resume: torrent.state,
+      total: Math.max(1, torrent.piece_count),
+      done: 0,
+    };
+    torrent.state = "checking";
+    torrent.progress = 0;
+    torrent.down_rate = 0;
+    torrent.up_rate = 0;
+    torrent.eta_seconds = null;
+    start();
+  }
+
   function tick(): void {
     const stamp = Date.now();
+    applyActiveLimits();
     for (const torrent of torrents) {
       const runtime = runtimes.get(torrent.id);
       if (!runtime) {
         continue;
       }
       const state = stateOf(torrent);
+      if (state === "checking") {
+        const check = runtime.check;
+        if (!check) {
+          continue;
+        }
+        const step = Math.max(1, Math.ceil(check.total / 20));
+        check.done = Math.min(check.total, check.done + step);
+        torrent.pieces_have = check.done;
+        torrent.progress = check.done / check.total;
+        if (check.done >= check.total) {
+          runtime.check = null;
+          torrent.state = check.resume;
+          refreshProgress(torrent);
+        }
+        continue;
+      }
       if (state === "metadata") {
         if (runtime.metaUntil > 0 && stamp >= runtime.metaUntil) {
           runtime.metaUntil = 0;
@@ -675,6 +827,14 @@ export async function createMockApi(): Promise<EngineApi> {
         continue;
       }
       if (state === "downloading") {
+        if (torrent.wanted_bytes <= 0) {
+          // Все файлы исключены (приоритет «не скачивать»): качать нечего,
+          // движок простаивает — нули вместо скорости и ETA.
+          torrent.down_rate = 0;
+          torrent.up_rate = 0;
+          torrent.eta_seconds = null;
+          continue;
+        }
         const wobble = 0.78 + 0.44 * (0.5 + 0.5 * Math.sin(stamp / 2600 + runtime.phase));
         const rawDown = runtime.downTarget * wobble;
         const rawUp = runtime.upTarget * (0.7 + 0.6 * (0.5 + 0.5 * Math.sin(stamp / 3900 + runtime.phase)));
@@ -726,12 +886,16 @@ export async function createMockApi(): Promise<EngineApi> {
         : total > 0
           ? [{ path: name, length: total }]
           : [];
-    const files: FileView[] = sourceFiles.map((file, index) => ({
-      path: file.path,
-      length: file.length,
-      downloaded: 0,
-      selected: options.selected === null ? true : options.selected.includes(index),
-    }));
+    const files: FileView[] = sourceFiles.map((file, index) => {
+      const selected = options.selected === null ? true : options.selected.includes(index);
+      return {
+        path: file.path,
+        length: file.length,
+        downloaded: 0,
+        selected,
+        priority: selected ? "normal" : "skip",
+      };
+    });
     const torrent: TorrentSnapshot = {
       id,
       name,
@@ -841,25 +1005,46 @@ export async function createMockApi(): Promise<EngineApi> {
       const wanted = new Set(files);
       const before = torrent.files.map((file) => (file.selected ? file.downloaded : 0));
       torrent.files.forEach((file, index) => {
-        file.selected = wanted.has(index);
+        const selected = wanted.has(index);
+        // 1.3: выбранный файл получает обычный приоритет, снятый — «не скачивать».
+        setPriority(file, selected ? (file.priority === "skip" ? "normal" : file.priority) : "skip");
       });
-      syncWanted(torrent);
-      const kept = torrent.files.reduce(
-        (sum, file, index) => sum + (file.selected ? Math.min(file.length, before[index]) : 0),
-        0,
-      );
-      torrent.downloaded_bytes = Math.min(kept, torrent.wanted_bytes);
-      syncFiles(torrent);
-      refreshProgress(torrent);
-      if (torrent.wanted_bytes > 0 && torrent.downloaded_bytes >= torrent.wanted_bytes) {
-        complete(torrent);
-      } else if (torrent.state === "completed" || torrent.state === "seeding") {
-        // Часть файлов отключили — загрузка вернулась в незавершённое состояние.
-        torrent.state = "paused";
-        torrent.down_rate = 0;
-        torrent.up_rate = 0;
-        torrent.eta_seconds = null;
+      applyFileChange(torrent, before);
+      emit();
+    },
+
+    setFilePriorities: async (id, priorities) => {
+      const torrent = find(id);
+      await delay(140);
+      if (priorities.length !== torrent.files.length) {
+        throw new Error("Список приоритетов не совпадает с числом файлов");
       }
+      for (const priority of priorities) {
+        if (
+          priority !== "skip" &&
+          priority !== "low" &&
+          priority !== "normal" &&
+          priority !== "high"
+        ) {
+          throw new Error(`Неизвестный приоритет файла: ${String(priority)}`);
+        }
+      }
+      if (torrent.files.every((file, index) => file.priority === priorities[index])) {
+        return;
+      }
+      const before = torrent.files.map((file) => (file.selected ? file.downloaded : 0));
+      torrent.files.forEach((file, index) => setPriority(file, priorities[index]));
+      applyFileChange(torrent, before);
+      emit();
+    },
+
+    recheckTorrent: async (id) => {
+      const torrent = find(id);
+      await delay(120);
+      if (torrent.state === "checking") {
+        return;
+      }
+      startRecheck(torrent);
       emit();
     },
 
@@ -958,6 +1143,12 @@ export async function createMockApi(): Promise<EngineApi> {
       torrent.down_rate = 0;
       torrent.up_rate = 0;
       torrent.eta_seconds = null;
+      // Пауза прерывает и перепроверку, и ожидание слота активности (1.3).
+      const runtime = runtimes.get(id);
+      if (runtime) {
+        runtime.check = null;
+        runtime.waiting = null;
+      }
       emit();
     },
 
@@ -1020,6 +1211,11 @@ export async function createMockApi(): Promise<EngineApi> {
           torrent.down_rate = 0;
           torrent.up_rate = 0;
           torrent.eta_seconds = null;
+          const runtime = runtimes.get(torrent.id);
+          if (runtime) {
+            runtime.check = null;
+            runtime.waiting = null;
+          }
         }
       }
       emit();
@@ -1082,6 +1278,15 @@ export async function createMockApi(): Promise<EngineApi> {
       settings.autostart = Boolean(next.autostart);
       settings.start_minimized = Boolean(next.start_minimized);
       settings.close_to_tray = Boolean(next.close_to_tray);
+      // 1.3: лимиты очереди, 0 — без ограничения.
+      settings.max_active_downloads = Math.min(
+        100,
+        Math.max(0, Math.round(Number(next.max_active_downloads) || 0)),
+      );
+      settings.max_active_seeds = Math.min(
+        100,
+        Math.max(0, Math.round(Number(next.max_active_seeds) || 0)),
+      );
       if (!settings.auto_shutdown) {
         autoPending = null;
       }
@@ -1093,10 +1298,6 @@ export async function createMockApi(): Promise<EngineApi> {
     },
 
     revealTorrent: async () => {
-      await delay(100);
-    },
-
-    openDownloadDir: async () => {
       await delay(100);
     },
 

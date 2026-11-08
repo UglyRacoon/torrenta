@@ -36,7 +36,9 @@ const BTIH_PREFIX: &str = "urn:btih:";
 
 /// Быстрая проверка без полного разбора.
 pub fn is_magnet(link: &str) -> bool {
-    link.trim_start().to_ascii_lowercase().starts_with("magnet:?")
+    link.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("magnet:?")
 }
 
 /// Разбирает magnet-ссылку.
@@ -277,12 +279,18 @@ mod tests {
         );
         let magnet = parse(&link).unwrap();
         assert_eq!(magnet.display_name.as_deref(), Some("Торрент"));
-        assert_eq!(magnet.trackers, vec!["udp://t.example:80/announce".to_string()]);
+        assert_eq!(
+            magnet.trackers,
+            vec!["udp://t.example:80/announce".to_string()]
+        );
     }
 
     #[test]
     fn rejects_non_magnet_and_missing_hash() {
-        assert_eq!(parse("http://example.com/x.torrent").unwrap_err(), MagnetError::NotMagnet);
+        assert_eq!(
+            parse("http://example.com/x.torrent").unwrap_err(),
+            MagnetError::NotMagnet
+        );
         assert_eq!(parse("magnet:?").unwrap_err(), MagnetError::MissingInfoHash);
         assert_eq!(
             parse("magnet:?dn=name&tr=http%3A%2F%2Ft.example%2Fa").unwrap_err(),

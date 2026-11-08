@@ -56,6 +56,11 @@ export async function createTauriApi(): Promise<EngineApi> {
 
     setFileSelection: (id, files) => invoke<void>("set_file_selection", { id, files }),
 
+    setFilePriorities: (id, priorities) =>
+      invoke<void>("set_file_priorities", { id, priorities }),
+
+    recheckTorrent: (id) => invoke<void>("recheck_torrent", { id }),
+
     setTorrentLimits: (id, downKib, upKib) =>
       invoke<void>("set_torrent_limits", { id, downKib, upKib }),
 
@@ -87,7 +92,6 @@ export async function createTauriApi(): Promise<EngineApi> {
     },
 
     revealTorrent: (id) => invoke<void>("reveal_torrent", { id }),
-    openDownloadDir: () => invoke<void>("open_download_dir"),
     openExternal: (url) => invoke<void>("open_external", { url }),
 
     /**

@@ -60,6 +60,8 @@ pub fn run() {
             commands::preview_torrent,
             commands::add_torrent,
             commands::set_file_selection,
+            commands::recheck_torrent,
+            commands::set_file_priorities,
             commands::set_torrent_limits,
             commands::pick_torrent_files,
             commands::pick_download_dir,

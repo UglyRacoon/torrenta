@@ -58,14 +58,8 @@ async fn corrupted_block_is_rejected_and_piece_is_downloaded_again() {
     // Сидер один раз отдаёт испорченный блок куска №2, дальше отдаёт верные данные.
     // Значит движок обязан: (1) отбраковать кусок по SHA-1, (2) не записать его на
     // диск, (3) запросить кусок повторно и в итоге собрать верный файл.
-    let seeder = MockSeeder::start(
-        sample.clone(),
-        Corruption::Transient {
-            index: 2,
-            times: 1,
-        },
-    )
-    .await;
+    let seeder =
+        MockSeeder::start(sample.clone(), Corruption::Transient { index: 2, times: 1 }).await;
     let tracker = MockTracker::start(TrackerReply::Peers(vec![seeder.addr])).await;
     let manager = TorrentManager::new(test_config(&download_dir));
 
@@ -147,11 +141,7 @@ async fn permanently_corrupt_piece_is_never_accepted() {
     assert_eq!(sample.piece_count(), 5, "ожидалось 5 кусков");
 
     // Сидер всегда портит кусок №2 — собрать торрент невозможно.
-    let seeder = MockSeeder::start(
-        sample.clone(),
-        Corruption::Permanent { index: 2 },
-    )
-    .await;
+    let seeder = MockSeeder::start(sample.clone(), Corruption::Permanent { index: 2 }).await;
     let tracker = MockTracker::start(TrackerReply::Peers(vec![seeder.addr])).await;
     let manager = TorrentManager::new(test_config(&download_dir));
 
@@ -221,9 +211,15 @@ async fn permanently_corrupt_piece_is_never_accepted() {
     );
 
     // Движок не паникует и остаётся работоспособным: снимки, пауза, удаление.
-    assert_eq!(manager.snapshot().len(), 1, "торрент должен остаться в менеджере");
+    assert_eq!(
+        manager.snapshot().len(),
+        1,
+        "торрент должен остаться в менеджере"
+    );
     assert_eq!(manager.totals().torrents, 1);
-    manager.pause(id).expect("пауза при постоянно испорченном куске");
+    manager
+        .pause(id)
+        .expect("пауза при постоянно испорченном куске");
     assert_eq!(
         require_snapshot(&manager, id).state,
         TorrentState::Paused,
@@ -249,7 +245,11 @@ async fn permanently_corrupt_piece_is_never_accepted() {
 async fn tracker_failure_does_not_break_engine() {
     let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
     let download_dir = temp.path().join("tracker-fail");
-    let sample = Arc::new(Sample::new("torrenta-tracker-fail", PIECE_LENGTH, &[("data.bin", 40_000)]));
+    let sample = Arc::new(Sample::new(
+        "torrenta-tracker-fail",
+        PIECE_LENGTH,
+        &[("data.bin", 40_000)],
+    ));
 
     // Трекер отвечает корректным bencode-словарём с `failure reason`.
     let tracker = MockTracker::start(TrackerReply::Failure(
@@ -272,7 +272,10 @@ async fn tracker_failure_does_not_break_engine() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(attempts >= 1, "движок должен был отправить announce трекеру");
+    assert!(
+        attempts >= 1,
+        "движок должен был отправить announce трекеру"
+    );
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let snapshot = require_snapshot(&manager, id);
@@ -311,9 +314,14 @@ async fn tracker_failure_does_not_break_engine() {
     // Движок продолжает работать: снимок доступен, новые операции не паникуют.
     manager.pause(id).expect("пауза после отказа трекера");
     assert_eq!(require_snapshot(&manager, id).state, TorrentState::Paused);
-    manager.resume(id).expect("возобновление после отказа трекера");
+    manager
+        .resume(id)
+        .expect("возобновление после отказа трекера");
     manager.remove(id, false).await.expect("удаление торрента");
-    assert!(manager.snapshot().is_empty(), "после remove торрентов быть не должно");
+    assert!(
+        manager.snapshot().is_empty(),
+        "после remove торрентов быть не должно"
+    );
     manager.shutdown().await;
 }
 
@@ -321,7 +329,11 @@ async fn tracker_failure_does_not_break_engine() {
 async fn error_state_carries_russian_message() {
     let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
     let download_dir = temp.path().join("errors");
-    let sample = Arc::new(Sample::new("torrenta-error", PIECE_LENGTH, &[("x.bin", 12_345)]));
+    let sample = Arc::new(Sample::new(
+        "torrenta-error",
+        PIECE_LENGTH,
+        &[("x.bin", 12_345)],
+    ));
     let manager = TorrentManager::new(test_config(&download_dir));
 
     // Magnet без трекеров: метаданные взять негде — это единственный путь,
@@ -348,10 +360,7 @@ async fn error_state_carries_russian_message() {
         .error
         .clone()
         .expect("в состоянии Error поле error должно быть заполнено");
-    assert!(
-        !message.is_empty(),
-        "текст ошибки не должен быть пустым"
-    );
+    assert!(!message.is_empty(), "текст ошибки не должен быть пустым");
     assert!(
         has_cyrillic(&message),
         "текст ошибки должен быть на русском, получено: {message}"
@@ -365,7 +374,10 @@ async fn error_state_carries_russian_message() {
     assert_eq!(manager.totals().torrents, 1);
     manager.pause(id).expect("пауза торрента в ошибке");
     manager.resume(id).expect("возобновление торрента в ошибке");
-    manager.remove(id, true).await.expect("удаление торрента в ошибке");
+    manager
+        .remove(id, true)
+        .await
+        .expect("удаление торрента в ошибке");
     assert!(manager.snapshot().is_empty());
     manager.shutdown().await;
 }

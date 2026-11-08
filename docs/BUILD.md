@@ -135,8 +135,8 @@ npm run tauri -- build
 | Что | Где |
 | --- | --- |
 | Исполняемый файл | `target\release\torrenta.exe` |
-| Установщик NSIS | `target\release\bundle\nsis\Torrenta_1.2.0_x64-setup.exe` |
-| Установщик MSI | `target\release\bundle\msi\Torrenta_1.2.0_x64_*.msi` |
+| Установщик NSIS | `target\release\bundle\nsis\Torrenta_1.3.0_x64-setup.exe` |
+| Установщик MSI | `target\release\bundle\msi\Torrenta_1.3.0_x64_*.msi` |
 
 Порядок и хуки: перед сборкой Rust Tauri сам запускает `beforeBuildCommand` из `src-tauri\tauri.conf.json` — то есть `npm run build`; результат попадает в `dist` (`frontendDist`) и встраивается в бинарник. Поэтому отдельный `npm run build` перед `tauri build` не обязателен: он нужен только для проверки типов и размера бандла без сборки приложения.
 
@@ -281,9 +281,9 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 
 1. Повторить сборку: загрузка кэшируется в `%LOCALAPPDATA%\tauri`.
 2. Собрать только NSIS: `.\build-windows.ps1 -BundleOnly`.
-3. Проверить, что `Torrenta_1.2.0_x64-setup.exe` не запущен в этот момент.
+3. Проверить, что `Torrenta_1.3.0_x64-setup.exe` не запущен в этот момент.
 
-### 5.14 `error: package torrent-core v1.2.0 ... requires rustc 1.77`
+### 5.14 `error: package torrent-core v1.3.0 ... requires rustc 1.77`
 
 **Причина:** устаревший Rust.
 

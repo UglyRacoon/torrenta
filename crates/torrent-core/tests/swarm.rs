@@ -96,9 +96,16 @@ async fn downloads_two_file_torrent_from_mock_swarm() {
     assert_file_matches(&download_dir, &sample.files);
 
     // Файлы на диске лежат там, где их ждёт UI (пути из снимка).
-    let mut paths: Vec<String> = snapshot.files.iter().map(|file| file.path.clone()).collect();
+    let mut paths: Vec<String> = snapshot
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
     paths.sort();
-    assert_eq!(paths, vec!["part1.bin".to_string(), "part2.bin".to_string()]);
+    assert_eq!(
+        paths,
+        vec!["part1.bin".to_string(), "part2.bin".to_string()]
+    );
 
     let totals = manager.totals();
     assert_eq!(totals.torrents, 1, "менеджер видит один торрент");
@@ -116,7 +123,10 @@ async fn downloads_two_file_torrent_from_mock_swarm() {
         "движок должен был объявиться mock-трекеру"
     );
     assert!(
-        seeder.connections.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        seeder
+            .connections
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
         "движок должен был подключиться к mock-сидеру"
     );
     assert!(
@@ -166,7 +176,9 @@ async fn downloads_single_file_torrent_and_stops_in_completed_state() {
     assert_file_matches(&download_dir, &sample.files);
 
     // Повторное добавление того же торрента — не дубль-скачивание, а ошибка Duplicate.
-    let duplicate = manager.add_file(sample.torrent_bytes(&tracker.url()), None).await;
+    let duplicate = manager
+        .add_file(sample.torrent_bytes(&tracker.url()), None)
+        .await;
     assert!(
         duplicate.is_err(),
         "повторное добавление того же info-hash должно отклоняться"
@@ -180,7 +192,11 @@ async fn downloads_single_file_torrent_and_stops_in_completed_state() {
 async fn downloads_two_torrents_in_parallel() {
     let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
     let root = temp.path().to_path_buf();
-    let first = Arc::new(Sample::new("torrenta-a", PIECE_LENGTH, &[("a.bin", 50_000)]));
+    let first = Arc::new(Sample::new(
+        "torrenta-a",
+        PIECE_LENGTH,
+        &[("a.bin", 50_000)],
+    ));
     let second = Arc::new(Sample::new(
         "torrenta-b",
         PIECE_LENGTH,
@@ -205,7 +221,10 @@ async fn downloads_two_torrents_in_parallel() {
 
     // Оба торрента пишутся в один каталог, но в разные файлы.
     let wait_dir: PathBuf = root.clone();
-    for (id, total) in [(id_a, first.data.len() as u64), (id_b, second.data.len() as u64)] {
+    for (id, total) in [
+        (id_a, first.data.len() as u64),
+        (id_b, second.data.len() as u64),
+    ] {
         let snapshot = wait_for(
             &manager,
             id,
@@ -235,8 +254,16 @@ async fn global_limit_is_shared_between_torrents() {
     let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
     let root = temp.path().to_path_buf();
     // По 640 КиБ на торрент: при 64 КиБ/с за окно измерения не докачаются.
-    let first = Arc::new(Sample::new("torrenta-limit-a", PIECE_LENGTH, &[("a.bin", 640_000)]));
-    let second = Arc::new(Sample::new("torrenta-limit-b", PIECE_LENGTH, &[("b.bin", 640_000)]));
+    let first = Arc::new(Sample::new(
+        "torrenta-limit-a",
+        PIECE_LENGTH,
+        &[("a.bin", 640_000)],
+    ));
+    let second = Arc::new(Sample::new(
+        "torrenta-limit-b",
+        PIECE_LENGTH,
+        &[("b.bin", 640_000)],
+    ));
     let seeder_a = MockSeeder::start(first.clone(), Corruption::None).await;
     let seeder_b = MockSeeder::start(second.clone(), Corruption::None).await;
     let tracker_a = MockTracker::start(TrackerReply::Peers(vec![seeder_a.addr])).await;

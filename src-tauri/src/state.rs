@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
-use torrent_core::{EngineError, GlobalTotals, TorrentManager, TorrentSnapshot, TorrentState};
+use torrent_core::{
+    EngineError, FilePriority, GlobalTotals, TorrentManager, TorrentSnapshot, TorrentState,
+};
 
 use crate::auto_shutdown::{self, AutoShutdown, AutoShutdownDto};
 use crate::autostart;
@@ -115,6 +117,9 @@ impl AppStateDto {
                 file.path.hash(&mut significant);
                 file.length.hash(&mut significant);
                 u8::from(file.selected).hash(&mut significant);
+                // Приоритет виден в интерфейсе и меняется командами 1.3, поэтому
+                // его изменение тоже должно отправлять событие состояния.
+                priority_code(file.priority).hash(&mut significant);
             }
 
             torrent.downloaded_bytes.hash(&mut dynamic);
@@ -314,6 +319,7 @@ fn state_code(state: TorrentState) -> u8 {
     match state {
         TorrentState::Queued => 0,
         TorrentState::Metadata => 1,
+        TorrentState::Checking => 7,
         TorrentState::Downloading => 2,
         TorrentState::Seeding => 3,
         TorrentState::Paused => 4,
@@ -321,7 +327,17 @@ fn state_code(state: TorrentState) -> u8 {
         TorrentState::Error => 6,
         // Страховка на случай расширения перечисления в движке.
         #[allow(unreachable_patterns)]
-        _ => 7,
+        _ => 8,
+    }
+}
+
+/// Числовой код приоритета файла для «значимого» хеша состояния.
+fn priority_code(priority: FilePriority) -> u8 {
+    match priority {
+        FilePriority::Skip => 0,
+        FilePriority::Low => 1,
+        FilePriority::Normal => 2,
+        FilePriority::High => 3,
     }
 }
 
@@ -463,6 +479,7 @@ mod tests {
             length: 10,
             downloaded: 0,
             selected: true,
+            priority: FilePriority::Normal,
         }];
         let b = a.clone();
         assert_eq!(a.fingerprints(), b.fingerprints());
@@ -494,6 +511,14 @@ mod tests {
         assert_ne!(
             a.fingerprints().significant,
             wanted.fingerprints().significant
+        );
+
+        let mut prioritized = a.clone();
+        prioritized.torrents[0].files[0].priority = FilePriority::High;
+        assert_ne!(
+            a.fingerprints().significant,
+            prioritized.fingerprints().significant,
+            "смена приоритета файла должна попадать в значимую часть"
         );
     }
 

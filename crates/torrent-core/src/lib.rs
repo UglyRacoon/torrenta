@@ -31,8 +31,8 @@ pub mod wire;
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};
 pub use bitfield::Bitfield;
 pub use engine::{
-    AddOptions, AddSource, EngineConfig, EngineError, EngineEvent, FileView, GlobalTotals,
-    PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot, TorrentState,
+    AddOptions, AddSource, EngineConfig, EngineError, EngineEvent, FilePriority, FileView,
+    GlobalTotals, PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot, TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};
 pub use metainfo::{FileEntry, InfoHash, Metainfo, MetainfoError};

@@ -4,6 +4,7 @@ import type {
   AppPayload,
   AutoShutdownState,
   EngineMode,
+  FilePriority,
   SettingsDto,
   TorrentPreview,
   TorrentSource,
@@ -28,6 +29,10 @@ export interface EngineApi {
   preview(source: TorrentSource): Promise<TorrentPreview>;
   addTorrent(source: TorrentSource, options: AddOptions): Promise<AddResult>;
   setFileSelection(id: number, files: number[]): Promise<void>;
+  /** Приоритеты всех файлов по порядку (1.3); изменённый — только редактируемый. */
+  setFilePriorities(id: number, priorities: FilePriority[]): Promise<void>;
+  /** Перепроверка локальных данных; на время проверки состояние — "checking". */
+  recheckTorrent(id: number): Promise<void>;
   /** 0 — без ограничения; действует как минимум с глобальным лимитом. */
   setTorrentLimits(id: number, downKib: number, upKib: number): Promise<void>;
   pickTorrentFiles(): Promise<TorrentSource[]>;
@@ -45,7 +50,6 @@ export interface EngineApi {
   /** Возвращает функцию отписки. */
   subscribeAutoShutdown(listener: (state: AutoShutdownState) => void): Promise<() => void>;
   revealTorrent(id: number): Promise<void>;
-  openDownloadDir(): Promise<void>;
   openExternal(url: string): Promise<void>;
   /** Возвращает функцию отписки. */
   bindFileDrop(handlers: FileDropHandlers): () => void;

@@ -85,10 +85,7 @@ impl Sample {
             data.extend_from_slice(&content);
             files.push(((*file_name).to_string(), content));
         }
-        let pieces: Vec<[u8; 20]> = data
-            .chunks(piece_length as usize)
-            .map(sha1_bytes)
-            .collect();
+        let pieces: Vec<[u8; 20]> = data.chunks(piece_length as usize).map(sha1_bytes).collect();
         let info_bytes = info_dict(name, piece_length, &pieces, &files);
         let info_hash = sha1_bytes(&info_bytes);
         Sample {
@@ -181,10 +178,7 @@ fn info_dict(
         .collect();
     let mut info = BTreeMap::new();
     info.insert(b"name".to_vec(), Value::string(name));
-    info.insert(
-        b"piece length".to_vec(),
-        Value::int(piece_length as i64),
-    );
+    info.insert(b"piece length".to_vec(), Value::int(piece_length as i64));
     info.insert(b"pieces".to_vec(), Value::bytes(hashes));
     info.insert(b"files".to_vec(), Value::List(entries));
     bencode::encode(&Value::Dict(info))
@@ -405,10 +399,7 @@ impl MockTracker {
     /// Поднимает трекер, который отвечает по очереди: `replies[0]` на первый
     /// announce, `replies[1]` на второй и так далее, последний ответ повторяется.
     pub async fn start_script(replies: Vec<TrackerReply>, interval: u32) -> MockTracker {
-        assert!(
-            !replies.is_empty(),
-            "mock-трекер: нужен хотя бы один ответ"
-        );
+        assert!(!replies.is_empty(), "mock-трекер: нужен хотя бы один ответ");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock-трекер: не удалось занять 127.0.0.1:0");
@@ -585,9 +576,10 @@ impl SeederState {
         match self.corruption {
             Corruption::None => false,
             Corruption::Permanent { index: target } => index == target,
-            Corruption::Transient { index: target, times } => {
-                index == target && self.corrupt_hits.fetch_add(1, Ordering::Relaxed) < times
-            }
+            Corruption::Transient {
+                index: target,
+                times,
+            } => index == target && self.corrupt_hits.fetch_add(1, Ordering::Relaxed) < times,
         }
     }
 }
@@ -832,10 +824,7 @@ async fn serve_metadata_peer(
             extensions.insert(b"v".to_vec(), Value::string("TorrentaMetaPeer 1.0"));
             let mut hello = BTreeMap::new();
             hello.insert(b"m".to_vec(), Value::Dict(extensions));
-            hello.insert(
-                b"metadata_size".to_vec(),
-                Value::int(info.len() as i64),
-            );
+            hello.insert(b"metadata_size".to_vec(), Value::int(info.len() as i64));
             let hello = Message::Extended {
                 ext_id: 0,
                 payload: bencode::encode(&Value::Dict(hello)),

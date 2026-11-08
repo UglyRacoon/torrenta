@@ -336,14 +336,8 @@ mod tests {
 
     #[test]
     fn decode_integer_extremes() {
-        assert_eq!(
-            decode(b"i9223372036854775807e").unwrap().0,
-            int(i64::MAX)
-        );
-        assert_eq!(
-            decode(b"i-9223372036854775808e").unwrap().0,
-            int(i64::MIN)
-        );
+        assert_eq!(decode(b"i9223372036854775807e").unwrap().0, int(i64::MAX));
+        assert_eq!(decode(b"i-9223372036854775808e").unwrap().0, int(i64::MIN));
         // i64::MAX + 1 — переполнение.
         assert_eq!(
             decode(b"i9223372036854775808e").unwrap_err(),
@@ -378,8 +372,14 @@ mod tests {
     fn encode_and_decode_roundtrip() {
         let value = Value::Dict(BTreeMap::from([
             (b"announce".to_vec(), b(b"http://tracker.example/announce")),
-            (b"info".to_vec(), Value::Dict(BTreeMap::from([(b"name".to_vec(), b(b"file.bin"))]))),
-            (b"list".to_vec(), Value::List(vec![int(1), b(b"two"), Value::List(vec![])])),
+            (
+                b"info".to_vec(),
+                Value::Dict(BTreeMap::from([(b"name".to_vec(), b(b"file.bin"))])),
+            ),
+            (
+                b"list".to_vec(),
+                Value::List(vec![int(1), b(b"two"), Value::List(vec![])]),
+            ),
         ]));
         let encoded = encode(&value);
         assert_eq!(decode_all(&encoded).unwrap(), value);
@@ -438,10 +438,7 @@ mod tests {
             );
         }
         // Обрезанная строка — не UnexpectedEof, только ошибка.
-        assert_eq!(
-            decode(b"5:hell").unwrap_err(),
-            BencodeError::UnexpectedEof
-        );
+        assert_eq!(decode(b"5:hell").unwrap_err(), BencodeError::UnexpectedEof);
         assert_eq!(decode(b"i12").unwrap_err(), BencodeError::UnexpectedEof);
         assert_eq!(decode(b"l1:a").unwrap_err(), BencodeError::UnexpectedEof);
         assert_eq!(decode(b"d1:a").unwrap_err(), BencodeError::UnexpectedEof);
@@ -481,7 +478,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_byte_and_bad_dict_key() {
-        assert_eq!(decode(b"x").unwrap_err(), BencodeError::InvalidByte(b'x', 0));
+        assert_eq!(
+            decode(b"x").unwrap_err(),
+            BencodeError::InvalidByte(b'x', 0)
+        );
         assert_eq!(decode(b"li1ee").unwrap(), (Value::List(vec![int(1)]), 5));
         // Ключ словаря не строка.
         assert!(matches!(
@@ -522,7 +522,8 @@ mod tests {
         let encoded = encode(&Value::Dict(map));
         assert_eq!(
             encoded,
-            b"d6:lengthi99e4:name5:a.iso12:piece lengthi16384e6:pieces20:01234567890123456789e".to_vec()
+            b"d6:lengthi99e4:name5:a.iso12:piece lengthi16384e6:pieces20:01234567890123456789e"
+                .to_vec()
         );
         // Ключи BTreeMap обходятся в нужном порядке, значения не потеряны.
         assert_eq!(decode_all(&encoded).unwrap().as_dict().unwrap().len(), 4);

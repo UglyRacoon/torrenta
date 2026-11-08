@@ -107,7 +107,17 @@ pub struct EngineConfig {
     pub listen_port: u16,
     /// Продолжать раздачу после завершения.
     pub seed_after_complete: bool,
+    /// Сколько торрентов могут одновременно скачиваться (0 — без ограничения).
+    ///
+    /// Торренты сверх лимита стоят в очереди (`TorrentState::Queued`) и не
+    /// занимают подключения. Скачиванием считается и ожидание метаданных.
+    pub max_active_downloads: usize,
+    /// Сколько торрентов могут одновременно раздаваться (0 — без ограничения).
+    pub max_active_seeds: usize,
 }
+
+/// Предел лимитов активных торрентов: больше всё равно не имеет смысла.
+const MAX_ACTIVE_LIMIT: usize = 500;
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -118,6 +128,8 @@ impl Default for EngineConfig {
             upload_limit_kib: 0,
             listen_port: 0,
             seed_after_complete: true,
+            max_active_downloads: 0,
+            max_active_seeds: 0,
         }
     }
 }
@@ -129,6 +141,9 @@ impl EngineConfig {
             self.download_dir = default_download_dir();
         }
         self.max_peers_per_torrent = self.max_peers_per_torrent.clamp(1, 200);
+        // 0 — «без ограничения», поэтому нижняя граница именно 0.
+        self.max_active_downloads = self.max_active_downloads.min(MAX_ACTIVE_LIMIT);
+        self.max_active_seeds = self.max_active_seeds.min(MAX_ACTIVE_LIMIT);
         self
     }
 }
@@ -151,13 +166,31 @@ fn default_download_dir() -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TorrentState {
+    /// Ждёт слота в очереди: лимит активных торрентов исчерпан.
     Queued,
+    /// Ждёт метаданные magnet-ссылки.
     Metadata,
+    /// Сверяет хэши кусков на диске.
+    Checking,
     Downloading,
     Seeding,
     Paused,
     Completed,
     Error,
+}
+
+/// Приоритет файла внутри торрента.
+///
+/// `Skip` выключает файл из загрузки, остальные уровни задают порядок, в котором
+/// пикер отдаёт куски: сначала `High`, затем `Normal`, в конце `Low`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilePriority {
+    Skip,
+    Low,
+    #[default]
+    Normal,
+    High,
 }
 
 /// Файл внутри торрента.
@@ -166,8 +199,10 @@ pub struct FileView {
     pub path: String,
     pub length: u64,
     pub downloaded: u64,
-    /// Выбран ли файл к загрузке.
+    /// Выбран ли файл к загрузке; всегда согласован с `priority != Skip`.
     pub selected: bool,
+    /// Приоритет загрузки файла.
+    pub priority: FilePriority,
 }
 
 /// Подключённый пир в снимке состояния.
@@ -303,6 +338,8 @@ pub enum EngineError {
     Duplicate(String),
     #[error("не выбран ни один файл")]
     Selection,
+    #[error("торрент ещё не готов к перепроверке")]
+    NotReady,
 }
 
 /// События движка (транслируются подписчикам).
@@ -320,10 +357,15 @@ pub enum EngineEvent {
 // Флаги рантайма
 // ---------------------------------------------------------------------------
 
-/// Разделяемые флаги торрента: пауза и удаление.
+/// Разделяемые флаги торрента: пауза, проверка и удаление.
 #[derive(Debug, Default)]
 pub(crate) struct Flags {
+    /// Работа остановлена: пауза пользователя или очередь планировщика.
     paused: AtomicBool,
+    /// Пользователь нажал «пауза»; такая пауза важнее лимитов очереди.
+    user_paused: AtomicBool,
+    /// Идёт перепроверка кусков на диске.
+    checking: AtomicBool,
     removed: AtomicBool,
 }
 
@@ -334,6 +376,22 @@ impl Flags {
 
     pub(crate) fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub(crate) fn user_paused(&self) -> bool {
+        self.user_paused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_user_paused(&self, paused: bool) {
+        self.user_paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub(crate) fn checking(&self) -> bool {
+        self.checking.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_checking(&self, checking: bool) {
+        self.checking.store(checking, Ordering::Relaxed);
     }
 
     pub(crate) fn removed(&self) -> bool {
@@ -405,11 +463,14 @@ impl Stats {
     /// Заполняет метаданные после разбора `.torrent`.
     pub(crate) fn set_meta(&self, meta: &Metainfo) {
         *wr(&self.name) = meta.info.name.clone();
-        self.total_bytes.store(meta.info.total_length, Ordering::Relaxed);
-        self.wanted_bytes.store(meta.info.total_length, Ordering::Relaxed);
+        self.total_bytes
+            .store(meta.info.total_length, Ordering::Relaxed);
+        self.wanted_bytes
+            .store(meta.info.total_length, Ordering::Relaxed);
         self.piece_count
             .store(meta.info.piece_count() as u32, Ordering::Relaxed);
-        self.piece_length.store(meta.info.piece_length, Ordering::Relaxed);
+        self.piece_length
+            .store(meta.info.piece_length, Ordering::Relaxed);
         *wr(&self.files) = meta
             .info
             .files
@@ -419,18 +480,25 @@ impl Stats {
                 length: file.length,
                 downloaded: 0,
                 selected: true,
+                priority: FilePriority::Normal,
             })
             .collect();
     }
 
-    /// Обновляет отметки выбранных файлов и объём нужных данных.
+    /// Обновляет отметки выбранных файлов, приоритеты и объём нужных данных.
     pub(crate) fn set_selection(&self, selection: &Selection) {
         self.wanted_bytes
             .store(selection.bytes(), Ordering::Relaxed);
         let flags = selection.files();
+        let priorities = selection.priorities();
         for (index, file) in wr(&self.files).iter_mut().enumerate() {
             if let Some(selected) = flags.get(index) {
                 file.selected = *selected;
+            }
+            if let Some(priority) = priorities.get(index) {
+                file.priority = *priority;
+                // Приоритет — источник истины для выбора файла.
+                file.selected = *priority != FilePriority::Skip;
             }
         }
     }
@@ -471,6 +539,112 @@ pub(crate) struct Limits {
     pub(crate) up_kib: u32,
 }
 
+/// Вид торрента для планировщика очереди.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanKind {
+    /// Недокачанный торрент (включая ожидание метаданных magnet).
+    Download,
+    /// Всё нужное уже на диске, торрент раздаёт.
+    Seed,
+    /// В очередь не встаёт: пауза пользователя, проверка, ошибка.
+    Idle,
+}
+
+/// Строка планировщика: торрент и его вид.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlanEntry {
+    pub(crate) id: u64,
+    pub(crate) kind: PlanKind,
+    pub(crate) user_paused: bool,
+}
+
+/// Выбирает торренты, которые должны быть активны при заданных лимитах.
+///
+/// `entries` идут в порядке очереди (сначала добавленные). `limits` —
+/// (сколько качать, сколько раздавать); 0 означает «без ограничения».
+/// Пауза пользователя важнее лимитов и не занимает слот, поэтому такие
+/// торренты в результат не попадают.
+pub(crate) fn plan(entries: &[PlanEntry], limits: (usize, usize)) -> Vec<u64> {
+    let (max_downloads, max_seeds) = limits;
+    let mut downloads = 0usize;
+    let mut seeds = 0usize;
+    let mut active = Vec::new();
+    for entry in entries {
+        if entry.user_paused {
+            continue;
+        }
+        match entry.kind {
+            PlanKind::Idle => {}
+            PlanKind::Download => {
+                if max_downloads == 0 || downloads < max_downloads {
+                    downloads += 1;
+                    active.push(entry.id);
+                }
+            }
+            PlanKind::Seed => {
+                if max_seeds == 0 || seeds < max_seeds {
+                    seeds += 1;
+                    active.push(entry.id);
+                }
+            }
+        }
+    }
+    active
+}
+
+/// Приводит набор активных торрентов в соответствие с лимитами очереди.
+///
+/// Каркас планировщика: лишние торренты паркуются (состояние `Queued`), а
+/// освободившиеся слоты достаются тем, кого добавили раньше. Вызывается после
+/// любого изменения, влияющего на очередь, и каждый тик статистики — поэтому
+/// ограничения работают, даже если состояние изменилось само (например,
+/// торрент докачался и хочет стать раздачей).
+fn schedule(inner: &Arc<Inner>) {
+    let limits = {
+        let config = rd(&inner.config);
+        (config.max_active_downloads, config.max_active_seeds)
+    };
+    let mut handles: Vec<Arc<TorrentHandle>> = rd(&inner.handles).clone();
+    // Очередь — в порядке добавления: `added_at`, затем id.
+    handles.sort_by_key(|handle| (handle.added_at, handle.id));
+    let kinds: Vec<PlanKind> = handles.iter().map(|handle| handle.plan_kind()).collect();
+    let entries: Vec<PlanEntry> = handles
+        .iter()
+        .zip(kinds.iter())
+        .map(|(handle, kind)| PlanEntry {
+            id: handle.id,
+            kind: *kind,
+            user_paused: handle.flags.user_paused(),
+        })
+        .collect();
+    let active: std::collections::HashSet<u64> = plan(&entries, limits).into_iter().collect();
+    for (handle, kind) in handles.iter().zip(kinds.iter()) {
+        // `Idle` — проверка, ошибка, пауза пользователя или выключенная раздача:
+        // слот такому торренту не нужен, и в очередь его ставить нельзя.
+        if *kind == PlanKind::Idle {
+            continue;
+        }
+        if active.contains(&handle.id) {
+            handle.activate(*kind);
+        } else {
+            handle.park();
+        }
+    }
+}
+
+/// Применяет готовый выбор файлов к снимку и рантайму торрента.
+///
+/// Общий путь для [`TorrentManager::set_file_selection`] и
+/// [`TorrentManager::set_file_priorities`]: оба меняют только набор нужных
+/// кусков и их приоритеты.
+fn apply_selection(handle: &Arc<TorrentHandle>, selection: Selection) {
+    *wr(&handle.selection) = selection.clone();
+    handle.stats.set_selection(&selection);
+    if let Some(runtime) = handle.runtime_clone() {
+        runtime.apply_selection(&selection);
+    }
+}
+
 /// Синхронная часть торрента: живёт с момента добавления до удаления,
 /// даже пока метаданные magnet-ссылки ещё не получены.
 pub(crate) struct TorrentHandle {
@@ -490,6 +664,8 @@ pub(crate) struct TorrentHandle {
     pub(crate) limits: Arc<RwLock<Limits>>,
     /// Выбор, заданный при добавлении magnet: применится после метаданных.
     pub(crate) pending_files: Mutex<Option<Vec<usize>>>,
+    /// Приоритеты, заданные до получения метаданных (важнее `pending_files`).
+    pub(crate) pending_priorities: Mutex<Option<Vec<FilePriority>>>,
 }
 
 impl TorrentHandle {
@@ -498,19 +674,127 @@ impl TorrentHandle {
     }
 
     pub(crate) fn effective_state(&self) -> TorrentState {
-        if self.flags.paused() {
-            TorrentState::Paused
+        // Проверка хэшей важнее паузы: пользователь должен видеть прогресс.
+        if self.flags.checking() {
+            return TorrentState::Checking;
+        }
+        let state = *lk(&self.stats.state);
+        if !self.flags.paused() {
+            return state;
+        }
+        // Очередь планировщика и пауза пользователя выглядят по-разному.
+        if state == TorrentState::Queued {
+            TorrentState::Queued
         } else {
-            *lk(&self.stats.state)
+            TorrentState::Paused
+        }
+    }
+
+    /// Вид торрента для планировщика очереди.
+    pub(crate) fn plan_kind(&self) -> PlanKind {
+        if self.flags.removed() || self.flags.checking() || self.flags.user_paused() {
+            return PlanKind::Idle;
+        }
+        if *lk(&self.stats.state) == TorrentState::Error {
+            return PlanKind::Idle;
+        }
+        match self.runtime_clone() {
+            Some(runtime) => {
+                if !runtime.is_complete() {
+                    PlanKind::Download
+                } else if rd(&self.env.config).seed_after_complete {
+                    PlanKind::Seed
+                } else {
+                    // Раздача выключена: слот не нужен.
+                    PlanKind::Idle
+                }
+            }
+            // Метаданные ещё не получены — это тоже активная загрузка.
+            None if self.magnet.is_some() => PlanKind::Download,
+            None => PlanKind::Idle,
+        }
+    }
+
+    /// Возвращает торрент в работу: планировщик выдал ему слот.
+    fn activate(self: &Arc<Self>, kind: PlanKind) {
+        let target = match kind {
+            PlanKind::Download if self.runtime_clone().is_some() => TorrentState::Downloading,
+            PlanKind::Download => TorrentState::Metadata,
+            PlanKind::Seed => TorrentState::Seeding,
+            PlanKind::Idle => return,
+        };
+        let was_paused = self.flags.paused();
+        self.flags.set_paused(false);
+        if *lk(&self.stats.state) != target {
+            self.set_state(target);
+        }
+        if !was_paused {
+            return;
+        }
+        match self.runtime_clone() {
+            Some(runtime) => {
+                // Файлы могли быть закрыты на запись во время паузы или
+                // проверки — перед обменом снова открываем их на запись.
+                if kind == PlanKind::Download {
+                    if let Err(message) = runtime.acquire_writes() {
+                        self.fail(message);
+                        return;
+                    }
+                }
+                runtime.requeue_peers();
+            }
+            None => {
+                if self.magnet.is_some() {
+                    torrent::start_metadata_fetch(self);
+                }
+            }
+        }
+    }
+
+    /// Ставит торрент в очередь: работа замирает, файлы закрываются на запись.
+    fn park(&self) {
+        if self.flags.paused() && *lk(&self.stats.state) == TorrentState::Queued {
+            return;
+        }
+        self.flags.set_paused(true);
+        self.release_writes();
+        if *lk(&self.stats.state) != TorrentState::Queued {
+            self.set_state(TorrentState::Queued);
+        }
+    }
+
+    /// Закрывает файлы на запись, оставляя их доступными для чтения.
+    ///
+    /// Так Windows отпускает `.exe` и другие скачанные файлы: их можно запускать
+    /// и открывать, пока торрент стоит на паузе или в очереди.
+    pub(crate) fn release_writes(&self) {
+        if let Some(runtime) = self.runtime_clone() {
+            if let Err(message) = runtime.release_writes() {
+                let _ = self.env.events.send(EngineEvent::Error {
+                    id: self.id,
+                    message,
+                });
+            }
+        }
+    }
+
+    /// Пауза по требованию пользователя: в очередь за слотом такой торрент
+    /// не встаёт, пока его не снимут с паузы.
+    pub(crate) fn pause_for_user(&self) {
+        self.flags.set_user_paused(true);
+        self.flags.set_paused(true);
+        self.release_writes();
+        if *lk(&self.stats.state) != TorrentState::Paused {
+            self.set_state(TorrentState::Paused);
         }
     }
 
     pub(crate) fn set_state(&self, state: TorrentState) {
         *lk(&self.stats.state) = state;
-        let _ = self.env.events.send(EngineEvent::StateChanged {
-            id: self.id,
-            state,
-        });
+        let _ = self
+            .env
+            .events
+            .send(EngineEvent::StateChanged { id: self.id, state });
     }
 
     /// Переводит торрент в состояние ошибки и уведомляет подписчиков.
@@ -692,9 +976,16 @@ impl TorrentManager {
         rd(&self.inner.config).clone()
     }
 
+    /// Пересобирает очередь активных торрентов по текущим лимитам.
+    fn schedule(&self) {
+        schedule(&self.inner);
+    }
+
     /// Применяет новую конфигурацию (каталог, лимиты, порт для новых сессий).
     pub fn set_config(&self, config: EngineConfig) {
         *wr(&self.inner.config) = config.sanitized();
+        // Лимиты активных торрентов могли поменяться — сразу пересобираем очередь.
+        self.schedule();
     }
 
     /// Порт, на котором движок слушает входящие подключения (0 — не слушает).
@@ -719,11 +1010,7 @@ impl TorrentManager {
     }
 
     /// Добавляет торрент из содержимого `.torrent` с выбором файлов.
-    pub async fn add_file_with(
-        &self,
-        data: Vec<u8>,
-        opts: AddOptions,
-    ) -> Result<u64, EngineError> {
+    pub async fn add_file_with(&self, data: Vec<u8>, opts: AddOptions) -> Result<u64, EngineError> {
         self.ensure_background();
         let meta = Metainfo::parse(&data).map_err(|err| EngineError::Metainfo(err.to_string()))?;
         // Выбор проверяем до добавления: пустой или кривой список индексов
@@ -747,6 +1034,8 @@ impl TorrentManager {
             id: handle.id,
             name,
         });
+        // Лимит активных торрентов мог быть уже исчерпан — новый встанет в очередь.
+        self.schedule();
         Ok(handle.id)
     }
 
@@ -770,25 +1059,19 @@ impl TorrentManager {
     ///
     /// Список файлов применится, когда придут метаданные; пустой список —
     /// сразу ошибка [`EngineError::Selection`].
-    pub async fn add_magnet_with(
-        &self,
-        link: &str,
-        opts: AddOptions,
-    ) -> Result<u64, EngineError> {
+    pub async fn add_magnet_with(&self, link: &str, opts: AddOptions) -> Result<u64, EngineError> {
         self.ensure_background();
         if matches!(&opts.files, Some(files) if files.is_empty()) {
             return Err(EngineError::Selection);
         }
-        let magnet = crate::magnet::parse(link).map_err(|err| EngineError::Magnet(err.to_string()))?;
+        let magnet =
+            crate::magnet::parse(link).map_err(|err| EngineError::Magnet(err.to_string()))?;
         let hash = magnet.info_hash;
         if self.find_by_hash(hash).is_some() {
             return Err(EngineError::Duplicate(hash.to_hex()));
         }
         let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
-        let name = magnet
-            .display_name
-            .clone()
-            .unwrap_or_else(|| hash.to_hex());
+        let name = magnet.display_name.clone().unwrap_or_else(|| hash.to_hex());
         let handle = self.make_handle(
             hash,
             Some(magnet),
@@ -802,7 +1085,11 @@ impl TorrentManager {
             id: handle.id,
             name,
         });
-        torrent::start_metadata_fetch(&handle);
+        // Очередь решает, искать ли метаданные прямо сейчас.
+        self.schedule();
+        if !handle.flags.paused() {
+            torrent::start_metadata_fetch(&handle);
+        }
         Ok(handle.id)
     }
 
@@ -819,21 +1106,51 @@ impl TorrentManager {
         let meta = rd(&handle.meta).clone();
         match meta {
             Some(meta) => {
-                let selection =
-                    Selection::from_files(&meta.info, Some(&files)).ok_or(EngineError::Selection)?;
-                // Порядок важен: сначала выбор в хендле и статистике (чтобы снимок
-                // уже видел новый набор), потом — пикер и состояние рантайма.
-                *wr(&handle.selection) = selection.clone();
-                handle.stats.set_selection(&selection);
-                if let Some(runtime) = handle.runtime_clone() {
-                    runtime.apply_selection(&selection);
-                }
+                let selection = Selection::from_files(&meta.info, Some(&files))
+                    .ok_or(EngineError::Selection)?;
+                apply_selection(&handle, selection);
             }
             None => {
                 // Метаданные ещё не получены: запоминаем выбор до установки.
                 *lk(&handle.pending_files) = Some(files);
+                *lk(&handle.pending_priorities) = None;
             }
         }
+        // Новый набор файлов может завершить торрент (или снова его запустить).
+        self.schedule();
+        Ok(())
+    }
+
+    /// Задаёт приоритеты загрузки для всех файлов торрента.
+    ///
+    /// Длина списка должна совпадать с числом файлов. Приоритет `Skip` исключает
+    /// файл из загрузки так же, как снятая галочка в [`Self::set_file_selection`];
+    /// высокий приоритет заставляет качать куски этого файла первыми.
+    ///
+    /// Метаданные magnet-ссылки могли ещё не прийти: тогда приоритеты
+    /// сохраняются и применяются сразу после их получения.
+    pub fn set_file_priorities(
+        &self,
+        id: u64,
+        priorities: Vec<FilePriority>,
+    ) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        let meta = rd(&handle.meta).clone();
+        match meta {
+            Some(meta) => {
+                let selection = Selection::from_priorities(&meta.info, &priorities)
+                    .ok_or(EngineError::Selection)?;
+                apply_selection(&handle, selection);
+            }
+            None => {
+                // Приоритеты применятся при установке метаданных и важнее
+                // списка файлов, заданного при добавлении.
+                *lk(&handle.pending_files) = None;
+                *lk(&handle.pending_priorities) = Some(priorities);
+            }
+        }
+        self.schedule();
         Ok(())
     }
 
@@ -960,11 +1277,9 @@ impl TorrentManager {
     pub fn pause(&self, id: u64) -> Result<(), EngineError> {
         self.ensure_background();
         let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
-        handle.flags.set_paused(true);
-        let _ = self.inner.events.send(EngineEvent::StateChanged {
-            id,
-            state: TorrentState::Paused,
-        });
+        handle.pause_for_user();
+        // Слот освободился — его получит следующий в очереди.
+        self.schedule();
         Ok(())
     }
 
@@ -972,30 +1287,10 @@ impl TorrentManager {
     pub fn resume(&self, id: u64) -> Result<(), EngineError> {
         self.ensure_background();
         let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
-        handle.flags.set_paused(false);
-        let state = *lk(&handle.stats.state);
-        let state = if state == TorrentState::Paused {
-            if handle.runtime_clone().is_some() {
-                TorrentState::Downloading
-            } else {
-                TorrentState::Metadata
-            }
-        } else {
-            state
-        };
-        handle.set_state(state);
-        if let Some(runtime) = handle.runtime_clone() {
-            // Сессии на паузе закрылись, а ждать объявления трекера долго:
-            // возвращаем в очередь уже известные адреса.
-            runtime.requeue_peers();
-        }
-        if let Some(magnet) = &handle.magnet {
-            if runtime_missing(&handle) {
-                // Метаданные ещё не получены — возобновляем их поиск.
-                let _ = magnet;
-                torrent::start_metadata_fetch(&handle);
-            }
-        }
+        handle.flags.set_user_paused(false);
+        // Дальше решает планировщик: активных торрентов может быть уже достаточно,
+        // и тогда торрент подождёт в очереди.
+        self.schedule();
         Ok(())
     }
 
@@ -1003,38 +1298,59 @@ impl TorrentManager {
     pub fn pause_all(&self) {
         self.ensure_background();
         for handle in self.handles() {
-            if !handle.flags.paused() {
-                handle.flags.set_paused(true);
-                let _ = self.inner.events.send(EngineEvent::StateChanged {
-                    id: handle.id,
-                    state: TorrentState::Paused,
-                });
-            }
+            handle.pause_for_user();
         }
+        self.schedule();
     }
 
     /// Снимает с паузы все торренты.
     pub fn resume_all(&self) {
         self.ensure_background();
         for handle in self.handles() {
-            if handle.flags.paused() {
-                handle.flags.set_paused(false);
-                let state = *lk(&handle.stats.state);
-                let state = if state == TorrentState::Paused {
-                    if handle.runtime_clone().is_some() {
-                        TorrentState::Downloading
-                    } else {
-                        TorrentState::Metadata
-                    }
-                } else {
-                    state
-                };
-                handle.set_state(state);
-                if let Some(runtime) = handle.runtime_clone() {
-                    runtime.requeue_peers();
-                }
-            }
+            handle.flags.set_user_paused(false);
         }
+        // Очередь распределит слоты по тем же правилам, что и при старте.
+        self.schedule();
+    }
+
+    /// Перепроверяет скачанные данные торрента по SHA-1.
+    ///
+    /// На время проверки торрент переходит в [`TorrentState::Checking`], обмен с
+    /// пирами останавливается, прогресс виден в `pieces_have`. По завершении
+    /// состояние выбирается по фактически найденным кускам: недостающие нужные
+    /// данные докачиваются, полностью готовый торрент раздаётся или попадает в
+    /// завершённые. Пользовательская пауза при этом не снимается.
+    pub fn recheck(&self, id: u64) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        let Some(runtime) = handle.runtime_clone() else {
+            // Метаданные magnet ещё не получены — проверять нечего.
+            return Err(EngineError::NotReady);
+        };
+        if handle.flags.checking() {
+            // Проверка уже идёт: повторный вызов ничего не ломает.
+            return Ok(());
+        }
+        handle.flags.set_checking(true);
+        // Обмен останавливаем: проверяем то, что уже лежит на диске. Файлы при
+        // этом остаются открытыми только для чтения.
+        handle.flags.set_paused(true);
+        handle.release_writes();
+        handle.stats.pieces_have.store(0, Ordering::Relaxed);
+        handle.set_state(TorrentState::Checking);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            runtime.verify_all().await;
+            handle.flags.set_checking(false);
+            if handle.flags.removed() || inner.shutdown.load(Ordering::Relaxed) {
+                // Торрент удалили или движок останавливается — очередь не нужна.
+                return;
+            }
+            // Проверка выставила состояние и режим файлов; очередь решает,
+            // получит ли торрент слот или подождёт в `Queued`.
+            schedule(&inner);
+        });
+        Ok(())
     }
 
     /// Удаляет торрент; при `delete_files` чистит скачанные файлы в каталоге.
@@ -1060,6 +1376,8 @@ impl TorrentManager {
         }
         self.drop_handle(id);
         let _ = self.inner.events.send(EngineEvent::Removed { id });
+        // Освободившийся слот достаётся следующему в очереди.
+        self.schedule();
         Ok(())
     }
 
@@ -1165,6 +1483,7 @@ impl TorrentManager {
             selection: RwLock::new(Selection::empty()),
             limits,
             pending_files: Mutex::new(None),
+            pending_priorities: Mutex::new(None),
         })
     }
 
@@ -1204,10 +1523,6 @@ impl TorrentManager {
     }
 }
 
-fn runtime_missing(handle: &Arc<TorrentHandle>) -> bool {
-    handle.runtime_clone().is_none()
-}
-
 /// Пытается занять порт; при неудаче берёт любой свободный.
 fn bind_listener(port: u16) -> (Option<std::net::TcpListener>, u16) {
     let attempt = |port: u16| std::net::TcpListener::bind(("0.0.0.0", port)).ok();
@@ -1237,6 +1552,9 @@ async fn ticker_loop(inner: Arc<Inner>) {
         for handle in handles {
             handle.tick();
         }
+        // Состояние могло измениться само (торрент докачался, проверка
+        // завершилась) — очередь пересобирается на каждом тике.
+        schedule(&inner);
     }
 }
 
@@ -1314,10 +1632,23 @@ mod tests {
             upload_limit_kib: 0,
             listen_port: 0,
             seed_after_complete: true,
+            max_active_downloads: 0,
+            max_active_seeds: 0,
         }
         .sanitized();
         assert_eq!(config.max_peers_per_torrent, 1);
         assert!(!config.download_dir.as_os_str().is_empty());
+        // 0 — без ограничения, слишком большие значения подрезаются.
+        assert_eq!(config.max_active_downloads, 0);
+        assert_eq!(config.max_active_seeds, 0);
+        let huge = EngineConfig {
+            max_active_downloads: 10_000,
+            max_active_seeds: 10_000,
+            ..config
+        }
+        .sanitized();
+        assert_eq!(huge.max_active_downloads, MAX_ACTIVE_LIMIT);
+        assert_eq!(huge.max_active_seeds, MAX_ACTIVE_LIMIT);
     }
 
     #[test]
@@ -1326,6 +1657,61 @@ mod tests {
         assert_eq!(value, "\"downloading\"");
         let value = serde_json::to_string(&TorrentState::Metadata).unwrap();
         assert_eq!(value, "\"metadata\"");
+        let value = serde_json::to_string(&TorrentState::Checking).unwrap();
+        assert_eq!(value, "\"checking\"");
+    }
+
+    #[test]
+    fn priority_serializes_lowercase() {
+        let value = serde_json::to_string(&FilePriority::High).unwrap();
+        assert_eq!(value, "\"high\"");
+        let value = serde_json::to_string(&FilePriority::Skip).unwrap();
+        assert_eq!(value, "\"skip\"");
+        assert_eq!(FilePriority::default(), FilePriority::Normal);
+    }
+
+    #[test]
+    fn plan_respects_limits_and_user_pause() {
+        let entries = vec![
+            PlanEntry {
+                id: 1,
+                kind: PlanKind::Download,
+                user_paused: false,
+            },
+            PlanEntry {
+                id: 2,
+                kind: PlanKind::Download,
+                user_paused: false,
+            },
+            PlanEntry {
+                id: 3,
+                kind: PlanKind::Seed,
+                user_paused: false,
+            },
+            PlanEntry {
+                id: 4,
+                kind: PlanKind::Seed,
+                user_paused: false,
+            },
+            PlanEntry {
+                id: 5,
+                kind: PlanKind::Download,
+                user_paused: true,
+            },
+            PlanEntry {
+                id: 6,
+                kind: PlanKind::Idle,
+                user_paused: false,
+            },
+        ];
+        // Без лимитов активны все, кроме выключенных и приостановленных вручную.
+        assert_eq!(plan(&entries, (0, 0)), vec![1, 2, 3, 4]);
+        // Слоты загрузки и раздачи считаются раздельно, порядок — по списку.
+        assert_eq!(plan(&entries, (1, 1)), vec![1, 3]);
+        assert_eq!(plan(&entries, (2, 1)), vec![1, 2, 3]);
+        assert!(plan(&entries, (0, 0)).contains(&2));
+        // Приостановленный вручную торрент не занимает слот даже при избытке.
+        assert!(!plan(&entries, (5, 5)).contains(&5));
     }
 
     #[test]

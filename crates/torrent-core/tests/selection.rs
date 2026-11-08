@@ -104,10 +104,7 @@ async fn add_with_files_limits_wanted_set() {
         snapshot.progress, 0.0,
         "пока ничего не скачано, прогресс по нужным файлам нулевой"
     );
-    assert_eq!(
-        snapshot.eta_seconds, None,
-        "без скорости ETA неизвестен"
-    );
+    assert_eq!(snapshot.eta_seconds, None, "без скорости ETA неизвестен");
     assert_eq!(snapshot.files.len(), 3, "снимок перечисляет все файлы");
     assert!(
         snapshot.files[1].selected,
@@ -325,7 +322,11 @@ async fn selection_change_switches_wanted_set_and_state() {
 
     let mut notifications = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let EngineEvent::StateChanged { id: event_id, state } = event {
+        if let EngineEvent::StateChanged {
+            id: event_id,
+            state,
+        } = event
+        {
             if event_id == id {
                 notifications.push(state);
             }
@@ -523,8 +524,14 @@ async fn effective_limit_is_min_of_global_and_torrent() {
         .set_limits(id, 10, 5)
         .expect("лимиты существующего торрента должны применяться");
     let tightened = require_snapshot(&manager, id);
-    assert_eq!(tightened.down_limit_kib, 10, "строгий локальный лимит важнее");
-    assert_eq!(tightened.up_limit_kib, 5, "строгий локальный лимит отдачи важнее");
+    assert_eq!(
+        tightened.down_limit_kib, 10,
+        "строгий локальный лимит важнее"
+    );
+    assert_eq!(
+        tightened.up_limit_kib, 5,
+        "строгий локальный лимит отдачи важнее"
+    );
 
     // Без глобальных лимитов действуют локальные.
     manager
@@ -601,10 +608,7 @@ async fn preview_magnet_fetches_metadata_without_adding() {
     let manager = TorrentManager::new(test_config(&temp.path().join("downloads")));
 
     let preview = manager
-        .preview_magnet(
-            &sample.magnet_link(&tracker.url()),
-            Duration::from_secs(20),
-        )
+        .preview_magnet(&sample.magnet_link(&tracker.url()), Duration::from_secs(20))
         .await
         .expect("метаданные должны подтянуться у mock-пира");
     assert_eq!(preview.name, sample.name);

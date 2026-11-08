@@ -3,6 +3,7 @@ import { createEngineApi, isTauriRuntime } from "./api/engine";
 import type {
   AppPayload,
   AutoShutdownState,
+  FilePriority,
   FilterKey,
   SettingsDto,
   SortKey,
@@ -338,12 +339,6 @@ export function mountApp(): void {
       .catch((reason: unknown) => fail(reason, "Не удалось открыть каталог"));
   }
 
-  function openDownloadDir(): void {
-    void api()
-      .openDownloadDir()
-      .catch((reason: unknown) => fail(reason, "Не удалось открыть каталог"));
-  }
-
   function openExternal(url: string): void {
     void api()
       .openExternal(url)
@@ -358,27 +353,43 @@ export function mountApp(): void {
     }
   }
 
-  async function changeFileSelection(id: number, files: number[]): Promise<void> {
+  function recheckTorrent(id: number): void {
+    void api()
+      .recheckTorrent(id)
+      .catch((reason: unknown) => fail(reason, "Не удалось перепроверить файлы"));
+  }
+
+  async function changeFilePriorities(id: number, priorities: FilePriority[]): Promise<void> {
     try {
-      await api().setFileSelection(id, files);
+      await api().setFilePriorities(id, priorities);
     } catch (reason) {
-      fail(reason, "Не удалось изменить выбор файлов");
+      fail(reason, "Не удалось изменить приоритет файлов");
       throw reason;
     }
   }
 
   function contextMenu(torrent: TorrentSnapshot, anchor: ContextAnchor): void {
-    const active = isActiveState(torrent.state);
+    const checking = torrent.state === "checking";
+    // Во время перепроверки торрент не на паузе, поэтому пункт остаётся «Пауза» —
+    // просто недоступный: движок не принимает паузу во время проверки.
+    const active = isActiveState(torrent.state) || checking;
     openMenu(anchor, [
       {
         label: active ? "Пауза" : "Возобновить",
         icon: active ? "pause" : "play",
+        disabled: checking,
         onSelect: () => void togglePause(torrent.id),
       },
       {
         label: "Подробности",
         icon: "info",
         onSelect: () => openDetails(torrent.id),
+      },
+      {
+        label: "Перепроверить файлы",
+        icon: "refresh",
+        disabled: checking,
+        onSelect: () => recheckTorrent(torrent.id),
       },
       {
         label: "Ограничить скорость",
@@ -389,10 +400,10 @@ export function mountApp(): void {
         }),
       },
       {
-        label: "Открыть папку загрузок",
+        label: "Открыть папку торрента",
         icon: "folderOpen",
         separatorBefore: true,
-        onSelect: openDownloadDir,
+        onSelect: () => revealTorrent(torrent.id),
       },
       {
         label: "Удалить торрент",
@@ -439,7 +450,7 @@ export function mountApp(): void {
     onReveal: (id) => revealTorrent(id),
     onRemove: (id) => removeTorrent(id),
     onOpenExternal: (url) => openExternal(url),
-    onFileSelection: (id, files) => changeFileSelection(id, files),
+    onFilePriorities: (id, priorities) => changeFilePriorities(id, priorities),
   });
 
   const statusbar = createStatusbar(statusbarMount, {

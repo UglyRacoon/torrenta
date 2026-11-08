@@ -238,6 +238,7 @@ mod tests {
                 length: 1024,
                 downloaded: 1024,
                 selected: true,
+                priority: torrent_core::FilePriority::Normal,
             }],
             trackers: Vec::new(),
             peers: Vec::new(),
