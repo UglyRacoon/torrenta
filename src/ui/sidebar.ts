@@ -1,7 +1,7 @@
 import type { AppState } from "../state/store";
 import type { FilterKey } from "../api/types";
 import { activeCount, filterCounts } from "../state/view";
-import { fmtBytes, fmtCount, fmtRate } from "../lib/format";
+import { clamp, fmtBytes, fmtCount, fmtRate } from "../lib/format";
 import { h, setAttr, setText } from "../lib/dom";
 import { brandMark, icon, type IconName } from "../lib/icons";
 
@@ -12,6 +12,13 @@ const NAV: { key: FilterKey; label: string; icon: IconName }[] = [
   { key: "paused", label: "Пауза", icon: "pause" },
   { key: "completed", label: "Завершено", icon: "check" },
 ];
+
+/** Минимальная ширина — режим «только иконки» (см. 4.3). */
+const MIN_WIDTH = 56;
+const MAX_WIDTH = 360;
+/** Ниже этой ширины подписи не помещаются — скрываем их. */
+const COMPACT_BELOW = 136;
+const WIDTH_KEY = "torrenta:sidebar-w";
 
 export interface SidebarOptions {
   onFilter(filter: FilterKey): void;
@@ -24,11 +31,32 @@ export interface Sidebar {
   update(state: AppState): void;
 }
 
+function readStoredWidth(): number | null {
+  try {
+    const raw = window.localStorage.getItem(WIDTH_KEY);
+    if (!raw) {
+      return null;
+    }
+    const value = Math.round(Number.parseInt(raw, 10));
+    return Number.isFinite(value) ? clamp(value, MIN_WIDTH, MAX_WIDTH) : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeWidth(width: number): void {
+  try {
+    window.localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+  } catch {
+    /* приватный режим — ширина просто не запомнится */
+  }
+}
+
 export function createSidebar(mount: HTMLElement, options: SidebarOptions): Sidebar {
   const brand = h(
     "div",
     { class: "brand" },
-    h("span", { class: "brand__mark" }, brandMark(24)),
+    h("span", { class: "brand__mark", attrs: { title: "Torrenta" } }, brandMark(24)),
     h("span", { class: "brand__name", text: "Torrenta" }),
   );
 
@@ -40,7 +68,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     const label = h("span", { class: "nav__label", text: item.label });
     const button = h("button", {
       class: "nav__item",
-      attrs: { type: "button", "data-filter": item.key },
+      attrs: { type: "button", "data-filter": item.key, title: item.label },
     });
     button.append(icon(item.icon, 17), label, count);
     button.addEventListener("click", () => options.onFilter(item.key));
@@ -92,7 +120,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     session,
   );
 
-  const themeLabel = h("span", { text: "Светлая тема" });
+  const themeLabel = h("span", { class: "side-action__label", text: "Светлая тема" });
   const themeButton = h("button", {
     class: "side-action",
     attrs: { type: "button", title: "Переключить тему" },
@@ -106,12 +134,25 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
   });
   settingsButton.append(
     h("span", { class: "side-action__icon" }, icon("settings", 16)),
-    h("span", { text: "Настройки" }),
+    h("span", { class: "side-action__label", text: "Настройки" }),
   );
 
   const footer = h("div", { class: "sidebar__footer" }, themeButton, settingsButton);
 
-  mount.append(brand, nav, speed, h("div", { class: "sidebar__spacer" }), footer);
+  const resize = h("div", {
+    class: "sidebar__resize",
+    attrs: {
+      role: "separator",
+      "aria-orientation": "vertical",
+      "aria-label": "Изменить ширину панели",
+      title: "Потяните, чтобы изменить ширину · стрелки ←→",
+      tabindex: "0",
+      "aria-valuemin": String(MIN_WIDTH),
+      "aria-valuemax": String(MAX_WIDTH),
+    },
+  });
+
+  mount.append(brand, nav, speed, h("div", { class: "sidebar__spacer" }), footer, resize);
 
   themeButton.addEventListener("click", () => options.onToggleTheme());
   settingsButton.addEventListener("click", () => options.onOpenSettings());
@@ -119,6 +160,120 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
 
   let allMode: "pause" | "resume" | "idle" | null = null;
   let theme: string | null = null;
+  let compact: boolean | null = null;
+  let width = 0;
+
+  function applyWidth(next: number, persist: boolean): void {
+    width = Math.round(clamp(next, MIN_WIDTH, MAX_WIDTH));
+    document.documentElement.style.setProperty("--sidebar-w", `${width}px`);
+    setAttr(resize, "aria-valuenow", String(width));
+    if (persist) {
+      storeWidth(width);
+    }
+    syncCompact();
+  }
+
+  function syncCompact(): void {
+    const isCompact = width < COMPACT_BELOW;
+    if (compact === isCompact) {
+      return;
+    }
+    compact = isCompact;
+    mount.dataset.compact = isCompact ? "true" : "false";
+    mount.classList.toggle("sidebar--compact", isCompact);
+    for (const [key, item] of navItems) {
+      const label = NAV.find((entry) => entry.key === key)?.label ?? key;
+      setAttr(item.button, "aria-label", isCompact ? label : null);
+      setAttr(item.button, "title", label);
+    }
+    setAttr(themeButton, "aria-label", isCompact ? "Переключить тему" : null);
+    setAttr(settingsButton, "aria-label", isCompact ? "Настройки" : null);
+    setAttr(allButton, "aria-label", allButton.dataset.label ?? "Пауза/возобновление");
+  }
+
+  // Начальная ширина: сохранённая или по содержимому (CSS max-content).
+  const stored = readStoredWidth();
+  if (stored !== null) {
+    applyWidth(stored, false);
+  } else {
+    width = Math.round(mount.getBoundingClientRect().width) || MAX_WIDTH;
+    setAttr(resize, "aria-valuenow", String(width));
+    syncCompact();
+  }
+
+  const observer = new ResizeObserver((entries) => {
+    const entry = entries[0];
+    if (!entry) {
+      return;
+    }
+    width = Math.round(entry.contentRect.width);
+    setAttr(resize, "aria-valuenow", String(width));
+    syncCompact();
+  });
+  observer.observe(mount);
+
+  let dragStartX = 0;
+  let dragStartWidth = 0;
+  let dragging = false;
+
+  function onPointerMove(event: PointerEvent): void {
+    if (!dragging) {
+      return;
+    }
+    applyWidth(dragStartWidth + (event.clientX - dragStartX), false);
+  }
+
+  function endDrag(event: PointerEvent): void {
+    if (!dragging) {
+      return;
+    }
+    dragging = false;
+    document.documentElement.classList.remove("is-resizing");
+    if (resize.hasPointerCapture(event.pointerId)) {
+      resize.releasePointerCapture(event.pointerId);
+    }
+    storeWidth(width);
+    resize.focus();
+  }
+
+  resize.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    dragging = true;
+    dragStartX = event.clientX;
+    dragStartWidth = mount.getBoundingClientRect().width;
+    document.documentElement.classList.add("is-resizing");
+    resize.setPointerCapture(event.pointerId);
+  });
+  resize.addEventListener("pointermove", onPointerMove);
+  resize.addEventListener("pointerup", endDrag);
+  resize.addEventListener("pointercancel", endDrag);
+
+  resize.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 32 : 16;
+    switch (event.key) {
+      case "ArrowLeft":
+        event.preventDefault();
+        applyWidth(width - step, true);
+        return;
+      case "ArrowRight":
+        event.preventDefault();
+        applyWidth(width + step, true);
+        return;
+      case "Home":
+        event.preventDefault();
+        applyWidth(MIN_WIDTH, true);
+        return;
+      case "End":
+        event.preventDefault();
+        applyWidth(MAX_WIDTH, true);
+        return;
+      default:
+        return;
+    }
+  });
 
   function setAllMode(next: "pause" | "resume" | "idle"): void {
     if (allMode === next) {
@@ -133,6 +288,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
         : next === "pause"
           ? "Приостановить все"
           : "Нет активных загрузок";
+    allButton.dataset.label = label;
     setAttr(allButton, "aria-label", label);
     setAttr(allButton, "title", label);
   }

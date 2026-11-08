@@ -56,6 +56,9 @@ const PATHS = {
   arrowDown: '<path d="M12 4.6v14.2"/><path d="m6.8 13.6 5.2 5.2 5.2-5.2"/>',
   arrowUp: '<path d="M12 19.4V5.2"/><path d="m6.8 10.4 5.2-5.2 5.2 5.2"/>',
   arrowRight: '<path d="M4.6 12h14.2"/><path d="m13.6 6.8 5.2 5.2-5.2 5.2"/>',
+  chevronLeft: '<path d="m14.5 6.5-5.5 5.5 5.5 5.5"/>',
+  power: '<path d="M12 4.4v7.2"/><path d="M7.4 7a7.2 7.2 0 1 0 9.2 0"/>',
+  grip: '<circle cx="9.4" cy="7.4" r="1.15" fill="currentColor" stroke="none"/><circle cx="14.6" cy="7.4" r="1.15" fill="currentColor" stroke="none"/><circle cx="9.4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="14.6" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="9.4" cy="16.6" r="1.15" fill="currentColor" stroke="none"/><circle cx="14.6" cy="16.6" r="1.15" fill="currentColor" stroke="none"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

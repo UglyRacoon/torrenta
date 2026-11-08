@@ -41,6 +41,8 @@ export interface DetailsOptions {
   onReveal(id: number): void;
   onRemove(id: number): void;
   onOpenExternal(url: string): void;
+  /** Изменение набора загружаемых файлов; отклонение промиса означает ошибку движка. */
+  onFileSelection(id: number, files: number[]): Promise<void>;
 }
 
 export interface DetailsPanel {
@@ -70,7 +72,7 @@ function hashString(value: string): number {
 }
 
 function progressText(torrent: TorrentSnapshot): string {
-  const remaining = Math.max(0, torrent.total_bytes - torrent.downloaded_bytes);
+  const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
   switch (torrent.state) {
     case "downloading":
       return torrent.eta_seconds === null
@@ -217,10 +219,27 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   }
 
   // --- Файлы -------------------------------------------------------------
+  const filesSummary = h("p", { class: "files__summary num" });
+  const selectAllButton = h("button", {
+    class: "btn btn--xs btn--ghost",
+    attrs: { type: "button" },
+    text: "Выбрать все",
+  });
+  const selectNoneButton = h("button", {
+    class: "btn btn--xs btn--ghost",
+    attrs: { type: "button" },
+    text: "Снять все",
+  });
+  const filesHead = h(
+    "div",
+    { class: "files__head", attrs: { hidden: "" } },
+    filesSummary,
+    h("div", { class: "files__tools" }, selectAllButton, selectNoneButton),
+  );
   const filesEmpty = h("p", { class: "tabpanel__empty", text: "Файлы появятся после получения метаданных", hidden: true });
   const filesList = h("div", { class: "files", attrs: { role: "list" } });
   const filesPanel = panel("files", "Файлы торрента");
-  filesPanel.append(filesList, filesEmpty);
+  filesPanel.append(filesHead, filesList, filesEmpty);
 
   // --- Трекеры -----------------------------------------------------------
   const trackersEmpty = h("p", { class: "tabpanel__empty", text: "Трекеры не указаны", hidden: true });
@@ -335,7 +354,10 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   });
 
   // --- Ключевые строки ---------------------------------------------------
-  const fileRows = new Map<string, { el: HTMLElement; name: HTMLElement; meta: HTMLElement; size: HTMLElement }>();
+  const fileRows = new Map<
+    string,
+    { el: HTMLElement; name: HTMLElement; meta: HTMLElement; size: HTMLElement; check: HTMLInputElement }
+  >();
   const peerRows = new Map<
     string,
     { el: HTMLElement; addr: HTMLElement; meta: HTMLElement; progress: HTMLElement; down: HTMLElement; up: HTMLElement }
@@ -349,9 +371,14 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     filesList.replaceChildren();
     peersList.replaceChildren();
     trackersList.replaceChildren();
+    currentFiles = [];
+    lastKnownSelection = [];
+    filesHead.hidden = true;
   }
 
   function renderFiles(files: FileView[]): void {
+    currentFiles = files;
+    lastKnownSelection = files.map((file) => file.selected);
     const seen = new Set<string>();
     let previous: HTMLElement | null = null;
     for (const file of files) {
@@ -361,16 +388,38 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
         const fileName = h("span", { class: "file-row__name" });
         const fileMeta = h("span", { class: "file-row__meta" });
         const fileSize = h("span", { class: "file-row__size num" });
-        const mainEl = h("div", { class: "file-row__main" }, fileName, fileMeta);
+        const check = h("input", {
+          class: "checkbox__input",
+          attrs: { type: "checkbox" },
+        });
+        const box = h("span", { class: "checkbox__box" });
         const iconEl = h("span", { class: "file-row__icon" }, icon("file", 15));
-        const el = h("div", { class: "file-row", attrs: { role: "listitem" } }, iconEl, mainEl, fileSize);
-        row = { el, name: fileName, meta: fileMeta, size: fileSize };
+        const mainEl = h("div", { class: "file-row__main" }, fileName, fileMeta);
+        const el = h(
+          "label",
+          { class: "file-row", attrs: { role: "listitem" } },
+          check,
+          box,
+          iconEl,
+          mainEl,
+          fileSize,
+        );
+        check.addEventListener("change", () => commitFileSelection());
+        row = { el, name: fileName, meta: fileMeta, size: fileSize, check };
         fileRows.set(file.path, row);
       }
       setText(row.name, basename(file.path));
       setAttr(row.name, "title", file.path);
       setText(row.meta, file.downloaded >= file.length ? "готово" : `скачано ${fmtBytes(file.downloaded)}`);
       setText(row.size, fmtBytes(file.length));
+      if (row.check.checked !== file.selected) {
+        row.check.checked = file.selected;
+      }
+      setAttr(
+        row.check,
+        "aria-label",
+        `${file.selected ? "Не скачивать" : "Скачивать"}: ${basename(file.path)}`,
+      );
       const reference: Node | null = previous ? previous.nextSibling : filesList.firstChild;
       if (reference !== row.el) {
         filesList.insertBefore(row.el, reference);
@@ -384,7 +433,63 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
       }
     }
     filesEmpty.hidden = files.length > 0;
+    filesHead.hidden = files.length === 0;
+    selectAllButton.disabled = files.length === 0;
+    selectNoneButton.disabled = files.length === 0;
+    refreshFilesSummary();
   }
+
+  /** Набор файлов из последнего снимка движка — база для отката при ошибке. */
+  let currentFiles: FileView[] = [];
+  let lastKnownSelection: boolean[] = [];
+
+  function refreshFilesSummary(): void {
+    let count = 0;
+    let bytes = 0;
+    for (const file of currentFiles) {
+      if (fileRows.get(file.path)?.check.checked) {
+        count += 1;
+        bytes += file.length;
+      }
+    }
+    setText(filesSummary, `Выбрано ${count} из ${currentFiles.length} · ${fmtBytes(bytes)}`);
+  }
+
+  function restoreFileSelection(values: boolean[]): void {
+    currentFiles.forEach((file, index) => {
+      const row = fileRows.get(file.path);
+      if (row) {
+        row.check.checked = values[index] ?? false;
+      }
+    });
+    refreshFilesSummary();
+  }
+
+  function commitFileSelection(): void {
+    const id = currentId;
+    refreshFilesSummary();
+    if (id === null) {
+      return;
+    }
+    const indices = currentFiles
+      .map((file, index) => (fileRows.get(file.path)?.check.checked ? index : -1))
+      .filter((index) => index >= 0);
+    // Пустой набор не принимается движком — покажем это через тост и откат.
+    void options.onFileSelection(id, indices).catch(() => restoreFileSelection(lastKnownSelection));
+  }
+
+  selectAllButton.addEventListener("click", () => {
+    for (const row of fileRows.values()) {
+      row.check.checked = true;
+    }
+    commitFileSelection();
+  });
+  selectNoneButton.addEventListener("click", () => {
+    for (const row of fileRows.values()) {
+      row.check.checked = false;
+    }
+    commitFileSelection();
+  });
 
   function renderTrackers(trackers: string[]): void {
     const seen = new Set<string>();
@@ -593,7 +698,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     const torrent = payload && state.selectedId !== null
       ? payload.torrents.find((item) => item.id === state.selectedId) ?? null
       : null;
-    mount.hidden = torrent === null;
+    mount.hidden = torrent === null || !state.detailsOpen;
     if (!torrent) {
       currentId = null;
       return;
@@ -637,9 +742,12 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     setText(progressNote, progressText(torrent));
     setAttr(bar, "aria-valuenow", String(Math.round(torrent.progress * 100)));
 
-    const remaining = Math.max(0, torrent.total_bytes - torrent.downloaded_bytes);
+    const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
     setText(downloaded.value, fmtBytes(torrent.downloaded_bytes));
-    setText(downloaded.sub, torrent.total_bytes > 0 ? `из ${fmtBytes(torrent.total_bytes)}` : "размер неизвестен");
+    setText(
+      downloaded.sub,
+      torrent.wanted_bytes > 0 ? `из ${fmtBytes(torrent.wanted_bytes)}` : "размер неизвестен",
+    );
     setText(uploaded.value, fmtBytes(torrent.uploaded_bytes));
     setText(uploaded.sub, "за сессию");
     setText(ratio.value, fmtRatio(torrent.uploaded_bytes, torrent.downloaded_bytes));

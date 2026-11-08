@@ -125,37 +125,30 @@
   pointer-events: none;
 }
 
-.sort__select {
-  height: 100%;
-  padding: 0 24px 0 6px;
-  border: 0;
-  background: none;
-  color: var(--color-text);
-  font-size: 12.5px;
-  appearance: none;
-  cursor: pointer;
+.sort__control {
+  min-width: 0;
 }
 
-.sort__select:focus-visible {
-  outline: none;
+.sort__control .select__button {
+  height: 30px;
+  padding: 0 4px 0 6px;
+  border: 0;
+  background: none;
+  font-size: 12.5px;
+}
+
+.sort__control .select__button:hover {
+  border: 0;
+}
+
+.sort__control .select__button:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 0;
 }
 
 .sort:focus-within {
   border-color: var(--color-focus);
   outline: 1px solid var(--color-focus);
-}
-
-.sort__chevron {
-  position: absolute;
-  right: 7px;
-  display: inline-flex;
-  color: var(--color-text-faint);
-  pointer-events: none;
-}
-
-.sort__select option {
-  background: var(--color-surface);
-  color: var(--color-text);
 }
 
 /* --- Список ------------------------------------------------------------ */

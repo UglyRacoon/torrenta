@@ -28,11 +28,13 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 
-pub(crate) use torrent::Env;
+pub(crate) use torrent::{Env, SharedLimiters};
 
 use crate::magnet::Magnet;
 use crate::metainfo::{InfoHash, Metainfo};
 use crate::peerid;
+pub(crate) use crate::selection::{effective_limit, Selection};
+use crate::tracker::{self, AnnounceEvent, AnnounceRequest};
 use crate::wire::Handshake;
 
 /// Сколько байт в блоке запроса (`request`/`piece`).
@@ -164,6 +166,8 @@ pub struct FileView {
     pub path: String,
     pub length: u64,
     pub downloaded: u64,
+    /// Выбран ли файл к загрузке.
+    pub selected: bool,
 }
 
 /// Подключённый пир в снимке состояния.
@@ -186,6 +190,8 @@ pub struct TorrentSnapshot {
     pub state: TorrentState,
     pub error: Option<String>,
     pub total_bytes: u64,
+    /// Сколько байт занимают выбранные файлы.
+    pub wanted_bytes: u64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
     pub progress: f64,
@@ -196,6 +202,10 @@ pub struct TorrentSnapshot {
     pub peers_known: u32,
     pub down_rate: f64,
     pub up_rate: f64,
+    /// Действующий лимит скачивания, КиБ/с (0 — без ограничения).
+    pub down_limit_kib: u32,
+    /// Действующий лимит отдачи, КиБ/с (0 — без ограничения).
+    pub up_limit_kib: u32,
     pub eta_seconds: Option<u64>,
     pub save_path: String,
     pub added_at: i64,
@@ -224,6 +234,60 @@ pub enum AddSource {
     Magnet(String),
 }
 
+/// Дополнительные параметры добавления торрента.
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    /// Куда сохранять файлы (по умолчанию — `download_dir` из конфигурации).
+    pub save_path: Option<PathBuf>,
+    /// Индексы выбранных файлов; `None` — все файлы.
+    pub files: Option<Vec<usize>>,
+}
+
+/// Файл в предварительном просмотре торрента.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewFile {
+    pub index: usize,
+    pub path: String,
+    pub length: u64,
+}
+
+/// Метаданные торрента до его добавления в список.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPreview {
+    pub name: String,
+    pub info_hash: String,
+    pub total_bytes: u64,
+    pub piece_length: u32,
+    pub piece_count: u32,
+    pub files: Vec<PreviewFile>,
+    pub trackers: Vec<String>,
+}
+
+impl TorrentPreview {
+    /// Собирает превью из разобранных метаданных.
+    pub(crate) fn from_metainfo(meta: &Metainfo) -> TorrentPreview {
+        TorrentPreview {
+            name: meta.info.name.clone(),
+            info_hash: meta.info_hash.to_hex(),
+            total_bytes: meta.info.total_length,
+            piece_length: meta.info.piece_length,
+            piece_count: meta.info.piece_count() as u32,
+            files: meta
+                .info
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| PreviewFile {
+                    index,
+                    path: file.path.clone(),
+                    length: file.length,
+                })
+                .collect(),
+            trackers: meta.trackers(),
+        }
+    }
+}
+
 /// Ошибки движка (сообщения уже на русском — их можно показывать в UI).
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -237,6 +301,8 @@ pub enum EngineError {
     NotFound(u64),
     #[error("торрент уже добавлен: {0}")]
     Duplicate(String),
+    #[error("не выбран ни один файл")]
+    Selection,
 }
 
 /// События движка (транслируются подписчикам).
@@ -289,6 +355,8 @@ pub(crate) struct Stats {
     pub(crate) error: RwLock<Option<String>>,
     pub(crate) state: Mutex<TorrentState>,
     pub(crate) total_bytes: AtomicU64,
+    /// Сколько байт занимают выбранные файлы.
+    pub(crate) wanted_bytes: AtomicU64,
     pub(crate) have_bytes: AtomicU64,
     pub(crate) downloaded: AtomicU64,
     pub(crate) uploaded: AtomicU64,
@@ -314,6 +382,7 @@ impl Stats {
             error: RwLock::new(None),
             state: Mutex::new(state),
             total_bytes: AtomicU64::new(0),
+            wanted_bytes: AtomicU64::new(0),
             have_bytes: AtomicU64::new(0),
             downloaded: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
@@ -337,6 +406,7 @@ impl Stats {
     pub(crate) fn set_meta(&self, meta: &Metainfo) {
         *wr(&self.name) = meta.info.name.clone();
         self.total_bytes.store(meta.info.total_length, Ordering::Relaxed);
+        self.wanted_bytes.store(meta.info.total_length, Ordering::Relaxed);
         self.piece_count
             .store(meta.info.piece_count() as u32, Ordering::Relaxed);
         self.piece_length.store(meta.info.piece_length, Ordering::Relaxed);
@@ -348,8 +418,21 @@ impl Stats {
                 path: file.path.clone(),
                 length: file.length,
                 downloaded: 0,
+                selected: true,
             })
             .collect();
+    }
+
+    /// Обновляет отметки выбранных файлов и объём нужных данных.
+    pub(crate) fn set_selection(&self, selection: &Selection) {
+        self.wanted_bytes
+            .store(selection.bytes(), Ordering::Relaxed);
+        let flags = selection.files();
+        for (index, file) in wr(&self.files).iter_mut().enumerate() {
+            if let Some(selected) = flags.get(index) {
+                file.selected = *selected;
+            }
+        }
     }
 
     /// Пересчитывает скорости (вызывается тикером раз в 500 мс).
@@ -381,6 +464,13 @@ fn smooth_rate(atom: &AtomicU64, instant: f64) {
 // Торрент-хэндл
 // ---------------------------------------------------------------------------
 
+/// Локальные лимиты скорости одного торрента, КиБ/с (0 — без ограничения).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Limits {
+    pub(crate) down_kib: u32,
+    pub(crate) up_kib: u32,
+}
+
 /// Синхронная часть торрента: живёт с момента добавления до удаления,
 /// даже пока метаданные magnet-ссылки ещё не получены.
 pub(crate) struct TorrentHandle {
@@ -394,6 +484,12 @@ pub(crate) struct TorrentHandle {
     pub(crate) save_dir: PathBuf,
     pub(crate) meta: RwLock<Option<Metainfo>>,
     pub(crate) runtime: Mutex<Option<Arc<torrent::Runtime>>>,
+    /// Текущий выбор файлов (нужные куски).
+    pub(crate) selection: RwLock<Selection>,
+    /// Локальные лимиты скорости.
+    pub(crate) limits: Arc<RwLock<Limits>>,
+    /// Выбор, заданный при добавлении magnet: применится после метаданных.
+    pub(crate) pending_files: Mutex<Option<Vec<usize>>>,
 }
 
 impl TorrentHandle {
@@ -472,7 +568,7 @@ impl TorrentHandle {
     pub(crate) fn snapshot(&self) -> TorrentSnapshot {
         let state = self.effective_state();
         let total = self.stats.total_bytes.load(Ordering::Relaxed);
-        let have_bytes = self.stats.have_bytes.load(Ordering::Relaxed);
+        let wanted_bytes = self.stats.wanted_bytes.load(Ordering::Relaxed);
         let mut files = rd(&self.stats.files).clone();
         let per_file = self.file_bytes();
         if per_file.len() == files.len() {
@@ -480,13 +576,23 @@ impl TorrentHandle {
                 file.downloaded = bytes;
             }
         }
+        // Прогресс и ETA считаются по выбранным файлам: скачанные байты чужих
+        // файлов в зачёт не идут, хотя и остаются на диске.
+        let wanted_have: u64 = files
+            .iter()
+            .filter(|file| file.selected)
+            .map(|file| file.downloaded)
+            .sum();
         let down_rate = load_f64(&self.stats.down_rate);
         let up_rate = load_f64(&self.stats.up_rate);
-        let eta = if total > have_bytes && down_rate > 1.0 {
-            Some(((total - have_bytes) as f64 / down_rate).ceil() as u64)
+        let remaining = wanted_bytes.saturating_sub(wanted_have);
+        let eta = if remaining > 0 && down_rate > 1.0 {
+            Some((remaining as f64 / down_rate).ceil() as u64)
         } else {
             None
         };
+        let limits = *rd(&self.limits);
+        let config = rd(&self.env.config).clone();
         TorrentSnapshot {
             id: self.id,
             name: rd(&self.stats.name).clone(),
@@ -494,12 +600,13 @@ impl TorrentHandle {
             state,
             error: rd(&self.stats.error).clone(),
             total_bytes: total,
+            wanted_bytes,
             downloaded_bytes: self.stats.downloaded.load(Ordering::Relaxed),
             uploaded_bytes: self.stats.uploaded.load(Ordering::Relaxed),
-            progress: if total == 0 {
+            progress: if wanted_bytes == 0 {
                 0.0
             } else {
-                (have_bytes as f64 / total as f64).clamp(0.0, 1.0)
+                (wanted_have as f64 / wanted_bytes as f64).clamp(0.0, 1.0)
             },
             piece_count: self.stats.piece_count.load(Ordering::Relaxed),
             piece_length: self.stats.piece_length.load(Ordering::Relaxed),
@@ -508,6 +615,8 @@ impl TorrentHandle {
             peers_known: self.stats.peers_known.load(Ordering::Relaxed),
             down_rate,
             up_rate,
+            down_limit_kib: effective_limit(config.download_limit_kib, limits.down_kib),
+            up_limit_kib: effective_limit(config.upload_limit_kib, limits.up_kib),
             eta_seconds: eta,
             save_path: self.save_dir.to_string_lossy().into_owned(),
             added_at: self.added_at,
@@ -534,6 +643,8 @@ struct Inner {
     rt: RwLock<Option<tokio::runtime::Handle>>,
     background: AtomicBool,
     shutdown: Arc<AtomicBool>,
+    /// Общие на сессию ведра лимитов скорости: глобальный потолок один на всех.
+    limiters: Arc<SharedLimiters>,
 }
 
 /// Менеджер торрентов — единственная точка входа движка для Tauri-бэкенда.
@@ -569,6 +680,7 @@ impl TorrentManager {
                 rt: RwLock::new(None),
                 background: AtomicBool::new(false),
                 shutdown: Arc::new(AtomicBool::new(false)),
+                limiters: Arc::new(SharedLimiters::new()),
             }),
         });
         manager.ensure_background();
@@ -596,15 +708,36 @@ impl TorrentManager {
         data: Vec<u8>,
         save_path: Option<PathBuf>,
     ) -> Result<u64, EngineError> {
+        self.add_file_with(
+            data,
+            AddOptions {
+                save_path,
+                files: None,
+            },
+        )
+        .await
+    }
+
+    /// Добавляет торрент из содержимого `.torrent` с выбором файлов.
+    pub async fn add_file_with(
+        &self,
+        data: Vec<u8>,
+        opts: AddOptions,
+    ) -> Result<u64, EngineError> {
         self.ensure_background();
         let meta = Metainfo::parse(&data).map_err(|err| EngineError::Metainfo(err.to_string()))?;
+        // Выбор проверяем до добавления: пустой или кривой список индексов
+        // не должен оставлять «полуторрент» в списке.
+        let selection = Selection::from_files(&meta.info, opts.files.as_deref())
+            .ok_or(EngineError::Selection)?;
         let hash = meta.info_hash;
         if self.find_by_hash(hash).is_some() {
             return Err(EngineError::Duplicate(hash.to_hex()));
         }
-        let dir = save_path.unwrap_or_else(|| self.config().download_dir);
+        let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
         let name = meta.info.name.clone();
         let handle = self.make_handle(hash, None, name.clone(), dir, TorrentState::Queued);
+        *wr(&handle.selection) = selection;
         self.push_handle(handle.clone())?;
         if let Err(message) = torrent::install(&handle, meta) {
             self.drop_handle(handle.id);
@@ -623,13 +756,35 @@ impl TorrentManager {
         link: &str,
         save_path: Option<PathBuf>,
     ) -> Result<u64, EngineError> {
+        self.add_magnet_with(
+            link,
+            AddOptions {
+                save_path,
+                files: None,
+            },
+        )
+        .await
+    }
+
+    /// Добавляет торрент по magnet-ссылке с выбором файлов.
+    ///
+    /// Список файлов применится, когда придут метаданные; пустой список —
+    /// сразу ошибка [`EngineError::Selection`].
+    pub async fn add_magnet_with(
+        &self,
+        link: &str,
+        opts: AddOptions,
+    ) -> Result<u64, EngineError> {
         self.ensure_background();
+        if matches!(&opts.files, Some(files) if files.is_empty()) {
+            return Err(EngineError::Selection);
+        }
         let magnet = crate::magnet::parse(link).map_err(|err| EngineError::Magnet(err.to_string()))?;
         let hash = magnet.info_hash;
         if self.find_by_hash(hash).is_some() {
             return Err(EngineError::Duplicate(hash.to_hex()));
         }
-        let dir = save_path.unwrap_or_else(|| self.config().download_dir);
+        let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
         let name = magnet
             .display_name
             .clone()
@@ -641,6 +796,7 @@ impl TorrentManager {
             dir,
             TorrentState::Metadata,
         );
+        *lk(&handle.pending_files) = opts.files;
         self.push_handle(handle.clone())?;
         let _ = self.inner.events.send(EngineEvent::Added {
             id: handle.id,
@@ -648,6 +804,156 @@ impl TorrentManager {
         });
         torrent::start_metadata_fetch(&handle);
         Ok(handle.id)
+    }
+
+    /// Меняет набор выбранных файлов уже добавленного торрента.
+    ///
+    /// Пересчитываются нужные куски, невыбранные возвращаются в пул, статус и
+    /// событие `StateChanged` обновляются. Скачанные файлы остаются на диске.
+    pub fn set_file_selection(&self, id: u64, files: Vec<usize>) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        if files.is_empty() {
+            return Err(EngineError::Selection);
+        }
+        let meta = rd(&handle.meta).clone();
+        match meta {
+            Some(meta) => {
+                let selection =
+                    Selection::from_files(&meta.info, Some(&files)).ok_or(EngineError::Selection)?;
+                // Порядок важен: сначала выбор в хендле и статистике (чтобы снимок
+                // уже видел новый набор), потом — пикер и состояние рантайма.
+                *wr(&handle.selection) = selection.clone();
+                handle.stats.set_selection(&selection);
+                if let Some(runtime) = handle.runtime_clone() {
+                    runtime.apply_selection(&selection);
+                }
+            }
+            None => {
+                // Метаданные ещё не получены: запоминаем выбор до установки.
+                *lk(&handle.pending_files) = Some(files);
+            }
+        }
+        Ok(())
+    }
+
+    /// Задаёт локальные лимиты скорости торрента, КиБ/с (0 — без ограничения).
+    ///
+    /// Действующий лимит — минимум из глобального и локального.
+    pub fn set_limits(&self, id: u64, down_kib: u32, up_kib: u32) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        *wr(&handle.limits) = Limits { down_kib, up_kib };
+        Ok(())
+    }
+
+    /// Разбирает `.torrent` и отдаёт метаданные для окна добавления.
+    ///
+    /// Ничего не добавляет в список торрентов.
+    pub fn preview_file(data: &[u8]) -> Result<TorrentPreview, EngineError> {
+        let meta = Metainfo::parse(data).map_err(|err| EngineError::Metainfo(err.to_string()))?;
+        Ok(TorrentPreview::from_metainfo(&meta))
+    }
+
+    /// Достаёт метаданные magnet-ссылки у пиров, не добавляя торрент в список.
+    ///
+    /// Укладывается в `timeout`; по завершении не остаётся ни задач, ни
+    /// подписок — все подключения живут внутри вызова.
+    pub async fn preview_magnet(
+        &self,
+        link: &str,
+        timeout: Duration,
+    ) -> Result<TorrentPreview, EngineError> {
+        let magnet =
+            crate::magnet::parse(link).map_err(|err| EngineError::Magnet(err.to_string()))?;
+        if magnet.trackers.is_empty() {
+            return Err(EngineError::Magnet(
+                "в magnet-ссылке нет трекеров — метаданные взять негде".to_string(),
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        let fetch = peer::MetadataFetch {
+            info_hash: magnet.info_hash,
+            peer_id: self.inner.peer_id,
+            timeout,
+        };
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if candidates.is_empty() {
+                for url in magnet.trackers.iter().take(5) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let request = AnnounceRequest {
+                        info_hash: magnet.info_hash,
+                        peer_id: self.inner.peer_id,
+                        port: self.inner.listen_port,
+                        uploaded: 0,
+                        downloaded: 0,
+                        left: 16 * 1024,
+                        event: Some(AnnounceEvent::Started),
+                        num_want: Some(50),
+                        key: None,
+                    };
+                    let response = tokio::time::timeout(
+                        left,
+                        tracker::announce(&self.inner.http, url, &request, left),
+                    )
+                    .await;
+                    if let Ok(Ok(response)) = response {
+                        for peer in response.peers {
+                            let addr = SocketAddr::new(peer.ip, peer.port);
+                            if peer.port != 0
+                                && !peer.ip.is_unspecified()
+                                && !candidates.contains(&addr)
+                            {
+                                candidates.push(addr);
+                            }
+                        }
+                    }
+                }
+                candidates.truncate(64);
+            }
+            let mut received: Option<Vec<u8>> = None;
+            while let Some(addr) = candidates.pop() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let fetched = tokio::time::timeout(left, peer::fetch_metadata(&fetch, addr)).await;
+                if let Ok(Ok(raw)) = fetched {
+                    received = Some(raw);
+                    break;
+                }
+            }
+            if let Some(raw) = received {
+                let meta = Metainfo::from_raw_info(
+                    &raw,
+                    magnet.trackers.clone(),
+                    magnet.display_name.as_deref(),
+                )
+                .map_err(|err| EngineError::Metainfo(err.to_string()))?;
+                if meta.info_hash != magnet.info_hash {
+                    return Err(EngineError::Metainfo(
+                        "метаданные не совпали с info-hash".to_string(),
+                    ));
+                }
+                return Ok(TorrentPreview::from_metainfo(&meta));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            tokio::time::sleep(left.min(Duration::from_secs(3))).await;
+        }
+        Err(EngineError::Io(
+            "не удалось получить метаданные за отведённое время".to_string(),
+        ))
     }
 
     /// Ставит торрент на паузу (соединения закрываются, данные сохраняются).
@@ -835,6 +1141,7 @@ impl TorrentManager {
         if let Some(magnet) = &magnet {
             *wr(&stats.trackers) = magnet.trackers.clone();
         }
+        let limits = Arc::new(RwLock::new(Limits::default()));
         Arc::new(TorrentHandle {
             id,
             info_hash: hash,
@@ -848,11 +1155,16 @@ impl TorrentManager {
                 port: self.inner.listen_port,
                 events: self.inner.events.clone(),
                 shutdown: self.inner.shutdown.clone(),
+                limits: limits.clone(),
+                shared: self.inner.limiters.clone(),
             },
             added_at: now_unix(),
             save_dir,
             meta: RwLock::new(None),
             runtime: Mutex::new(None),
+            selection: RwLock::new(Selection::empty()),
+            limits,
+            pending_files: Mutex::new(None),
         })
     }
 

@@ -1,4 +1,4 @@
-/** Типы данных, которые движок Torrenta отдаёт фронтенду (snake_case — контракт CORE_API). */
+/** DTO движка. Имена полей повторяют serde-представление Rust как есть. */
 
 export type TorrentState =
   | "queued"
@@ -9,10 +9,12 @@ export type TorrentState =
   | "completed"
   | "error";
 
+/** Файл внутри торрента. selected — выбран ли файл для скачивания. */
 export interface FileView {
   path: string;
   length: number;
   downloaded: number;
+  selected: boolean;
 }
 
 export interface PeerView {
@@ -30,23 +32,26 @@ export interface TorrentSnapshot {
   info_hash: string;
   state: TorrentState;
   error: string | null;
+  /** Полный размер торрента, не зависит от выбранных файлов. */
   total_bytes: number;
+  /** Размер только выбранных файлов — база для прогресса. */
+  wanted_bytes: number;
   downloaded_bytes: number;
   uploaded_bytes: number;
-  /** Прогресс 0..1. */
   progress: number;
   piece_count: number;
   piece_length: number;
   pieces_have: number;
   peers_connected: number;
   peers_known: number;
-  /** Байт/с. */
   down_rate: number;
-  /** Байт/с. */
   up_rate: number;
+  /** 0 — без ограничения. */
+  down_limit_kib: number;
+  /** 0 — без ограничения. */
+  up_limit_kib: number;
   eta_seconds: number | null;
   save_path: string;
-  /** Unix-время, секунды. */
   added_at: number;
   files: FileView[];
   trackers: string[];
@@ -69,7 +74,8 @@ export interface SettingsDto {
   upload_limit_kib: number;
   listen_port: number;
   seed_after_complete: boolean;
-  theme: string;
+  auto_shutdown: boolean;
+  theme: ThemeName;
 }
 
 export interface AppInfoDto {
@@ -87,19 +93,60 @@ export interface AppPayload {
   app: AppInfoDto;
 }
 
-export type EngineMode = "mock" | "tauri";
+export type EngineMode = "tauri" | "mock";
 
 export type FilterKey = "all" | "downloading" | "seeding" | "paused" | "completed";
-export type SortKey = "added" | "name" | "progress" | "speed" | "size";
-export type ThemeName = "dark" | "light";
-export type ToastKind = "success" | "error" | "info";
 
-/** Вход для добавления торрента: путь к .torrent на диске или уже прочитанные байты. */
-export type TorrentInput =
-  | { kind: "file"; path: string }
-  | { kind: "bytes"; bytes: Uint8Array; name: string };
+export type SortKey = "added" | "name" | "progress" | "speed" | "size";
+
+export type ThemeName = "dark" | "light";
+
+export type ToastKind = "info" | "success" | "warning" | "error";
+
+/**
+ * Источник торрента: путь к .torrent или magnet-ссылка.
+ * В демо-режиме вместо пути приходит имя выбранного файла.
+ */
+export type TorrentSource =
+  | { kind: "path"; path: string }
+  | { kind: "magnet"; link: string };
+
+/** Предпросмотр до добавления: имя, размер, хеш и список файлов. */
+export interface PreviewFile {
+  index: number;
+  path: string;
+  length: number;
+}
+
+export interface TorrentPreview {
+  name: string;
+  info_hash: string;
+  total_bytes: number;
+  piece_length: number;
+  piece_count: number;
+  files: PreviewFile[];
+  trackers: string[];
+}
+
+export interface AddOptions {
+  /** Каталог сохранения; null — каталог по умолчанию из настроек. */
+  savePath: string | null;
+  /** Индексы выбранных файлов; null — все файлы. */
+  files: number[] | null;
+}
 
 export interface AddResult {
   id: number;
   name: string;
 }
+
+/** Состояние автовыключения: включено ли и сколько секунд до выключения. */
+export interface AutoShutdownState {
+  enabled: boolean;
+  pending_seconds: number | null;
+}
+
+export const NO_LIMIT = 0;
+
+/** Ступени ограничения скорости в КиБ/с — общие для настроек и меню торрента. */
+export const SPEED_STEPS: number[] = [NO_LIMIT, 64, 256, 1024, 4096];

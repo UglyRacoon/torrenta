@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha1::{Digest, Sha1};
@@ -343,8 +343,49 @@ pub struct MockTracker {
     pub addr: SocketAddr,
     /// Сколько announce реально дошло.
     pub announces: Arc<AtomicU32>,
+    /// Параметры дошедших announce (в порядке прихода).
+    pub log: Arc<Mutex<Vec<TrackerAnnounce>>>,
     stop: Arc<AtomicBool>,
     task: JoinHandle<()>,
+}
+
+/// Параметры одного объявления, которые запоминает mock-трекер.
+#[derive(Clone, Debug, Default)]
+pub struct TrackerAnnounce {
+    /// Сколько байт осталось скачать по мнению движка.
+    pub left: u64,
+    /// Отдано за сессию.
+    pub uploaded: u64,
+    /// Скачано за сессию.
+    pub downloaded: u64,
+    /// Событие (`started`, `completed`, …), если было.
+    pub event: Option<String>,
+}
+
+/// Достаёт параметры announce из query-строки HTTP-запроса.
+fn parse_announce_query(request: &[u8]) -> TrackerAnnounce {
+    let text = String::from_utf8_lossy(request);
+    let mut announce = TrackerAnnounce::default();
+    let Some(line) = text.lines().next() else {
+        return announce;
+    };
+    let Some((_path, query)) = line.split_once('?') else {
+        return announce;
+    };
+    let query = query.split_whitespace().next().unwrap_or(query);
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match name {
+            "left" => announce.left = value.parse().unwrap_or(0),
+            "uploaded" => announce.uploaded = value.parse().unwrap_or(0),
+            "downloaded" => announce.downloaded = value.parse().unwrap_or(0),
+            "event" => announce.event = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    announce
 }
 
 impl MockTracker {
@@ -375,6 +416,7 @@ impl MockTracker {
             .local_addr()
             .expect("mock-трекер: не удалось узнать локальный адрес");
         let announces = Arc::new(AtomicU32::new(0));
+        let log: Arc<Mutex<Vec<TrackerAnnounce>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let bodies: Arc<Vec<Vec<u8>>> = Arc::new(
             replies
@@ -384,6 +426,7 @@ impl MockTracker {
         );
         let counter = announces.clone();
         let stopping = stop.clone();
+        let recorded = log.clone();
         let task = tokio::spawn(async move {
             loop {
                 if stopping.load(Ordering::Relaxed) {
@@ -397,8 +440,9 @@ impl MockTracker {
                 let seen = counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let position = seen.min(bodies.len().saturating_sub(1));
                 let body = bodies[position].clone();
+                let recorded = recorded.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = serve_tracker(stream, body).await {
+                    if let Err(err) = serve_tracker(stream, body, recorded).await {
                         eprintln!("mock-трекер: {err}");
                     }
                 });
@@ -407,6 +451,7 @@ impl MockTracker {
         MockTracker {
             addr,
             announces,
+            log,
             stop,
             task,
         }
@@ -420,6 +465,14 @@ impl MockTracker {
     /// Сколько announce пришло.
     pub fn announce_count(&self) -> u32 {
         self.announces.load(Ordering::Relaxed)
+    }
+
+    /// Копия журнала announce: что именно присылал движок.
+    pub fn log(&self) -> Vec<TrackerAnnounce> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -456,7 +509,11 @@ fn tracker_body(reply: &TrackerReply, interval: u32) -> Vec<u8> {
 }
 
 /// Отвечает на один HTTP-запрос трекера.
-async fn serve_tracker(mut stream: TcpStream, body: Vec<u8>) -> io::Result<()> {
+async fn serve_tracker(
+    mut stream: TcpStream,
+    body: Vec<u8>,
+    log: Arc<Mutex<Vec<TrackerAnnounce>>>,
+) -> io::Result<()> {
     let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -480,7 +537,12 @@ async fn serve_tracker(mut stream: TcpStream, body: Vec<u8>) -> io::Result<()> {
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&body).await?;
-    stream.flush().await
+    stream.flush().await?;
+    let announce = parse_announce_query(&request);
+    log.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(announce);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

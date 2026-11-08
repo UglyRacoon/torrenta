@@ -1,13 +1,16 @@
 import type {
+  AddOptions,
   AddResult,
   AppInfoDto,
   AppPayload,
+  AutoShutdownState,
   FileView,
   GlobalTotals,
   PeerView,
   SettingsDto,
-  TorrentInput,
+  TorrentPreview,
   TorrentSnapshot,
+  TorrentSource,
   TorrentState,
 } from "./types";
 import type { EngineApi, FileDropHandlers } from "./engine";
@@ -76,6 +79,13 @@ function peer(
   return { addr, client, down_rate: down, up_rate: up, progress, is_seed: isSeed };
 }
 
+interface FixtureFile {
+  path: string;
+  length: number;
+  downloaded: number;
+  selected?: boolean;
+}
+
 interface FixtureOptions {
   id: number;
   name: string;
@@ -92,13 +102,21 @@ interface FixtureOptions {
   up: number;
   eta: number | null;
   minutesAgo: number;
-  files: FileView[];
+  files: FixtureFile[];
   trackers: string[];
   peers: PeerView[];
   error?: string;
 }
 
 function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
+  const files: FileView[] = options.files.map((file) => ({
+    ...file,
+    selected: file.selected ?? true,
+  }));
+  const wanted =
+    files.length > 0
+      ? files.reduce((sum, file) => sum + (file.selected ? file.length : 0), 0)
+      : options.total;
   return {
     id: options.id,
     name: options.name,
@@ -106,9 +124,10 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     state: options.state,
     error: options.error ?? null,
     total_bytes: options.total,
+    wanted_bytes: wanted,
     downloaded_bytes: options.downloaded,
     uploaded_bytes: options.uploaded,
-    progress: options.total > 0 ? clamp(options.downloaded / options.total, 0, 1) : 0,
+    progress: wanted > 0 ? clamp(options.downloaded / wanted, 0, 1) : 0,
     piece_count: options.pieces,
     piece_length: 2_097_152,
     pieces_have: options.piecesHave,
@@ -116,10 +135,12 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     peers_known: options.peersKnown,
     down_rate: options.down,
     up_rate: options.up,
+    down_limit_kib: 0,
+    up_limit_kib: 0,
     eta_seconds: options.eta,
     save_path: DOWNLOADS,
     added_at: Math.floor(now / 1000) - options.minutesAgo * 60,
-    files: options.files,
+    files,
     trackers: options.trackers,
     peers: options.peers,
   };
@@ -343,6 +364,60 @@ function stateOf(torrent: TorrentSnapshot): TorrentState {
   return torrent.state;
 }
 
+/**
+ * Демо-разбор источника: без сети, но с той же формой ответа, что у Rust.
+ * Для магнита имя берётся из dn, для файла — из имени файла.
+ */
+function previewOf(source: TorrentSource): TorrentPreview {
+  if (source.kind === "magnet") {
+    const link = source.link.trim();
+    if (!/^magnet:\?/i.test(link)) {
+      throw new Error("Ссылка должна начинаться с magnet:?");
+    }
+    const params = new URLSearchParams(link.slice(link.indexOf("?") + 1));
+    const xt = params.get("xt") ?? "";
+    const match = /urn:btih:([0-9a-z]+)/i.exec(xt);
+    if (!match) {
+      throw new Error("В magnet-ссылке нет info-hash (xt=urn:btih)");
+    }
+    const name = params.get("dn")?.trim() || "Magnet-загрузка";
+    const total = plausibleSize(name);
+    return {
+      name,
+      info_hash: match[1].toLowerCase(),
+      total_bytes: total,
+      piece_length: 2_097_152,
+      piece_count: Math.ceil(total / 2_097_152),
+      files: [{ index: 0, path: name, length: total }],
+      trackers: params.getAll("tr").filter(Boolean).slice(0, 6),
+    };
+  }
+
+  const path = source.path.trim();
+  if (!/\.torrent$/i.test(path)) {
+    throw new Error("Это не .torrent-файл");
+  }
+  const name = baseName(path);
+  const main = plausibleSize(name);
+  const files = [
+    { index: 0, path: name, length: main },
+    { index: 1, path: "readme.txt", length: 2_048 },
+  ];
+  const total = main + 2_048;
+  return {
+    name,
+    info_hash: hashHex(`preview:${name}`),
+    total_bytes: total,
+    piece_length: 2_097_152,
+    piece_count: Math.ceil(total / 2_097_152),
+    files,
+    trackers: [
+      "udp://tracker.opentrackr.org:1337/announce",
+      "https://tracker.gbitt.info/announce",
+    ],
+  };
+}
+
 export async function createMockApi(): Promise<EngineApi> {
   const now = Date.now();
   const torrents = buildFixtures(now);
@@ -359,20 +434,24 @@ export async function createMockApi(): Promise<EngineApi> {
     upload_limit_kib: 0,
     listen_port: 51413,
     seed_after_complete: true,
+    auto_shutdown: false,
     theme: "dark",
   };
 
   const app: AppInfoDto = {
     name: "Torrenta",
-    version: "1.0.0",
-    engine: "torrent-core 0.1.0",
+    version: "1.1.0",
+    engine: "torrent-core 0.2.0",
     listen_port: 51413,
     platform: "windows",
   };
 
   const listeners = new Set<(payload: AppPayload) => void>();
+  const autoListeners = new Set<(state: AutoShutdownState) => void>();
   let nextId = Math.max(...torrents.map((torrent) => torrent.id)) + 1;
   let timer = 0;
+  let autoTimer = 0;
+  let autoPending: number | null = null;
 
   function deriveTotals(): GlobalTotals {
     let active = 0;
@@ -424,16 +503,49 @@ export async function createMockApi(): Promise<EngineApi> {
     return torrent;
   }
 
+  function syncWanted(torrent: TorrentSnapshot): void {
+    torrent.wanted_bytes =
+      torrent.files.length > 0
+        ? torrent.files.reduce((sum, file) => sum + (file.selected ? file.length : 0), 0)
+        : torrent.total_bytes;
+  }
+
+  /** Раскладывает скачанное по выбранным файлам пропорционально их размеру. */
   function syncFiles(torrent: TorrentSnapshot): void {
-    if (torrent.total_bytes <= 0) {
+    syncWanted(torrent);
+    const wanted = torrent.wanted_bytes;
+    if (wanted <= 0) {
       return;
     }
+    const ratio = clamp(torrent.downloaded_bytes / wanted, 0, 1);
     for (const file of torrent.files) {
-      file.downloaded = Math.min(
-        file.length,
-        Math.round((torrent.downloaded_bytes * file.length) / torrent.total_bytes),
-      );
+      file.downloaded = file.selected ? Math.min(file.length, Math.round(file.length * ratio)) : 0;
     }
+  }
+
+  function refreshProgress(torrent: TorrentSnapshot): void {
+    const wanted = torrent.wanted_bytes;
+    torrent.progress = wanted > 0 ? clamp(torrent.downloaded_bytes / wanted, 0, 1) : 0;
+    torrent.pieces_have = Math.min(
+      torrent.piece_count,
+      Math.floor(torrent.progress * torrent.piece_count),
+    );
+    if (torrent.state === "downloading") {
+      torrent.eta_seconds =
+        torrent.down_rate > 0
+          ? Math.ceil(Math.max(0, wanted - torrent.downloaded_bytes) / torrent.down_rate)
+          : null;
+    }
+  }
+
+  /** Эффективный лимит: минимум из глобального и лимита торрента, 0 — без ограничения. */
+  function capRate(rate: number, torrentLimit: number, globalLimit: number): number {
+    const limits = [torrentLimit, globalLimit].filter((value) => value > 0);
+    if (limits.length === 0) {
+      return rate;
+    }
+    const limit = Math.min(...limits) * 1024;
+    return Math.min(rate, limit);
   }
 
   function complete(torrent: TorrentSnapshot): void {
@@ -444,9 +556,81 @@ export async function createMockApi(): Promise<EngineApi> {
     torrent.up_rate = 0;
     torrent.eta_seconds = null;
     torrent.peers_connected = 0;
-    torrent.downloaded_bytes = torrent.total_bytes;
+    torrent.downloaded_bytes = torrent.wanted_bytes;
     for (const file of torrent.files) {
-      file.downloaded = file.length;
+      file.downloaded = file.selected ? file.length : 0;
+    }
+  }
+
+  function autoState(): AutoShutdownState {
+    return { enabled: settings.auto_shutdown, pending_seconds: autoPending };
+  }
+
+  function emitAuto(): void {
+    const state = autoState();
+    for (const listener of [...autoListeners]) {
+      listener(state);
+    }
+  }
+
+  /**
+   * Условие выключения как в бэкенде (`auto_shutdown::should_shutdown`):
+   * есть хотя бы один завершённый/раздающий торрент и никто не мешает —
+   * ни очередь, ни метаданные, ни загрузка, ни пауза (пауза — осознанное
+   * действие пользователя, за его спиной ПК не выключаем; ошибка не мешает).
+   */
+  function downloadsFinished(): boolean {
+    const finished = torrents.some(
+      (torrent) => torrent.state === "completed" || torrent.state === "seeding",
+    );
+    if (!finished) {
+      return false;
+    }
+    return torrents.every(
+      (torrent) =>
+        torrent.state !== "queued" &&
+        torrent.state !== "metadata" &&
+        torrent.state !== "downloading" &&
+        torrent.state !== "paused",
+    );
+  }
+
+  function cancelPending(): void {
+    if (autoPending === null) {
+      return;
+    }
+    autoPending = null;
+    emitAuto();
+  }
+
+  function autoTick(): void {
+    if (!settings.auto_shutdown) {
+      cancelPending();
+      return;
+    }
+    if (autoPending === null) {
+      if (!downloadsFinished()) {
+        return;
+      }
+      autoPending = 60;
+      emitAuto();
+      return;
+    }
+    autoPending -= 1;
+    if (autoPending > 0) {
+      emitAuto();
+      return;
+    }
+    // Демо-режим не выключает машину: показываем 0 и снимаем отсчёт.
+    autoPending = null;
+    settings.auto_shutdown = false;
+    emitAuto();
+    emit();
+  }
+
+  function startAuto(): void {
+    if (autoTimer === 0) {
+      autoTimer = window.setInterval(autoTick, 1000);
     }
   }
 
@@ -462,9 +646,11 @@ export async function createMockApi(): Promise<EngineApi> {
     torrent.up_rate = runtime.upTarget;
     torrent.eta_seconds = Math.ceil(2_400_000_000 / runtime.downTarget);
     torrent.files = [
-      { path: "Архив документации 2024.pdf", length: 1_850_000_000, downloaded: 0 },
-      { path: "Приложения/Справочник.djv", length: 550_000_000, downloaded: 0 },
+      { path: "Архив документации 2024.pdf", length: 1_850_000_000, downloaded: 0, selected: true },
+      { path: "Приложения/Справочник.djv", length: 550_000_000, downloaded: 0, selected: true },
     ];
+    syncWanted(torrent);
+    torrent.wanted_bytes = 2_400_000_000;
     if (torrent.trackers.length === 0) {
       torrent.trackers = ["udp://tracker.opentrackr.org:1337/announce"];
     }
@@ -487,33 +673,29 @@ export async function createMockApi(): Promise<EngineApi> {
       }
       if (state === "downloading") {
         const wobble = 0.78 + 0.44 * (0.5 + 0.5 * Math.sin(stamp / 2600 + runtime.phase));
-        const down = runtime.downTarget * wobble;
-        const up = runtime.upTarget * (0.7 + 0.6 * (0.5 + 0.5 * Math.sin(stamp / 3900 + runtime.phase)));
+        const rawDown = runtime.downTarget * wobble;
+        const rawUp = runtime.upTarget * (0.7 + 0.6 * (0.5 + 0.5 * Math.sin(stamp / 3900 + runtime.phase)));
+        const down = capRate(rawDown, torrent.down_limit_kib, settings.download_limit_kib);
+        const up = capRate(rawUp, torrent.up_limit_kib, settings.upload_limit_kib);
         torrent.down_rate = down;
         torrent.up_rate = up;
         torrent.downloaded_bytes = Math.min(
-          torrent.total_bytes,
+          torrent.wanted_bytes,
           torrent.downloaded_bytes + (down * TICK_MS) / 1000,
         );
         torrent.uploaded_bytes += (up * TICK_MS) / 1000;
-        torrent.progress = clamp(torrent.downloaded_bytes / torrent.total_bytes, 0, 1);
-        torrent.pieces_have = Math.min(
-          torrent.piece_count,
-          Math.floor(torrent.progress * torrent.piece_count),
-        );
-        torrent.eta_seconds =
-          down > 0 ? Math.ceil((torrent.total_bytes - torrent.downloaded_bytes) / down) : null;
         syncFiles(torrent);
-        if (torrent.downloaded_bytes >= torrent.total_bytes) {
+        refreshProgress(torrent);
+        if (torrent.downloaded_bytes >= torrent.wanted_bytes) {
           complete(torrent);
         }
         continue;
       }
       if (state === "seeding") {
-        const up = runtime.upTarget * (0.72 + 0.55 * (0.5 + 0.5 * Math.sin(stamp / 3300 + runtime.phase)));
-        torrent.up_rate = up;
+        const rawUp = runtime.upTarget * (0.72 + 0.55 * (0.5 + 0.5 * Math.sin(stamp / 3300 + runtime.phase)));
+        torrent.up_rate = capRate(rawUp, torrent.up_limit_kib, settings.upload_limit_kib);
         torrent.down_rate = 0;
-        torrent.uploaded_bytes += (up * TICK_MS) / 1000;
+        torrent.uploaded_bytes += (torrent.up_rate * TICK_MS) / 1000;
       }
     }
     emit();
@@ -530,10 +712,23 @@ export async function createMockApi(): Promise<EngineApi> {
     state: TorrentState,
     total: number,
     trackers: string[],
+    options: { savePath: string | null; files: { path: string; length: number }[] | null; selected: number[] | null },
   ): AddResult {
     const id = nextId;
     nextId += 1;
     const pieces = total > 0 ? Math.ceil(total / 2_097_152) : 0;
+    const sourceFiles =
+      options.files && options.files.length > 0
+        ? options.files
+        : total > 0
+          ? [{ path: name, length: total }]
+          : [];
+    const files: FileView[] = sourceFiles.map((file, index) => ({
+      path: file.path,
+      length: file.length,
+      downloaded: 0,
+      selected: options.selected === null ? true : options.selected.includes(index),
+    }));
     const torrent: TorrentSnapshot = {
       id,
       name,
@@ -541,6 +736,7 @@ export async function createMockApi(): Promise<EngineApi> {
       state,
       error: null,
       total_bytes: total,
+      wanted_bytes: 0,
       downloaded_bytes: 0,
       uploaded_bytes: 0,
       progress: 0,
@@ -551,13 +747,12 @@ export async function createMockApi(): Promise<EngineApi> {
       peers_known: state === "metadata" ? 14 : 18,
       down_rate: 0,
       up_rate: 0,
+      down_limit_kib: 0,
+      up_limit_kib: 0,
       eta_seconds: null,
-      save_path: settings.download_dir,
+      save_path: options.savePath ?? settings.download_dir,
       added_at: Math.floor(Date.now() / 1000),
-      files:
-        total > 0
-          ? [{ path: name, length: total, downloaded: 0 }]
-          : [],
+      files,
       trackers,
       peers:
         state === "metadata"
@@ -568,6 +763,7 @@ export async function createMockApi(): Promise<EngineApi> {
             ]
           : [],
     };
+    syncWanted(torrent);
     torrents.push(torrent);
     runtimes.set(id, {
       downTarget: 8_400_000,
@@ -575,11 +771,14 @@ export async function createMockApi(): Promise<EngineApi> {
       phase: Math.random() * Math.PI * 2,
       metaUntil: state === "metadata" ? Date.now() + 14_000 : 0,
     });
+    // Новая загрузка отменяет отсчёт автовыключения.
+    cancelPending();
     emit();
     return { id, name };
   }
 
   start();
+  startAuto();
 
   return {
     mode: "mock",
@@ -593,35 +792,117 @@ export async function createMockApi(): Promise<EngineApi> {
       };
     },
 
-    addTorrent: async (input: TorrentInput): Promise<AddResult> => {
+    preview: async (source: TorrentSource): Promise<TorrentPreview> => {
+      // Магнит «ждёт метаданные» заметно дольше — интерфейс успевает показать спиннер.
+      await delay(source.kind === "magnet" ? 1_100 : 200);
+      return previewOf(source);
+    },
+
+    addTorrent: async (source: TorrentSource, options: AddOptions): Promise<AddResult> => {
+      const preview = previewOf(source);
       await delay(360);
-      const name =
-        input.kind === "file" ? baseName(input.path) : baseName(input.name);
-      const size = plausibleSize(name);
-      const existing = torrents.find((torrent) => torrent.name === name);
+      if (options.files !== null && options.files.length === 0) {
+        throw new Error("Не выбран ни один файл");
+      }
+      const existing = torrents.find((torrent) => torrent.name === preview.name);
       if (existing) {
         throw new Error("Такой торрент уже добавлен");
       }
-      return addSnapshot(name, "downloading", size, [
-        "udp://tracker.opentrackr.org:1337/announce",
-        "https://tracker.gbitt.info/announce",
-      ]);
+      const trackers =
+        preview.trackers.length > 0
+          ? preview.trackers
+          : ["udp://tracker.opentrackr.org:1337/announce"];
+      if (source.kind === "magnet") {
+        return addSnapshot(preview.name, "metadata", 0, trackers, {
+          savePath: options.savePath,
+          files: null,
+          selected: null,
+        });
+      }
+      return addSnapshot(preview.name, "downloading", preview.total_bytes, trackers, {
+        savePath: options.savePath,
+        files: options.files === null ? preview.files : preview.files.map((file) => ({
+          path: file.path,
+          length: file.length,
+        })),
+        selected: options.files,
+      });
     },
 
-    addMagnet: async (link: string): Promise<AddResult> => {
-      await delay(320);
-      const trimmed = link.trim();
-      if (!/^magnet:\?/i.test(trimmed)) {
-        throw new Error("Ссылка должна начинаться с magnet:?");
+    setFileSelection: async (id, files) => {
+      const torrent = find(id);
+      await delay(140);
+      if (files.length === 0) {
+        throw new Error("Не выбран ни один файл");
       }
-      const query = trimmed.slice(trimmed.indexOf("?") + 1);
-      const params = new URLSearchParams(query);
-      const name = params.get("dn")?.trim() || `Magnet-загрузка ${nextId}`;
-      const trackers = params
-        .getAll("tr")
-        .filter(Boolean)
-        .slice(0, 6);
-      return addSnapshot(name, "metadata", 0, trackers);
+      const wanted = new Set(files);
+      const before = torrent.files.map((file) => (file.selected ? file.downloaded : 0));
+      torrent.files.forEach((file, index) => {
+        file.selected = wanted.has(index);
+      });
+      syncWanted(torrent);
+      const kept = torrent.files.reduce(
+        (sum, file, index) => sum + (file.selected ? Math.min(file.length, before[index]) : 0),
+        0,
+      );
+      torrent.downloaded_bytes = Math.min(kept, torrent.wanted_bytes);
+      syncFiles(torrent);
+      refreshProgress(torrent);
+      if (torrent.wanted_bytes > 0 && torrent.downloaded_bytes >= torrent.wanted_bytes) {
+        complete(torrent);
+      } else if (torrent.state === "completed" || torrent.state === "seeding") {
+        // Часть файлов отключили — загрузка вернулась в незавершённое состояние.
+        torrent.state = "paused";
+        torrent.down_rate = 0;
+        torrent.up_rate = 0;
+        torrent.eta_seconds = null;
+      }
+      emit();
+    },
+
+    setTorrentLimits: async (id, downKib, upKib) => {
+      const torrent = find(id);
+      await delay(100);
+      torrent.down_limit_kib = Math.max(0, Math.round(downKib));
+      torrent.up_limit_kib = Math.max(0, Math.round(upKib));
+      emit();
+    },
+
+    getAutoShutdown: async () => {
+      startAuto();
+      return autoState();
+    },
+
+    setAutoShutdown: async (enabled: boolean) => {
+      await delay(120);
+      settings.auto_shutdown = enabled;
+      if (!enabled) {
+        autoPending = null;
+      }
+      startAuto();
+      emitAuto();
+      emit();
+      return autoState();
+    },
+
+    cancelAutoShutdown: async () => {
+      await delay(80);
+      // Как в бэкенде (`commands::cancel_auto_shutdown`): отмена отсчёта
+      // заодно снимает настройку, иначе наблюдатель запустит отсчёт снова.
+      settings.auto_shutdown = false;
+      autoPending = null;
+      emitAuto();
+      emit();
+      return autoState();
+    },
+
+    subscribeAutoShutdown: async (listener) => {
+      autoListeners.add(listener);
+      startAuto();
+      listener(autoState());
+      return () => {
+        autoListeners.delete(listener);
+      };
     },
 
     pickTorrentFiles: async () => {
@@ -658,12 +939,8 @@ export async function createMockApi(): Promise<EngineApi> {
         input.click();
       });
 
-      const inputs: TorrentInput[] = [];
-      for (const file of files) {
-        const buffer = new Uint8Array(await file.arrayBuffer());
-        inputs.push({ kind: "bytes", bytes: buffer, name: file.name });
-      }
-      return inputs;
+      // В браузере реальный путь недоступен — отдаём имя файла, как его видит демо-движок.
+      return files.map((file) => ({ kind: "path" as const, path: file.name }));
     },
 
     pickDownloadDir: async () => {
@@ -687,6 +964,8 @@ export async function createMockApi(): Promise<EngineApi> {
       if (torrent.state !== "paused" && torrent.state !== "completed" && torrent.state !== "error") {
         return;
       }
+      // Возобновление тоже отменяет отсчёт автовыключения.
+      cancelPending();
       // Из ошибки возвращаемся в загрузку: движок заново опрашивает трекер.
       if (torrent.state === "error") {
         torrent.error = null;
@@ -697,7 +976,7 @@ export async function createMockApi(): Promise<EngineApi> {
         if (runtime) {
           runtime.metaUntil = Date.now() + 6_000;
         }
-      } else if (torrent.downloaded_bytes >= torrent.total_bytes) {
+      } else if (torrent.wanted_bytes > 0 && torrent.downloaded_bytes >= torrent.wanted_bytes) {
         torrent.state = "seeding";
         const runtime = runtimes.get(id) ?? {
           downTarget: 0,
@@ -753,7 +1032,7 @@ export async function createMockApi(): Promise<EngineApi> {
           torrent.state = "metadata";
           continue;
         }
-        if (torrent.downloaded_bytes >= torrent.total_bytes) {
+        if (torrent.wanted_bytes > 0 && torrent.downloaded_bytes >= torrent.wanted_bytes) {
           torrent.state = "seeding";
           continue;
         }
@@ -794,8 +1073,13 @@ export async function createMockApi(): Promise<EngineApi> {
       settings.upload_limit_kib = Math.max(0, Math.round(next.upload_limit_kib));
       settings.listen_port = port >= 0 && port <= 65535 ? port : 51413;
       settings.seed_after_complete = Boolean(next.seed_after_complete);
+      settings.auto_shutdown = Boolean(next.auto_shutdown);
+      if (!settings.auto_shutdown) {
+        autoPending = null;
+      }
       settings.theme = next.theme === "light" ? "light" : "dark";
       app.listen_port = settings.listen_port === 0 ? 51413 : settings.listen_port;
+      emitAuto();
       emit();
       return { ...settings };
     },
@@ -854,17 +1138,10 @@ export async function createMockApi(): Promise<EngineApi> {
         depth = 0;
         handlers.onLeave();
         const files = Array.from(event.dataTransfer?.files ?? []);
-        void (async () => {
-          const inputs: TorrentInput[] = [];
-          for (const file of files) {
-            if (!/\.torrent$/i.test(file.name)) {
-              continue;
-            }
-            const buffer = new Uint8Array(await file.arrayBuffer());
-            inputs.push({ kind: "bytes", bytes: buffer, name: file.name });
-          }
-          handlers.onDrop(inputs);
-        })();
+        const sources = files
+          .filter((file) => /\.torrent$/i.test(file.name))
+          .map((file) => ({ kind: "path" as const, path: file.name }));
+        handlers.onDrop(sources);
       };
 
       const onDragEnd = () => {

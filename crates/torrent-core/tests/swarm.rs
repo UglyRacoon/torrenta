@@ -226,3 +226,63 @@ async fn downloads_two_torrents_in_parallel() {
 
     manager.shutdown().await;
 }
+
+/// Глобальный лимит скорости общий на сессию: два торрента вместе не
+/// превышают потолок (в 1.0 лимит действовал на каждый торрент отдельно,
+/// и суммарная скорость доходила до N × лимит).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_limit_is_shared_between_torrents() {
+    let temp = tempfile::tempdir().expect("не удалось создать временный каталог");
+    let root = temp.path().to_path_buf();
+    // По 640 КиБ на торрент: при 64 КиБ/с за окно измерения не докачаются.
+    let first = Arc::new(Sample::new("torrenta-limit-a", PIECE_LENGTH, &[("a.bin", 640_000)]));
+    let second = Arc::new(Sample::new("torrenta-limit-b", PIECE_LENGTH, &[("b.bin", 640_000)]));
+    let seeder_a = MockSeeder::start(first.clone(), Corruption::None).await;
+    let seeder_b = MockSeeder::start(second.clone(), Corruption::None).await;
+    let tracker_a = MockTracker::start(TrackerReply::Peers(vec![seeder_a.addr])).await;
+    let tracker_b = MockTracker::start(TrackerReply::Peers(vec![seeder_b.addr])).await;
+    let manager = TorrentManager::new(EngineConfig {
+        download_dir: root,
+        listen_port: 0,
+        download_limit_kib: 64,
+        ..EngineConfig::default()
+    });
+
+    let ids = [
+        manager
+            .add_file(first.torrent_bytes(&tracker_a.url()), None)
+            .await
+            .expect("движок не принял первый торрент"),
+        manager
+            .add_file(second.torrent_bytes(&tracker_b.url()), None)
+            .await
+            .expect("движок не принял второй торрент"),
+    ];
+    assert_ne!(ids[0], ids[1], "у торрентов должны быть разные id");
+
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let snapshots = manager.snapshot();
+    let downloaded: u64 = snapshots.iter().map(|item| item.downloaded_bytes).sum();
+    // Запас — несколько кусков: ведро доливается во время запуска, а
+    // `downloaded_bytes` учитывает только целиком проверенные куски.
+    let cap = (64.0 * 1024.0 * elapsed) as u64 + 4 * PIECE_LENGTH as u64;
+    assert!(
+        downloaded <= cap,
+        "суммарно скачано {downloaded} Б при потолке {cap} Б за {elapsed:.1} с"
+    );
+    assert!(
+        downloaded > 0,
+        "за окно измерения ничего не скачалось — тест не показателен"
+    );
+    for item in &snapshots {
+        assert!(
+            !matches!(item.state, TorrentState::Seeding | TorrentState::Completed),
+            "при лимите 64 КиБ/с торрент не должен успеть докачаться"
+        );
+    }
+
+    manager.shutdown().await;
+}

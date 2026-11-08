@@ -13,11 +13,12 @@ use sha1::{Digest, Sha1};
 
 use super::peer;
 use super::{
-    lk, rd, wr, EngineConfig, EngineEvent, Flags, Stats, TorrentHandle, TorrentState, BLOCK_SIZE,
+    effective_limit, lk, rd, wr, EngineConfig, EngineEvent, Flags, Limits, Selection, Stats,
+    TorrentHandle, TorrentState, BLOCK_SIZE,
 };
 use crate::bitfield::Bitfield;
 use crate::metainfo::{InfoHash, Metainfo};
-use crate::picker::PiecePicker;
+use crate::picker::{PiecePicker, PieceStatus};
 use crate::storage::Storage;
 use crate::tracker::{self, AnnounceEvent, AnnounceRequest, PeerAddr};
 
@@ -36,6 +37,9 @@ pub(crate) struct Env {
     pub(crate) port: u16,
     pub(crate) events: broadcast::Sender<EngineEvent>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) limits: Arc<std::sync::RwLock<Limits>>,
+    /// Общие на сессию ведра лимитов скорости (одно на менеджер торрентов).
+    pub(crate) shared: Arc<SharedLimiters>,
 }
 
 /// Запрос блока у пира.
@@ -134,7 +138,7 @@ pub(crate) struct RuntimeState {
 }
 
 /// Простейший ограничитель скорости по блокам/байтам.
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     tokens: f64,
     last: Instant,
 }
@@ -161,6 +165,111 @@ impl RateLimiter {
             false
         }
     }
+
+    /// Сколько токенов доступно прямо сейчас; долив выполняется ровно один раз.
+    fn available(&mut self, per_second: f64, burst: f64) -> f64 {
+        self.refill(per_second, burst);
+        self.tokens
+    }
+}
+
+/// Ограничители скорости, общие на всю сессию (живут в `Inner` менеджера).
+///
+/// Ведро одно на сессию, поэтому при N торрентах глобальный лимит делится
+/// между ними, а не умножается на N. Торрентный лимит проверяется сверх него.
+pub(crate) struct SharedLimiters {
+    pub(crate) down: Mutex<RateLimiter>,
+    pub(crate) up: Mutex<RateLimiter>,
+}
+
+impl SharedLimiters {
+    pub(crate) fn new() -> SharedLimiters {
+        SharedLimiters {
+            down: Mutex::new(RateLimiter::new()),
+            up: Mutex::new(RateLimiter::new()),
+        }
+    }
+}
+
+/// Сколько блоков можно запросить с учётом общего и торрентного лимитов.
+///
+/// Сначала считается потолок торрента (действующая скорость = минимум из
+/// глобальной и торрентной), затем из общего ведра сессии забирается не больше
+/// доступного. Каждое ведро доливается один раз за вызов и списывается ровно на
+/// выданное количество блоков, поэтому двойного списания нет.
+fn grant_download(
+    own: &Mutex<RateLimiter>,
+    shared: &Mutex<RateLimiter>,
+    global_kib: u32,
+    local_kib: u32,
+    want: usize,
+) -> usize {
+    if want == 0 || (global_kib == 0 && local_kib == 0) {
+        return want;
+    }
+    let blocks_per_second =
+        effective_limit(global_kib, local_kib) as f64 * 1024.0 / BLOCK_SIZE as f64;
+    let mut own_limiter = lk(own);
+    // 0 в торрентном лимите означает «без своего потолка»: тогда ограничивает
+    // только общее ведро сессии.
+    let allowed = if local_kib == 0 {
+        want
+    } else {
+        own_limiter.available(blocks_per_second, 64.0).floor() as usize
+    };
+    let allowed = allowed.min(want);
+    if allowed == 0 {
+        return 0;
+    }
+    let granted = if global_kib == 0 {
+        allowed
+    } else {
+        let global_blocks = global_kib as f64 * 1024.0 / BLOCK_SIZE as f64;
+        let mut shared_limiter = lk(shared);
+        let granted = (shared_limiter.available(global_blocks, 64.0).floor() as usize).min(allowed);
+        if granted != 0 {
+            shared_limiter.take(granted as f64);
+        }
+        granted
+    };
+    if granted == 0 {
+        return 0;
+    }
+    if local_kib != 0 {
+        own_limiter.take(granted as f64);
+    }
+    granted
+}
+
+/// Можно ли отдать `length` байт с учётом общего и торрентного лимитов отдачи.
+fn grant_upload(
+    own: &Mutex<RateLimiter>,
+    shared: &Mutex<RateLimiter>,
+    global_kib: u32,
+    local_kib: u32,
+    length: usize,
+) -> bool {
+    if length == 0 || (global_kib == 0 && local_kib == 0) {
+        return true;
+    }
+    let length = length as f64;
+    let effective = effective_limit(global_kib, local_kib) as f64 * 1024.0;
+    let mut own_limiter = lk(own);
+    if local_kib != 0 && own_limiter.available(effective, 512.0 * 1024.0) < length {
+        return false;
+    }
+    if global_kib != 0 {
+        let mut shared_limiter = lk(shared);
+        let global_bytes = global_kib as f64 * 1024.0;
+        if shared_limiter.available(global_bytes, 512.0 * 1024.0) < length {
+            return false;
+        }
+        shared_limiter.take(length);
+    }
+    if local_kib != 0 {
+        own_limiter.take(length);
+    }
+    true
 }
 
 /// Активный торрент: метаданные уже есть, идёт обмен с пирами.
@@ -172,11 +281,16 @@ pub(crate) struct Runtime {
     pub(crate) state: Mutex<RuntimeState>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) flags: Arc<Flags>,
+    /// Текущий выбор файлов: какие куски качаем и сколько это байт.
+    selection: std::sync::RwLock<Selection>,
     pub(crate) have_tx: broadcast::Sender<u32>,
     next_peer: AtomicU64,
     down_limiter: Mutex<RateLimiter>,
     up_limiter: Mutex<RateLimiter>,
     completed_announced: AtomicBool,
+    /// Будит циклы трекеров, когда состояние изменилось не по расписанию
+    /// (например, завершение из-за смены выбора файлов).
+    announce_now: tokio::sync::Notify,
 }
 
 impl Runtime {
@@ -207,11 +321,13 @@ impl Runtime {
             }),
             stats,
             flags,
+            selection: std::sync::RwLock::new(Selection::empty()),
             have_tx,
             next_peer: AtomicU64::new(1),
             down_limiter: Mutex::new(RateLimiter::new()),
             up_limiter: Mutex::new(RateLimiter::new()),
             completed_announced: AtomicBool::new(false),
+            announce_now: tokio::sync::Notify::new(),
         })
     }
 
@@ -428,18 +544,11 @@ impl Runtime {
 
     /// Сколько блоков можно запросить сейчас (с учётом лимита скорости).
     pub(crate) fn download_budget(&self, want: usize) -> usize {
-        let limit_kib = rd(&self.env.config).download_limit_kib;
-        if limit_kib == 0 || want == 0 {
-            return want;
-        }
-        let blocks_per_second = (limit_kib as f64 * 1024.0) / BLOCK_SIZE as f64;
-        let mut limiter = lk(&self.down_limiter);
-        limiter.refill(blocks_per_second, 64.0);
-        let mut granted = 0;
-        while granted < want && limiter.take(1.0) {
-            granted += 1;
-        }
-        granted
+        // Действует более строгий из двух лимитов: глобального и своего,
+        // при этом глобальное ведро общее для всей сессии.
+        let global = rd(&self.env.config).download_limit_kib;
+        let local = rd(&self.env.limits).down_kib;
+        grant_download(&self.down_limiter, &self.env.shared.down, global, local, want)
     }
 
     /// Подбирает блоки, которые надо запросить у пира.
@@ -622,18 +731,17 @@ impl Runtime {
         self.stats
             .have_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        let have = self.stats.pieces_have.fetch_add(1, Ordering::Relaxed) + 1;
+        self.stats.pieces_have.fetch_add(1, Ordering::Relaxed);
         let _ = self.have_tx.send(index);
-        if have as usize >= self.meta.info.piece_count() {
+        // Готовность считается только по нужным кускам: невыбранные файлы
+        // могут остаться на диске недокачанными и торренту не мешают.
+        if self.is_complete() {
             self.mark_complete();
         }
         Ok(true)
     }
 
     fn mark_complete(self: &Arc<Self>) {
-        self.stats
-            .pieces_have
-            .store(self.meta.info.piece_count() as u32, Ordering::Relaxed);
         let seed = rd(&self.env.config).seed_after_complete;
         let state = if seed {
             TorrentState::Seeding
@@ -650,6 +758,85 @@ impl Runtime {
             id: self.id,
             name,
         });
+    }
+
+    // -- выбор файлов -------------------------------------------------------
+
+    /// Применяет новый набор нужных кусков без уведомления о состоянии.
+    pub(crate) fn set_wanted(&self, selection: &Selection) {
+        *wr(&self.selection) = selection.clone();
+        let mut state = lk(&self.state);
+        let wanted = selection.pieces();
+        state.picker.set_wanted(wanted);
+        // Ненужные куски возвращаем в пул и выбрасываем недоделанные буферы;
+        // уже полученные данные при этом остаются на диске.
+        let mut dropped: Vec<u32> = Vec::new();
+        for index in 0..wanted.len() {
+            if wanted.get(index) {
+                continue;
+            }
+            if state.picker.status(index) != PieceStatus::Have {
+                state.picker.release(index);
+                state.buffers.remove(&(index as u32));
+                dropped.push(index as u32);
+            }
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        for peer in state.peers.values_mut() {
+            if let Some(index) = peer.owned_piece {
+                if dropped.contains(&index) {
+                    peer.owned_piece = None;
+                    peer.inflight.clear();
+                }
+            }
+        }
+    }
+
+    /// Применяет новый выбор и пересчитывает состояние (Downloading/Completed).
+    pub(crate) fn apply_selection(self: &Arc<Self>, selection: &Selection) {
+        self.set_wanted(selection);
+        self.refresh_after_selection();
+    }
+
+    /// Сколько байт нужных файлов ещё не скачано (для объявления трекеру).
+    pub(crate) fn wanted_left(&self) -> u64 {
+        let wanted_bytes = self.stats.wanted_bytes.load(Ordering::Relaxed);
+        let selection = rd(&self.selection);
+        let state = lk(&self.state);
+        let have_wanted =
+            crate::selection::wanted_downloaded(&self.meta.info, state.picker.have(), &selection);
+        drop(state);
+        wanted_bytes.saturating_sub(have_wanted)
+    }
+
+    /// Пересчитывает состояние после смены выбора файлов.
+    fn refresh_after_selection(self: &Arc<Self>) {
+        if self.flags.paused() {
+            return;
+        }
+        let complete = self.is_complete();
+        let seed = rd(&self.env.config).seed_after_complete;
+        let next = match (complete, seed) {
+            (true, true) => TorrentState::Seeding,
+            (true, false) => TorrentState::Completed,
+            (false, _) => TorrentState::Downloading,
+        };
+        let current = *lk(&self.stats.state);
+        if current == next {
+            return;
+        }
+        *lk(&self.stats.state) = next;
+        let _ = self.env.events.send(EngineEvent::StateChanged {
+            id: self.id,
+            state: next,
+        });
+        // Всё нужное уже на диске, а трекер ещё не знает: будим циклы
+        // объявлений, чтобы `event=completed` ушёл без ожидания интервала.
+        if complete && !self.completed_announced.load(Ordering::Relaxed) {
+            self.announce_now.notify_waiters();
+        }
     }
 
     // -- отдача -------------------------------------------------------------
@@ -680,14 +867,9 @@ impl Runtime {
     }
 
     fn allow_upload(&self, length: usize) -> bool {
-        let limit_kib = rd(&self.env.config).upload_limit_kib;
-        if limit_kib == 0 {
-            return true;
-        }
-        let bytes_per_second = limit_kib as f64 * 1024.0;
-        let mut limiter = lk(&self.up_limiter);
-        limiter.refill(bytes_per_second, 512.0 * 1024.0);
-        limiter.take(length as f64)
+        let global = rd(&self.env.config).upload_limit_kib;
+        let local = rd(&self.env.limits).up_kib;
+        grant_upload(&self.up_limiter, &self.env.shared.up, global, local, length)
     }
 
     pub(crate) fn add_uploaded(&self, id: u64, length: usize) {
@@ -782,7 +964,7 @@ impl Runtime {
         if *lk(&self.stats.state) != TorrentState::Error {
             return;
         }
-        let complete = self.stats.have_bytes.load(Ordering::Relaxed) >= self.meta.info.total_length;
+        let complete = self.is_complete();
         let seed = rd(&self.env.config).seed_after_complete;
         let next = match (complete, seed) {
             (true, true) => TorrentState::Seeding,
@@ -836,9 +1018,10 @@ impl Runtime {
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 continue;
             }
-            let total = self.meta.info.total_length;
-            let have = self.stats.have_bytes.load(Ordering::Relaxed);
-            let complete = have >= total;
+            // `left` и признак завершения — по нужным файлам: трекер ждёт
+            // остаток именно того, что пользователь выбрал скачать.
+            let left = self.wanted_left();
+            let complete = self.is_complete();
             let event = if first {
                 Some(AnnounceEvent::Started)
             } else if complete && !self.completed_announced.swap(true, Ordering::Relaxed) {
@@ -852,7 +1035,7 @@ impl Runtime {
                 port: self.env.port,
                 uploaded: self.stats.uploaded.load(Ordering::Relaxed),
                 downloaded: self.stats.downloaded.load(Ordering::Relaxed),
-                left: total.saturating_sub(have),
+                left,
                 event,
                 num_want: Some(50),
                 key: None,
@@ -864,7 +1047,12 @@ impl Runtime {
                     self.clear_tracker_failure();
                     self.add_candidates(response.peers);
                     let interval = response.interval.clamp(30, 1800);
-                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    // Завершение из-за смены выбора файлов будит нас раньше,
+                    // чтобы `event=completed` ушёл сразу, а не через интервал.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+                        _ = self.announce_now.notified() => {}
+                    }
                 }
                 Err(err) => {
                     failures = failures.saturating_add(1);
@@ -888,9 +1076,25 @@ impl Runtime {
 
 /// Готовит хранилище, создаёт рантайм и запускает его задачи.
 pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(), String> {
+    // Выбор файлов: заданный заранее (для magnet — после метаданных) или
+    // полный по умолчанию.
+    let selection = match lk(&handle.pending_files).take() {
+        Some(files) => Selection::from_files(&meta.info, Some(&files))
+            .ok_or_else(|| "не выбран ни один файл".to_string())?,
+        None => {
+            let existing = rd(&handle.selection).clone();
+            if existing.is_empty() {
+                Selection::all(&meta.info)
+            } else {
+                existing
+            }
+        }
+    };
     let storage = Storage::prepare(&handle.save_dir, &meta.info)
         .map_err(|err| format!("не удалось подготовить файлы: {err}"))?;
     handle.stats.set_meta(&meta);
+    *wr(&handle.selection) = selection.clone();
+    handle.stats.set_selection(&selection);
     let runtime = Runtime::new(
         handle.id,
         meta,
@@ -899,6 +1103,7 @@ pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(),
         handle.flags.clone(),
         handle.env.clone(),
     );
+    runtime.set_wanted(&selection);
     *wr(&handle.meta) = Some(runtime.meta.clone());
     *lk(&handle.runtime) = Some(runtime.clone());
     runtime.start();
@@ -1032,6 +1237,74 @@ mod tests {
         limiter.refill(1000.0, 10.0);
         assert!(limiter.take(5.0));
         assert!(!limiter.take(1.0));
+    }
+
+    /// Глобальное ведро одно на сессию: два торрента делят потолок, а не
+    /// умножают его на своё количество.
+    #[test]
+    fn shared_limiter_caps_aggregate_download() {
+        let shared = Mutex::new(RateLimiter::new());
+        let first = Mutex::new(RateLimiter::new());
+        let second = Mutex::new(RateLimiter::new());
+        // Прошла секунда: при 64 КиБ/с в общем ведре четыре блока на всех.
+        lk(&shared).last = Instant::now() - Duration::from_secs(1);
+        let granted_first = grant_download(&first, &shared, 64, 0, 8);
+        let granted_second = grant_download(&second, &shared, 64, 0, 8);
+        assert_eq!(granted_first + granted_second, 4);
+        // Ведро не доливается повторно в том же такте.
+        assert_eq!(grant_download(&first, &shared, 64, 0, 8), 0);
+    }
+
+    /// Свой лимит торрента строже глобального: общее ведро его не разгоняет.
+    #[test]
+    fn torrent_limit_has_priority_over_global() {
+        let shared = Mutex::new(RateLimiter::new());
+        let own = Mutex::new(RateLimiter::new());
+        // Глобально 1 МиБ/с (64 блока в секунду), торренту — 32 КиБ/с (2 блока).
+        lk(&shared).last = Instant::now() - Duration::from_secs(10);
+        lk(&own).last = Instant::now() - Duration::from_secs(10);
+        let mut granted = 0;
+        for _ in 0..10 {
+            granted += grant_download(&own, &shared, 1024, 32, 64);
+        }
+        // За десять секунд торренту можно двадцать блоков, хотя общее ведро
+        // готово отдать шестьдесят четыре.
+        assert!((19..=20).contains(&granted), "granted = {granted}");
+    }
+
+    /// Отдача ограничивается тем же общим ведром сессии.
+    #[test]
+    fn shared_limiter_caps_aggregate_upload() {
+        let shared = Mutex::new(RateLimiter::new());
+        let first = Mutex::new(RateLimiter::new());
+        let second = Mutex::new(RateLimiter::new());
+        lk(&shared).last = Instant::now() - Duration::from_secs(1);
+        // 64 КиБ/с — четыре блока по 16 КиБ в секунду на всю сессию.
+        let block = BLOCK_SIZE as usize;
+        let mut allowed = 0;
+        for _ in 0..6 {
+            if grant_upload(&first, &shared, 64, 0, block) {
+                allowed += 1;
+            }
+            if grant_upload(&second, &shared, 64, 0, block) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 4);
+    }
+
+    /// Нулевые лимиты — без ограничения; торрентный работает и без глобального.
+    #[test]
+    fn zero_limits_mean_no_limit() {
+        let shared = Mutex::new(RateLimiter::new());
+        let own = Mutex::new(RateLimiter::new());
+        assert_eq!(grant_download(&own, &shared, 0, 0, 16), 16);
+        assert!(grant_upload(&own, &shared, 0, 0, 512 * 1024));
+        let shared = Mutex::new(RateLimiter::new());
+        let own = Mutex::new(RateLimiter::new());
+        lk(&own).last = Instant::now() - Duration::from_secs(1);
+        // Без глобального потолка каждый торрент упирается в свой: 4 блока/с.
+        assert_eq!(grant_download(&own, &shared, 0, 64, 16), 4);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use torrent_core::{EngineError, GlobalTotals, TorrentManager, TorrentSnapshot, TorrentState};
 
+use crate::auto_shutdown::{self, AutoShutdown, AutoShutdownDto};
 use crate::settings::{self, SettingsDto};
 
 /// Событие с полным снимком состояния (payload — [`AppStateDto`]).
@@ -105,6 +106,15 @@ impl AppStateDto {
             torrent.peers_known.hash(&mut significant);
             progress_permille(torrent.progress).hash(&mut significant);
             torrent.total_bytes.hash(&mut significant);
+            torrent.wanted_bytes.hash(&mut significant);
+            torrent.down_limit_kib.hash(&mut significant);
+            torrent.up_limit_kib.hash(&mut significant);
+
+            for file in &torrent.files {
+                file.path.hash(&mut significant);
+                file.length.hash(&mut significant);
+                u8::from(file.selected).hash(&mut significant);
+            }
 
             torrent.downloaded_bytes.hash(&mut dynamic);
             torrent.uploaded_bytes.hash(&mut dynamic);
@@ -144,6 +154,8 @@ pub struct AppEngine {
     settings_path: PathBuf,
     /// Каталог загрузки по умолчанию (системный «Загрузки»).
     fallback_dir: PathBuf,
+    /// Обратный отсчёт автовыключения (делится с наблюдателем).
+    auto_shutdown: Arc<AutoShutdown>,
 }
 
 impl AppEngine {
@@ -161,6 +173,7 @@ impl AppEngine {
             app_dir,
             settings_path,
             fallback_dir,
+            auto_shutdown: Arc::new(AutoShutdown::new()),
         }
     }
 
@@ -215,6 +228,58 @@ impl AppEngine {
             Err(poisoned) => *poisoned.into_inner() = prepared.clone(),
         }
         Ok(prepared)
+    }
+
+    /// Текущее состояние автовыключения для фронтенда.
+    pub fn auto_shutdown_dto(&self) -> AutoShutdownDto {
+        AutoShutdownDto {
+            enabled: self.settings().auto_shutdown,
+            pending_seconds: self.auto_shutdown.pending_seconds(),
+        }
+    }
+
+    /// Включает или выключает автовыключение и сохраняет настройку на диск.
+    ///
+    /// При выключении попутно снимает уже взведённый системный таймер: иначе
+    /// Windows выключил бы компьютер, хотя пользователь передумал.
+    pub fn set_auto_shutdown(&self, enabled: bool) -> Result<AutoShutdownDto, String> {
+        let mut next = self.settings();
+        if next.auto_shutdown != enabled {
+            next.auto_shutdown = enabled;
+            let applied = self.apply_settings(next)?;
+            if !applied.auto_shutdown {
+                self.cancel_auto_shutdown();
+            }
+        }
+        Ok(self.auto_shutdown_dto())
+    }
+
+    /// Снимает отсчёт и системный таймер выключения.
+    ///
+    /// Возвращает `true`, если отменять было что: по этому признаку команда
+    /// решает, отправлять ли событие `engine://auto-shutdown`.
+    pub fn cancel_auto_shutdown(&self) -> bool {
+        let was_active = self.auto_shutdown.reset();
+        if was_active {
+            if let Err(err) = auto_shutdown::cancel_system_shutdown() {
+                eprintln!("[torrenta] не удалось отменить выключение компьютера: {err}");
+            }
+        }
+        was_active
+    }
+
+    /// Взводит системный таймер и начинает обратный отсчёт.
+    ///
+    /// При ошибке запуска `shutdown.exe` отсчёт не начинается, чтобы интерфейс
+    /// не показывал таймер, за которым ничего не стоит.
+    pub fn arm_auto_shutdown(&self) -> Result<u32, String> {
+        auto_shutdown::schedule_system_shutdown()?;
+        Ok(self.auto_shutdown.begin())
+    }
+
+    /// Владеющая ссылка на состояние отсчёта — для фоновой задачи.
+    pub fn auto_shutdown_handle(&self) -> Arc<AutoShutdown> {
+        Arc::clone(&self.auto_shutdown)
     }
 }
 
@@ -272,6 +337,9 @@ mod tests {
             down_rate: 0.0,
             up_rate: 0.0,
             eta_seconds: None,
+            wanted_bytes: 1024,
+            down_limit_kib: 0,
+            up_limit_kib: 0,
             save_path: "C:\\Torrents".to_string(),
             added_at: 1_700_000_000,
             files: Vec::new(),
@@ -357,6 +425,41 @@ mod tests {
         let mut b = state_with(vec![torrent(1, TorrentState::Downloading)]);
         b.settings.max_peers = 120;
         assert_ne!(a.fingerprints().significant, b.fingerprints().significant);
+    }
+
+    #[test]
+    fn file_selection_and_limits_are_significant() {
+        use torrent_core::FileView;
+
+        let mut a = state_with(vec![torrent(1, TorrentState::Downloading)]);
+        a.torrents[0].files = vec![FileView {
+            path: "a.bin".to_string(),
+            length: 10,
+            downloaded: 0,
+            selected: true,
+        }];
+        let b = a.clone();
+        assert_eq!(a.fingerprints(), b.fingerprints());
+
+        let mut changed = a.clone();
+        changed.torrents[0].files[0].selected = false;
+        assert_ne!(
+            a.fingerprints().significant,
+            changed.fingerprints().significant,
+            "смена выбора файлов должна попадать в значимую часть"
+        );
+
+        let mut limited = a.clone();
+        limited.torrents[0].down_limit_kib = 256;
+        assert_ne!(a.fingerprints().significant, limited.fingerprints().significant);
+
+        let mut limited = a.clone();
+        limited.torrents[0].up_limit_kib = 64;
+        assert_ne!(a.fingerprints().significant, limited.fingerprints().significant);
+
+        let mut wanted = a.clone();
+        wanted.torrents[0].wanted_bytes = 5;
+        assert_ne!(a.fingerprints().significant, wanted.fingerprints().significant);
     }
 
     #[test]

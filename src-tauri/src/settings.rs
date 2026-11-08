@@ -51,6 +51,11 @@ pub struct SettingsDto {
     pub listen_port: u16,
     /// Раздавать после завершения загрузки.
     pub seed_after_complete: bool,
+    /// Выключать компьютер, когда все загрузки завершены.
+    ///
+    /// Само выключение выполняет наблюдатель движка (см. `auto_shutdown`),
+    /// настройка лишь хранит выбор пользователя между запусками.
+    pub auto_shutdown: bool,
     /// Тема оформления: `"dark"` или `"light"`.
     pub theme: String,
 }
@@ -64,6 +69,7 @@ impl Default for SettingsDto {
             upload_limit_kib: 0,
             listen_port: 0,
             seed_after_complete: true,
+            auto_shutdown: false,
             theme: DEFAULT_THEME.to_string(),
         }
     }
@@ -187,8 +193,9 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
 
 /// Обратное преобразование: конфигурация движка → DTO настроек.
 ///
-/// Тема не входит в `EngineConfig`, поэтому передаётся отдельно.
-pub fn from_engine_config(config: &EngineConfig, theme: &str) -> SettingsDto {
+/// Тема и автовыключение не входят в `EngineConfig`, поэтому передаются
+/// отдельными аргументами.
+pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: bool) -> SettingsDto {
     SettingsDto {
         download_dir: config.download_dir.to_string_lossy().into_owned(),
         max_peers: u32::try_from(config.max_peers_per_torrent)
@@ -198,6 +205,7 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str) -> SettingsDto {
         upload_limit_kib: clamp_rate(config.upload_limit_kib),
         listen_port: config.listen_port,
         seed_after_complete: config.seed_after_complete,
+        auto_shutdown,
         theme: normalize_theme(theme),
     }
 }
@@ -315,6 +323,7 @@ mod tests {
             upload_limit_kib: 512,
             listen_port: 51413,
             seed_after_complete: false,
+            auto_shutdown: true,
             theme: "light".to_string(),
         }
     }
@@ -327,6 +336,7 @@ mod tests {
         assert_eq!(dto.upload_limit_kib, 0);
         assert_eq!(dto.listen_port, 0);
         assert!(dto.seed_after_complete);
+        assert!(!dto.auto_shutdown);
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert!(dto.download_dir.is_empty());
         assert_eq!(dto, dto.clone().normalized());
@@ -341,6 +351,7 @@ mod tests {
             upload_limit_kib: MAX_RATE_LIMIT_KIB + 1,
             listen_port: 65_535,
             seed_after_complete: true,
+            auto_shutdown: true,
             theme: "  LIGHT  ".to_string(),
         };
         dto.normalize();
@@ -349,6 +360,7 @@ mod tests {
         assert_eq!(dto.download_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.upload_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.theme, "light");
+        assert!(dto.auto_shutdown);
 
         let mut dto = SettingsDto {
             max_peers: MAX_PEERS_LIMIT + 100,
@@ -440,7 +452,7 @@ mod tests {
         assert_eq!(config.listen_port, 51413);
         assert!(!config.seed_after_complete);
 
-        let back = from_engine_config(&config, &dto.theme);
+        let back = from_engine_config(&config, &dto.theme, dto.auto_shutdown);
         assert_eq!(back, dto);
     }
 
@@ -454,19 +466,20 @@ mod tests {
             listen_port: 0,
             seed_after_complete: true,
         };
-        let dto = from_engine_config(&config, "unknown");
+        let dto = from_engine_config(&config, "unknown", false);
         assert_eq!(dto.max_peers, MAX_PEERS_LIMIT);
         assert_eq!(dto.download_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.upload_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert_eq!(dto.download_dir, "D:\\Torrents");
+        assert!(!dto.auto_shutdown);
 
         let config = EngineConfig {
             download_dir: PathBuf::from("D:\\Torrents"),
             max_peers_per_torrent: 0,
             ..EngineConfig::default()
         };
-        assert_eq!(from_engine_config(&config, "dark").max_peers, 1);
+        assert_eq!(from_engine_config(&config, "dark", false).max_peers, 1);
     }
 
     #[test]
@@ -532,6 +545,7 @@ mod tests {
         assert_eq!(loaded.max_peers, 7);
         assert_eq!(loaded.theme, DEFAULT_THEME);
         assert_eq!(loaded.download_limit_kib, 0);
+        assert!(!loaded.auto_shutdown, "старый settings.json не включает автовыключение");
         let _ = fs::remove_dir_all(&dir);
     }
 

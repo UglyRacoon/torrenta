@@ -1,11 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AddResult, AppPayload, SettingsDto, TorrentInput } from "./types";
+import type {
+  AddOptions,
+  AddResult,
+  AppPayload,
+  AutoShutdownState,
+  SettingsDto,
+  TorrentPreview,
+  TorrentSource,
+} from "./types";
 import type { EngineApi, FileDropHandlers } from "./engine";
 import { basename } from "../lib/format";
 
+/** На проводе источник — просто строка: путь к файлу или magnet-ссылка. */
+function sourceOf(source: TorrentSource): string {
+  return source.kind === "path" ? source.path : source.link;
+}
+
+function nameOf(source: TorrentSource): string {
+  if (source.kind === "magnet") {
+    const query = source.link.slice(source.link.indexOf("?") + 1);
+    const dn = new URLSearchParams(query).get("dn");
+    return dn?.trim() || "Magnet-загрузка";
+  }
+  return basename(source.path).replace(/\.torrent$/i, "") || "Новый торрент";
+}
+
 /**
- * Реальный движок: команды Tauri и событие engine://state.
+ * Реальный движок: команды Tauri и события engine://state и engine://auto-shutdown.
  * Все аргументы — camelCase, как их ждёт #[tauri::command] на стороне Rust.
  */
 export async function createTauriApi(): Promise<EngineApi> {
@@ -21,26 +43,25 @@ export async function createTauriApi(): Promise<EngineApi> {
       return unlisten;
     },
 
-    addTorrent: async (input: TorrentInput): Promise<AddResult> => {
-      if (input.kind === "file") {
-        const id = await invoke<number>("add_torrent_file", { path: input.path });
-        return { id, name: basename(input.path).replace(/\.torrent$/i, "") };
-      }
-      const id = await invoke<number>("add_torrent_bytes", {
-        bytes: Array.from(input.bytes),
-        nameHint: input.name.replace(/\.torrent$/i, ""),
+    preview: (source) => invoke<TorrentPreview>("preview_torrent", { source: sourceOf(source) }),
+
+    addTorrent: async (source: TorrentSource, options: AddOptions): Promise<AddResult> => {
+      const id = await invoke<number>("add_torrent", {
+        source: sourceOf(source),
+        savePath: options.savePath,
+        files: options.files,
       });
-      return { id, name: basename(input.name).replace(/\.torrent$/i, "") };
+      return { id, name: nameOf(source) };
     },
 
-    addMagnet: async (link) => {
-      const id = await invoke<number>("add_magnet", { link });
-      return { id, name: "Magnet-загрузка" };
-    },
+    setFileSelection: (id, files) => invoke<void>("set_file_selection", { id, files }),
+
+    setTorrentLimits: (id, downKib, upKib) =>
+      invoke<void>("set_torrent_limits", { id, downKib, upKib }),
 
     pickTorrentFiles: async () => {
       const paths = await invoke<string[]>("pick_torrent_files");
-      return paths.map((path) => ({ kind: "file" as const, path }));
+      return paths.map((path) => ({ kind: "path" as const, path }));
     },
 
     pickDownloadDir: () => invoke<string | null>("pick_download_dir"),
@@ -53,6 +74,17 @@ export async function createTauriApi(): Promise<EngineApi> {
 
     getSettings: () => invoke<SettingsDto>("get_settings"),
     saveSettings: (settings) => invoke<SettingsDto>("set_settings", { settings }),
+
+    getAutoShutdown: () => invoke<AutoShutdownState>("get_auto_shutdown"),
+    setAutoShutdown: (enabled) => invoke<AutoShutdownState>("set_auto_shutdown", { enabled }),
+    cancelAutoShutdown: () => invoke<AutoShutdownState>("cancel_auto_shutdown"),
+
+    subscribeAutoShutdown: async (listener) => {
+      const unlisten = await listen<AutoShutdownState>("engine://auto-shutdown", (event) => {
+        listener(event.payload);
+      });
+      return unlisten;
+    },
 
     revealTorrent: (id) => invoke<void>("reveal_torrent", { id }),
     openDownloadDir: () => invoke<void>("open_download_dir"),
@@ -85,7 +117,7 @@ export async function createTauriApi(): Promise<EngineApi> {
             }
             handlers.onLeave();
             const paths = payload.paths.filter((path) => /\.torrent$/i.test(path));
-            handlers.onDrop(paths.map((path) => ({ kind: "file" as const, path })));
+            handlers.onDrop(paths.map((path) => ({ kind: "path" as const, path })));
           });
           if (disposed) {
             stop();

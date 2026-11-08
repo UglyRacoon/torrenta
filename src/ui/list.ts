@@ -13,6 +13,7 @@ import {
 } from "../lib/format";
 import { h, setAttr, setScaleX, setText } from "../lib/dom";
 import { icon } from "../lib/icons";
+import { createSelect } from "./select";
 
 const BADGES: Record<TorrentState, { label: string; cls: string }> = {
   queued: { label: "В очереди", cls: "queued" },
@@ -34,6 +35,15 @@ const SORT_OPTIONS: { value: SortKey; label: string }[] = [
 
 type ActionKind = "pause" | "resume" | "retry";
 
+/** Точка открытия контекстного меню (кнопка «…» или курсор правого клика). */
+export interface MenuPoint {
+  x: number;
+  y: number;
+  restore?: HTMLElement;
+}
+
+export type ContextAnchor = HTMLElement | MenuPoint;
+
 interface RowView {
   el: HTMLElement;
   name: HTMLElement;
@@ -54,9 +64,12 @@ interface RowView {
 }
 
 export interface ListOptions {
+  /** Клик по строке — только выделение, панель подробностей не открывается. */
   onSelect(id: number): void;
+  /** Двойной щелчок — открыть панель подробностей. */
+  onOpen(id: number): void;
   onPauseToggle(id: number): void;
-  onContextMenu(id: number, anchor: HTMLElement): void;
+  onContextMenu(id: number, anchor: ContextAnchor): void;
   onAdd(): void;
   onQuery(query: string): void;
   onSort(sort: SortKey): void;
@@ -136,8 +149,9 @@ function statValue(torrent: TorrentSnapshot, kind: "down" | "up" | "left"): stri
       : "—";
   }
   if (torrent.state === "downloading" || torrent.state === "paused" || torrent.state === "queued") {
-    const remaining = torrent.total_bytes - torrent.downloaded_bytes;
-    return remaining > 0 && torrent.total_bytes > 0 ? fmtBytes(remaining) : "—";
+    // Осталось скачать только выбранные файлы (контракт 1.1).
+    const remaining = torrent.wanted_bytes - torrent.downloaded_bytes;
+    return remaining > 0 && torrent.wanted_bytes > 0 ? fmtBytes(remaining) : "—";
   }
   return "—";
 }
@@ -169,19 +183,20 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     searchClear,
   );
 
-  const sortSelect = h("select", {
-    class: "sort__select",
-    attrs: { "aria-label": "Сортировка списка" },
+  // Единый выпадающий список (контракт 4.7) вместо нативного <select>.
+  const sortSelect = createSelect({
+    label: "Сортировка списка",
+    options: SORT_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
+    value: "added",
+    onChange: (value) => options.onSort(value as SortKey),
+    className: "sort__control",
+    menuWidth: 196,
   });
-  for (const option of SORT_OPTIONS) {
-    sortSelect.append(h("option", { text: option.label, attrs: { value: option.value } }));
-  }
   const sort = h(
-    "label",
+    "div",
     { class: "sort" },
     h("span", { class: "sort__label", text: "Сортировка" }),
-    sortSelect,
-    h("span", { class: "sort__chevron" }, icon("chevronDown", 14)),
+    sortSelect.element,
   );
 
   const addButton = h("button", {
@@ -415,14 +430,22 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
       if (event.target instanceof HTMLElement && event.target.closest("button")) {
         return;
       }
-      options.onSelect(torrent.id);
+      options.onOpen(torrent.id);
     });
     el.addEventListener("contextmenu", (event) => {
       event.preventDefault();
-      options.onContextMenu(torrent.id, el);
+      event.stopPropagation();
+      options.onContextMenu(torrent.id, { x: event.clientX, y: event.clientY, restore: el });
     });
-    pause.addEventListener("click", () => options.onPauseToggle(torrent.id));
-    menu.addEventListener("click", () => options.onContextMenu(torrent.id, menu));
+    // Кнопки строки не должны выделять строку и открывать панель (контракт 4.5).
+    pause.addEventListener("click", (event) => {
+      event.stopPropagation();
+      options.onPauseToggle(torrent.id);
+    });
+    menu.addEventListener("click", (event) => {
+      event.stopPropagation();
+      options.onContextMenu(torrent.id, menu);
+    });
 
     return view;
   }
@@ -543,7 +566,6 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     options.onQuery("");
     searchInput.focus();
   });
-  sortSelect.addEventListener("change", () => options.onSort(sortSelect.value as SortKey));
   addButton.addEventListener("click", () => options.onAdd());
 
   let lastQuery = "";
@@ -585,7 +607,7 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
       searchClear.hidden = state.query === "";
       if (lastSort !== state.sort) {
         lastSort = state.sort;
-        sortSelect.value = state.sort;
+        sortSelect.setValue(state.sort);
       }
 
       const seen = new Set<number>();

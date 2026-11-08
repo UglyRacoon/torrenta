@@ -30,6 +30,8 @@ pub struct PiecePicker {
     in_progress_count: usize,
     /// Максимум кусков в работе одновременно.
     max_in_progress: usize,
+    /// Нужные куски (пересекаются с выбранными файлами): только их и отдаём.
+    wanted: Bitfield,
 }
 
 impl PiecePicker {
@@ -42,6 +44,7 @@ impl PiecePicker {
             availability: vec![0; piece_count],
             in_progress_count: 0,
             max_in_progress: (piece_count / 40).clamp(4, 64),
+            wanted: Bitfield::all_set(piece_count),
         }
     }
 
@@ -73,9 +76,48 @@ impl PiecePicker {
         self.have.count()
     }
 
-    /// Все куски получены.
+    /// Все нужные куски получены.
+    ///
+    /// Ненужные куски (в невыбранных файлах) на «завершённость» не влияют:
+    /// после частичного выбора торрент считается скачанным, как только на диске
+    /// лежат все куски выбранных файлов.
     pub fn is_complete(&self) -> bool {
-        self.have_count() == self.piece_count
+        (0..self.piece_count).all(|index| !self.wanted.get(index) || self.have.get(index))
+    }
+
+    /// Битовая карта нужных кусков.
+    pub fn wanted(&self) -> &Bitfield {
+        &self.wanted
+    }
+
+    /// Куски, которые надо скачать.
+    pub fn wanted_count(&self) -> usize {
+        (0..self.piece_count)
+            .filter(|index| self.wanted.get(*index))
+            .count()
+    }
+
+    /// Сколько нужных кусков уже есть.
+    pub fn wanted_have_count(&self) -> usize {
+        (0..self.piece_count)
+            .filter(|index| self.wanted.get(*index) && self.have.get(*index))
+            .count()
+    }
+
+    /// Заменяет набор нужных кусков (например, после смены выбора файлов).
+    pub fn set_wanted(&mut self, wanted: &Bitfield) {
+        let mut next = Bitfield::new(self.piece_count);
+        for index in 0..self.piece_count {
+            if wanted.get(index) {
+                next.set(index);
+            }
+        }
+        self.wanted = next;
+    }
+
+    /// Нужен ли кусок.
+    pub fn is_wanted(&self, index: usize) -> bool {
+        self.wanted.get(index)
     }
 
     pub fn status(&self, index: usize) -> PieceStatus {
@@ -151,47 +193,69 @@ impl PiecePicker {
     ///
     /// * `peer_have` — что есть у пира;
     /// * `exclude` — куски, которые уже запрошены у других пиров (избегаем дублей).
+    ///
+    /// Куски вне набора нужных не выбираются никогда.
     pub fn pick(&mut self, peer_have: &Bitfield, exclude: &HashSet<usize>) -> Option<usize> {
         if self.is_complete() || self.in_progress_count >= self.max_in_progress {
             return None;
         }
+        let index = self.best(peer_have, exclude, &self.wanted)?;
+        self.claim(index)
+    }
+
+    /// То же, но набор нужных кусков задаётся снаружи (без изменения состояния).
+    pub fn pick_wanted(
+        &mut self,
+        peer_have: &Bitfield,
+        exclude: &HashSet<usize>,
+        wanted: &Bitfield,
+    ) -> Option<usize> {
+        if self.in_progress_count >= self.max_in_progress {
+            return None;
+        }
+        let index = self.best(peer_have, exclude, wanted)?;
+        self.claim(index)
+    }
+
+    /// Лучший кандидат: rarest-first, на старте — последовательно с начала.
+    fn best(
+        &self,
+        peer_have: &Bitfield,
+        exclude: &HashSet<usize>,
+        wanted: &Bitfield,
+    ) -> Option<usize> {
         // Две трети — rarest-first, оставшаяся треть — последовательно с начала,
         // чтобы уже скачанные данные были полезны сразу (можно смотреть/раздавать).
         let sequential_bias = self.in_progress_count == 0;
-        let mut best: Option<(usize, u32, bool)> = None;
+        let mut best: Option<(usize, u32)> = None;
         for i in 0..self.piece_count {
-            if !self.peer_has(i) || exclude.contains(&i) {
-                continue;
-            }
-            if !peer_have.get(i) {
+            if !wanted.get(i) || !self.peer_has(i) || exclude.contains(&i) || !peer_have.get(i) {
                 continue;
             }
             let avail = self.availability[i];
-            let candidate = (i, avail, sequential_bias);
             best = match best {
-                None => Some(candidate),
-                Some((bi, ba, _)) => {
-                    let better = if sequential_bias && i < bi {
-                        true
-                    } else if sequential_bias && i > bi {
-                        false
+                None => Some((i, avail)),
+                Some((bi, ba)) => {
+                    let better = if sequential_bias {
+                        i < bi
                     } else {
                         avail < ba
                     };
                     if better {
-                        Some((i, avail, sequential_bias))
+                        Some((i, avail))
                     } else {
-                        Some((bi, ba, sequential_bias))
+                        Some((bi, ba))
                     }
                 }
             };
         }
-        if let Some((index, _, _)) = best {
-            self.status[index] = PieceStatus::InProgress;
-            self.in_progress_count += 1;
-            return Some(index);
-        }
-        None
+        best.map(|(index, _)| index)
+    }
+
+    fn claim(&mut self, index: usize) -> Option<usize> {
+        self.status[index] = PieceStatus::InProgress;
+        self.in_progress_count += 1;
+        Some(index)
     }
 
     /// Возвращает список отсутствующих кусков (для отладки и тестов).
@@ -262,5 +326,47 @@ mod tests {
             assert!(picked <= 64, "окно одновременно загружаемых кусков должно быть ограничено");
         }
         assert!(picked > 0);
+    }
+
+    #[test]
+    fn never_picks_pieces_outside_wanted() {
+        let mut picker = PiecePicker::new(4);
+        let mut wanted = Bitfield::new(4);
+        wanted.set(2);
+        picker.set_wanted(&wanted);
+        let mut peer = Bitfield::new(4);
+        for i in 0..4 {
+            peer.set(i);
+        }
+        assert!(!picker.is_wanted(1));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(2));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn completion_counts_wanted_pieces_only() {
+        let mut picker = PiecePicker::new(4);
+        let mut wanted = Bitfield::new(4);
+        wanted.set(1);
+        wanted.set(3);
+        picker.set_wanted(&wanted);
+        assert!(!picker.is_complete());
+        // Наличие «чужих» кусков завершённости не даёт.
+        picker.mark_have(0);
+        picker.mark_have(2);
+        assert!(!picker.is_complete());
+        picker.mark_have(1);
+        picker.mark_have(3);
+        assert!(picker.is_complete());
+        assert_eq!(picker.wanted_have_count(), 2);
+        assert_eq!(picker.wanted_count(), 2);
+        // В полном выборе завершённость по-прежнему требует все куски.
+        let mut full = PiecePicker::new(4);
+        full.mark_have(0);
+        assert!(!full.is_complete());
+        for index in 1..4 {
+            full.mark_have(index);
+        }
+        assert!(full.is_complete());
     }
 }

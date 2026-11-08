@@ -5,6 +5,7 @@ import { icon, type IconName } from "../lib/icons";
 const ICONS: Record<ToastKind, IconName> = {
   success: "checkCircle",
   error: "alertCircle",
+  warning: "alertCircle",
   info: "info",
 };
 

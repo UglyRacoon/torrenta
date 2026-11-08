@@ -67,7 +67,7 @@
   --radius-lg: 12px;
   --radius-xl: 14px;
 
-  --sidebar-w: 236px;
+  --sidebar-w: max-content;
   --details-w: 352px;
   --statusbar-h: 30px;
 

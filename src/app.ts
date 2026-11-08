@@ -1,10 +1,20 @@
 import type { EngineApi } from "./api/engine";
 import { createEngineApi, isTauriRuntime } from "./api/engine";
-import type { AppPayload, FilterKey, SortKey, TorrentInput, TorrentSnapshot, TorrentState } from "./api/types";
+import type {
+  AppPayload,
+  AutoShutdownState,
+  FilterKey,
+  SettingsDto,
+  SortKey,
+  TorrentSnapshot,
+  TorrentSource,
+  TorrentState,
+} from "./api/types";
+import { NO_LIMIT, SPEED_STEPS } from "./api/types";
 import { messageOf } from "./lib/dom";
-import { openMenu } from "./ui/menu";
+import { closeMenu, openMenu, type MenuItem } from "./ui/menu";
 import { createDetails, type DetailsPanel } from "./ui/details";
-import { createList, type TorrentList } from "./ui/list";
+import { createList, type ContextAnchor, type TorrentList } from "./ui/list";
 import { createModalHost } from "./ui/modals";
 import { createSidebar } from "./ui/sidebar";
 import { createStatusbar } from "./ui/statusbar";
@@ -50,8 +60,21 @@ function applyTheme(theme: Theme): void {
     ?.setAttribute("content", theme === "dark" ? DARK_THEME_COLOR : LIGHT_THEME_COLOR);
 }
 
-function isMagnet(link: string): boolean {
-  return /^magnet:\?/i.test(link.trim());
+function isMagnetLink(value: string): boolean {
+  return /^magnet:\?/i.test(value.trim());
+}
+
+/** Ступени ограничения скорости — общие для меню торрента (0 = без ограничения). */
+function limitItems(current: number, apply: (value: number) => void): MenuItem[] {
+  const items: MenuItem[] = SPEED_STEPS.map((step) => ({
+    label: step === NO_LIMIT ? "Без ограничения" : `${step} КиБ/с`,
+    checked: current === step,
+    onSelect: () => apply(step),
+  }));
+  if (!SPEED_STEPS.includes(current)) {
+    items.push({ label: `${current} КиБ/с`, checked: true, onSelect: () => apply(current) });
+  }
+  return items;
 }
 
 export function mountApp(): void {
@@ -76,6 +99,7 @@ export function mountApp(): void {
     query: "",
     sort: "added",
     selectedId: null,
+    detailsOpen: false,
     theme: initialTheme,
   });
 
@@ -84,8 +108,10 @@ export function mountApp(): void {
 
   let engine: EngineApi | null = null;
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeAuto: (() => void) | null = null;
   let stopDrop: (() => void) | null = null;
   let tornDown = false;
+  let autoState: AutoShutdownState = { enabled: false, pending_seconds: null };
 
   const api = (): EngineApi => {
     if (!engine) {
@@ -104,66 +130,93 @@ export function mountApp(): void {
     appEl.dataset.details = open ? "open" : "closed";
   }
 
-  async function pickFiles(): Promise<void> {
+  // --- Добавление торрентов (контракт 4.1) --------------------------------
+
+  async function openAdd(source: TorrentSource | null = null): Promise<void> {
+    let savePath = "";
     try {
-      const inputs = await api().pickTorrentFiles();
-      if (inputs.length === 0) {
-        return;
-      }
-      await addInputs(inputs);
-    } catch (reason) {
-      fail(reason, "Не удалось открыть файл");
+      savePath = (await api().getSettings()).download_dir;
+    } catch {
+      // Каталог неизвестен — движок возьмёт значение по умолчанию.
     }
+    modals.openAdd(
+      { source, savePath },
+      {
+        onPreview: (src) => api().preview(src),
+        onAdd: async (src, options) => {
+          const result = await api().addTorrent(src, options);
+          store.patch({ selectedId: result.id });
+          toaster.push("success", "Торрент добавлен", result.name);
+        },
+        onPickSource: async () => {
+          try {
+            const sources = await api().pickTorrentFiles();
+            return sources[0] ?? null;
+          } catch (reason) {
+            fail(reason, "Не удалось открыть файл");
+            return null;
+          }
+        },
+        onBrowseDir: () => api().pickDownloadDir(),
+      },
+    );
   }
 
-  async function addInputs(inputs: TorrentInput[]): Promise<void> {
-    const engineApi = api();
+  /** Несколько источников сразу (мультивыбор в диалоге / drag&drop): первый — в диалог. */
+  async function addSources(sources: TorrentSource[]): Promise<void> {
+    if (sources.length === 0) {
+      return;
+    }
+    if (sources.length === 1) {
+      const only = sources[0];
+      if (only) {
+        await openAdd(only);
+      }
+      return;
+    }
     let added = 0;
     const problems: string[] = [];
-    for (const input of inputs) {
+    for (const source of sources) {
       try {
-        await engineApi.addTorrent(input);
+        await api().addTorrent(source, { savePath: null, files: null });
         added += 1;
       } catch (reason) {
         problems.push(messageOf(reason));
       }
     }
     if (added > 0) {
-      toaster.push("success", added === 1 ? "Торрент добавлен" : `Добавлено: ${added}`, "Загрузка начнётся автоматически");
+      toaster.push(
+        "success",
+        added === 1 ? "Торрент добавлен" : `Добавлено: ${added}`,
+        "Загрузка начнётся автоматически",
+      );
     }
     for (const problem of problems) {
       toaster.push("error", "Торрент не добавлен", problem);
     }
   }
 
-  async function readFiles(files: File[]): Promise<void> {
-    const inputs: TorrentInput[] = [];
-    for (const file of files) {
-      const buffer = new Uint8Array(await file.arrayBuffer());
-      inputs.push({ kind: "bytes", bytes: buffer, name: file.name });
+  async function pasteFromClipboard(): Promise<void> {
+    let text = "";
+    try {
+      text = (await navigator.clipboard.readText()).trim();
+    } catch {
+      await openAdd();
+      return;
     }
-    await addInputs(inputs);
+    await openAdd(isMagnetLink(text) ? { kind: "magnet", link: text } : null);
   }
 
-  async function addMagnet(link: string): Promise<void> {
-    const result = await api().addMagnet(link);
-    toaster.push("success", "Magnet добавлен", result.name);
-  }
-
-  function openAdd(prefill?: string): void {
-    modals.openAdd({
-      prefill,
-      onAddMagnet: (link) => addMagnet(link),
-      onFiles: (files) => readFiles(files),
-      onPick: pickFiles,
-    });
-  }
+  // --- Настройки и тема ---------------------------------------------------
 
   async function openSettings(): Promise<void> {
     try {
-      const settings = await api().getSettings();
+      // set_settings — полная замена DTO: всегда отправляем все поля,
+      // а auto_shutdown берём из живого состояния, чтобы не снять таймер.
+      const settings: SettingsDto = { ...(await api().getSettings()), auto_shutdown: autoState.enabled };
       modals.openSettings(settings, {
         onSave: async (next) => {
+          next.auto_shutdown = autoState.enabled;
           const saved = await api().saveSettings(next);
           const theme: Theme = saved.theme === "light" ? "light" : "dark";
           if (theme !== state().theme) {
@@ -188,12 +241,44 @@ export function mountApp(): void {
     const payload = state().payload;
     if (payload) {
       void api()
-        .saveSettings({ ...payload.settings, theme: next })
+        .saveSettings({ ...payload.settings, auto_shutdown: autoState.enabled, theme: next })
         .catch(() => {
           // Тема применена локально; отказ движка не должен ломать переключатель.
         });
     }
   }
+
+  // --- Автовыключение (контракт 4.2) --------------------------------------
+
+  function applyAutoShutdown(next: AutoShutdownState): void {
+    autoState = next;
+    statusbar.setAutoShutdown(next);
+  }
+
+  async function toggleAutoShutdown(enabled: boolean): Promise<void> {
+    try {
+      const next = await api().setAutoShutdown(enabled);
+      applyAutoShutdown(next);
+      toaster.push(
+        "info",
+        enabled ? "Автовыключение включено" : "Автовыключение выключено",
+        enabled ? "Компьютер выключится после завершения всех загрузок" : "Компьютер не будет выключен",
+      );
+    } catch (reason) {
+      fail(reason, "Не удалось изменить автовыключение");
+    }
+  }
+
+  async function cancelAutoShutdown(): Promise<void> {
+    try {
+      applyAutoShutdown(await api().cancelAutoShutdown());
+      toaster.push("info", "Выключение отменено", "Компьютер останется включённым");
+    } catch (reason) {
+      fail(reason, "Не удалось отменить выключение");
+    }
+  }
+
+  // --- Действия над торрентом ---------------------------------------------
 
   async function togglePause(id: number): Promise<void> {
     const torrent = findTorrent(state(), id);
@@ -230,14 +315,20 @@ export function mountApp(): void {
     }
   }
 
-  function removeTorrent(id: number): void {
+  function openDetails(id: number): void {
+    if (state().selectedId !== id || !state().detailsOpen) {
+      store.patch({ selectedId: id, detailsOpen: true });
+    }
+  }
+
+  function removeTorrent(id: number, withFiles = false): void {
     const torrent = findTorrent(state(), id);
     if (!torrent) {
       return;
     }
     modals.confirmRemove(torrent.name, async (deleteFiles) => {
-      await api().remove(id, deleteFiles);
-      toaster.push("success", "Торрент удалён", torrent.name);
+      await api().remove(id, deleteFiles || withFiles);
+      toaster.push("success", "Торрент удалён", withFiles ? `${torrent.name} — вместе с файлами` : torrent.name);
     });
   }
 
@@ -259,49 +350,67 @@ export function mountApp(): void {
       .catch((reason: unknown) => fail(reason, "Ссылка недоступна"));
   }
 
-  function contextMenu(torrent: TorrentSnapshot, anchor: HTMLElement): void {
+  async function setLimits(id: number, downKib: number, upKib: number): Promise<void> {
+    try {
+      await api().setTorrentLimits(id, downKib, upKib);
+    } catch (reason) {
+      fail(reason, "Не удалось изменить ограничение скорости");
+    }
+  }
+
+  async function changeFileSelection(id: number, files: number[]): Promise<void> {
+    try {
+      await api().setFileSelection(id, files);
+    } catch (reason) {
+      fail(reason, "Не удалось изменить выбор файлов");
+      throw reason;
+    }
+  }
+
+  function contextMenu(torrent: TorrentSnapshot, anchor: ContextAnchor): void {
     const active = isActiveState(torrent.state);
     openMenu(anchor, [
       {
-        label: active ? "Пауза" : torrent.state === "completed" ? "Раздать" : "Продолжить",
+        label: active ? "Пауза" : "Возобновить",
         icon: active ? "pause" : "play",
         onSelect: () => void togglePause(torrent.id),
       },
       {
-        label: "Показать в проводнике",
-        icon: "folderOpen",
-        separatorBefore: true,
-        onSelect: () => revealTorrent(torrent.id),
+        label: "Подробности",
+        icon: "info",
+        onSelect: () => openDetails(torrent.id),
       },
       {
-        label: "Открыть каталог загрузок",
-        icon: "folder",
+        label: "Ограничить скорость",
+        icon: "clock",
+        separatorBefore: true,
+        children: limitItems(torrent.down_limit_kib, (value) => {
+          void setLimits(torrent.id, value, torrent.up_limit_kib);
+        }),
+      },
+      {
+        label: "Открыть папку загрузок",
+        icon: "folderOpen",
+        separatorBefore: true,
         onSelect: openDownloadDir,
       },
       {
-        label: "Удалить",
+        label: "Удалить торрент",
         icon: "trash",
         danger: true,
         separatorBefore: true,
         onSelect: () => removeTorrent(torrent.id),
       },
+      {
+        label: "Удалить торрент и файлы",
+        icon: "trash",
+        danger: true,
+        onSelect: () => removeTorrent(torrent.id, true),
+      },
     ]);
   }
 
-  async function pasteFromClipboard(): Promise<void> {
-    let text = "";
-    try {
-      text = (await navigator.clipboard.readText()).trim();
-    } catch {
-      openAdd();
-      return;
-    }
-    if (isMagnet(text)) {
-      openAdd(text);
-    } else {
-      openAdd();
-    }
-  }
+  // --- Сборка интерфейса --------------------------------------------------
 
   const sidebar = createSidebar(sidebarMount, {
     onFilter: (filter: FilterKey) => store.patch({ filter }),
@@ -312,9 +421,10 @@ export function mountApp(): void {
 
   const list: TorrentList = createList(listMount, {
     onSelect: (id) => {
+      // Выбор строки — только подсветка; панель открывается отдельно (4.5).
       store.patch({ selectedId: id });
-      setDetailsOpen(true);
     },
+    onOpen: (id) => openDetails(id),
     onPauseToggle: (id) => void togglePause(id),
     onContextMenu: (id, anchor) => {
       const torrent = findTorrent(state(), id);
@@ -322,7 +432,7 @@ export function mountApp(): void {
         contextMenu(torrent, anchor);
       }
     },
-    onAdd: () => openAdd(),
+    onAdd: () => void openAdd(),
     onQuery: (query) => store.patch({ query }),
     onSort: (sort: SortKey) => store.patch({ sort }),
     onClearFilters: () => store.patch({ filter: "all", query: "" }),
@@ -330,17 +440,18 @@ export function mountApp(): void {
   });
 
   const details: DetailsPanel = createDetails(detailsMount, {
-    onClose: () => {
-      store.patch({ selectedId: null });
-      setDetailsOpen(false);
-    },
+    onClose: () => store.patch({ detailsOpen: false }),
     onPauseToggle: (id) => void togglePause(id),
     onReveal: (id) => revealTorrent(id),
     onRemove: (id) => removeTorrent(id),
     onOpenExternal: (url) => openExternal(url),
+    onFileSelection: (id, files) => changeFileSelection(id, files),
   });
 
-  const statusbar = createStatusbar(statusbarMount);
+  const statusbar = createStatusbar(statusbarMount, {
+    onToggleAutoShutdown: (enabled) => void toggleAutoShutdown(enabled),
+    onCancelAutoShutdown: () => void cancelAutoShutdown(),
+  });
 
   // Переходы состояний для уведомлений: первый payload — не событие.
   let previousStates = new Map<number, TorrentState>();
@@ -372,7 +483,7 @@ export function mountApp(): void {
     list.update(current);
     details.update(current);
     statusbar.update(current);
-    setDetailsOpen(current.selectedId !== null);
+    setDetailsOpen(current.detailsOpen);
     if (current.payload) {
       notifyTransitions(current.payload);
     }
@@ -382,11 +493,25 @@ export function mountApp(): void {
     if (modals.isOpen()) {
       return;
     }
+    if (event.key === "Escape") {
+      // Меню/подменю закрывает свой обработчик; здесь — только панель и выбор.
+      if (closeMenu()) {
+        return;
+      }
+      if (state().detailsOpen) {
+        store.patch({ detailsOpen: false });
+        return;
+      }
+      if (state().selectedId !== null) {
+        store.patch({ selectedId: null });
+      }
+      return;
+    }
     const mod = event.ctrlKey || event.metaKey;
     const key = event.key.toLowerCase();
     if (mod && key === "o") {
       event.preventDefault();
-      void pickFiles();
+      void openAdd();
       return;
     }
     if (mod && event.key === ",") {
@@ -409,11 +534,6 @@ export function mountApp(): void {
       }
       event.preventDefault();
       list.focusSearch();
-      return;
-    }
-    if (event.key === "Escape" && state().selectedId !== null) {
-      store.patch({ selectedId: null });
-      setDetailsOpen(false);
     }
   });
 
@@ -443,6 +563,18 @@ export function mountApp(): void {
           store.setPayload(next);
         }
       });
+      if (unsubscribeAuto) {
+        unsubscribeAuto();
+        unsubscribeAuto = null;
+      }
+      unsubscribeAuto = await engineApi.subscribeAutoShutdown((next) => {
+        if (!tornDown) {
+          applyAutoShutdown(next);
+        }
+      });
+      void engineApi.getAutoShutdown().then(applyAutoShutdown, () => {
+        // Состояние автовыключения необязательно для работы интерфейса.
+      });
       if (!stopDrop) {
         stopDrop = engineApi.bindFileDrop({
           onEnter: () => {
@@ -451,9 +583,9 @@ export function mountApp(): void {
           onLeave: () => {
             dropOverlay.hidden = true;
           },
-          onDrop: (inputs) => {
+          onDrop: (sources) => {
             dropOverlay.hidden = true;
-            void addInputs(inputs);
+            void addSources(sources);
           },
         });
       }
@@ -471,6 +603,7 @@ export function mountApp(): void {
   window.addEventListener("beforeunload", () => {
     tornDown = true;
     unsubscribe?.();
+    unsubscribeAuto?.();
     stopDrop?.();
   });
 

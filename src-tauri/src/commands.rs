@@ -2,20 +2,172 @@
 //!
 //! Правила модуля:
 //! * ни одной паники — всё возвращает `Result<T, String>` с русским текстом;
-//! * тяжёлые операции (чтение файла, диалоги) не блокируют поток Tauri;
+//! * тяжёлые операции (чтение файла, диалоги, получение метаданных magnet)
+//!   не блокируют поток Tauri;
 //! * ошибки движка (`EngineError`) отдаются через `Display`, без двойных префиксов.
+//!
+//! Начиная с 1.1 добавление идёт парой `preview_torrent` + `add_torrent`, где
+//! `source` — либо `magnet:...`, либо путь к `.torrent`-файлу. Разбор источника
+//! вынесен в [`classify_source`], чтобы предпросмотр и добавление проверяли
+//! вход одинаково.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter as _, State};
 use tauri_plugin_dialog::{DialogExt as _, FilePath};
 use tauri_plugin_opener as opener;
+use torrent_core::engine::{AddOptions, TorrentManager, TorrentPreview};
 
-use crate::settings::SettingsDto;
+use crate::auto_shutdown::{AutoShutdownDto, AutoShutdownEvent, AUTO_SHUTDOWN_EVENT};
+use crate::settings::{self, SettingsDto};
 use crate::state::{engine_error_text, AppEngine, AppStateDto};
 
 /// Максимальный размер .torrent-файла, который принимает бэкенд.
-const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Тайм-аут получения метаданных magnet-ссылки для предпросмотра.
+///
+/// Совпадает с рекомендацией контракта (25 с): дольше пользователь уже не
+/// готов ждать в модальном окне добавления.
+pub const MAGNET_PREVIEW_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Префикс magnet-ссылки; сравнивается побайтово и без учёта регистра.
+const MAGNET_PREFIX: &[u8] = b"magnet:";
+
+/// Источник добавления торрента.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TorrentSource {
+    /// Magnet-ссылка (`magnet:?xt=...`).
+    Magnet(String),
+    /// Существующий `.torrent`-файл на диске.
+    File(PathBuf),
+}
+
+/// Разбирает строку источника: magnet-ссылка или путь к `.torrent`-файлу.
+///
+/// Проверки те же, что были в 1.0 (пустая строка, отсутствующий файл), плюс
+/// проверка, что в magnet есть параметр `xt`. Сравнение префикса побайтовое:
+/// так строка с кириллицей не может вызвать панику на границе символа.
+pub fn classify_source(source: &str) -> Result<TorrentSource, String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err("укажите magnet-ссылку или путь к .torrent-файлу".to_string());
+    }
+
+    if has_magnet_prefix(trimmed) {
+        let lowered = trimmed.to_ascii_lowercase();
+        if !lowered.contains("xt=") {
+            return Err("в magnet-ссылке нет параметра xt (info hash)".to_string());
+        }
+        return Ok(TorrentSource::Magnet(trimmed.to_string()));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.is_file() {
+        return Err(format!("файл «{}» не найден", path.display()));
+    }
+    Ok(TorrentSource::File(path))
+}
+
+/// Начинается ли строка с `magnet:` (регистр не важен, кириллица безопасна).
+fn has_magnet_prefix(value: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..MAGNET_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(MAGNET_PREFIX))
+}
+
+/// Читает `.torrent`-файл в фоне: блокирующий ввод-вывод не держит поток Tauri.
+async fn read_torrent_file(path: &Path) -> Result<Vec<u8>, String> {
+    let display = path.display().to_string();
+    let path = path.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || read_torrent_bytes(&path))
+        .await
+        .map_err(|err| format!("не удалось прочитать «{display}»: {err}"))?
+}
+
+/// Синхронное чтение с проверкой размера (выполняется в блокирующем пуле).
+fn read_torrent_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    // Размер проверяется до чтения: файл на несколько гигабайт не должен целиком
+    // попасть в память только ради того, чтобы потом быть отвергнутым.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_TORRENT_BYTES as u64 {
+            return Err(too_large(path, meta.len()));
+        }
+    }
+
+    let bytes = std::fs::read(path)
+        .map_err(|err| format!("не удалось прочитать «{}»: {err}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("файл «{}» пустой", path.display()));
+    }
+    if bytes.len() > MAX_TORRENT_BYTES {
+        return Err(too_large(path, bytes.len() as u64));
+    }
+
+    Ok(bytes)
+}
+
+/// Текст ошибки «файл больше [`MAX_TORRENT_BYTES`]».
+fn too_large(path: &Path, len: u64) -> String {
+    format!(
+        "файл «{}» слишком большой для .torrent: {} МиБ (предел {} МиБ)",
+        path.display(),
+        len / (1024 * 1024),
+        MAX_TORRENT_BYTES / (1024 * 1024)
+    )
+}
+
+/// Приводит выбранный каталог к `PathBuf`: пустая строка — «по умолчанию».
+///
+/// Каталог создаётся заранее, чтобы движок не падал на записи в несуществующий
+/// путь; относительный путь отклоняется — иначе данные уедут в рабочий каталог
+/// процесса, который пользователь не выбирал.
+fn prepare_save_path(save_path: Option<String>) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = save_path else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "каталог загрузки должен быть абсолютным путём: «{trimmed}»"
+        ));
+    }
+    if path.exists() && !path.is_dir() {
+        return Err(format!("«{trimmed}» существует, но это не каталог"));
+    }
+    if !path.is_dir() {
+        std::fs::create_dir_all(&path).map_err(|err| {
+            format!("не удалось создать каталог загрузки «{trimmed}»: {err}")
+        })?;
+    }
+
+    Ok(Some(path))
+}
+
+/// Нормализует список выбранных файлов: без дублей, по возрастанию индекса.
+///
+/// `None` — «все файлы»; `Some(vec![])` остаётся пустым, и движок отвечает
+/// `EngineError::Selection` — ровно как требует контракт.
+fn normalize_files(files: Option<Vec<usize>>) -> Option<Vec<usize>> {
+    files.map(|files| {
+        let mut files = files;
+        files.sort_unstable();
+        files.dedup();
+        files
+    })
+}
+
+/// Ограничивает лимиты скорости допустимым диапазоном (`0` — без лимита).
+pub fn clamp_limits(down_kib: u32, up_kib: u32) -> (u32, u32) {
+    (settings::clamp_rate(down_kib), settings::clamp_rate(up_kib))
+}
 
 /// Отдаёт полный снимок состояния (используется при первом рендере).
 #[tauri::command]
@@ -23,104 +175,83 @@ pub async fn get_state(state: State<'_, AppEngine>) -> Result<AppStateDto, Strin
     Ok(state.state())
 }
 
-/// Добавляет торрент из .torrent-файла на диске.
+/// Разбирает источник без добавления: путь к `.torrent` или magnet-ссылка.
 #[tauri::command]
-pub async fn add_torrent_file(
+pub async fn preview_torrent(
     state: State<'_, AppEngine>,
-    path: String,
-) -> Result<u64, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return Err("не указан путь к .torrent-файлу".to_string());
-    }
-
-    let file_path = PathBuf::from(trimmed);
-    let display = file_path.display().to_string();
-    if !file_path.is_file() {
-        return Err(format!("файл «{display}» не найден"));
-    }
-
-    let bytes = {
-        let file_path = file_path.clone();
-        let read = tauri::async_runtime::spawn_blocking(move || std::fs::read(file_path));
-        match read.await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(err)) => return Err(format!("не удалось прочитать «{display}»: {err}")),
-            Err(err) => return Err(format!("не удалось прочитать «{display}»: {err}")),
+    source: String,
+) -> Result<TorrentPreview, String> {
+    match classify_source(&source)? {
+        TorrentSource::File(path) => {
+            let data = read_torrent_file(&path).await?;
+            TorrentManager::preview_file(&data).map_err(|err| engine_error_text(&err))
         }
+        TorrentSource::Magnet(link) => state
+            .manager
+            .preview_magnet(&link, MAGNET_PREVIEW_TIMEOUT)
+            .await
+            .map_err(|err| engine_error_text(&err)),
+    }
+}
+
+/// Добавляет торрент из magnet-ссылки или `.torrent`-файла.
+///
+/// `save_path` — каталог загрузки для этого торрента (`None` — из настроек),
+/// `files` — индексы выбранных файлов (`None` — все).
+#[tauri::command]
+pub async fn add_torrent(
+    state: State<'_, AppEngine>,
+    source: String,
+    save_path: Option<String>,
+    files: Option<Vec<usize>>,
+) -> Result<u64, String> {
+    let opts = AddOptions {
+        save_path: prepare_save_path(save_path)?,
+        files: normalize_files(files),
     };
 
-    if bytes.is_empty() {
-        return Err(format!("файл «{display}» пустой"));
+    match classify_source(&source)? {
+        TorrentSource::File(path) => {
+            let data = read_torrent_file(&path).await?;
+            state
+                .manager
+                .add_file_with(data, opts)
+                .await
+                .map_err(|err| engine_error_text(&err))
+        }
+        TorrentSource::Magnet(link) => state
+            .manager
+            .add_magnet_with(&link, opts)
+            .await
+            .map_err(|err| engine_error_text(&err)),
     }
-    if bytes.len() > MAX_TORRENT_BYTES {
-        return Err(format!(
-            "файл «{display}» слишком большой для .torrent ({} МиБ)",
-            bytes.len() / (1024 * 1024)
-        ));
-    }
+}
 
+/// Меняет набор скачиваемых файлов у добавленного торрента.
+#[tauri::command]
+pub async fn set_file_selection(
+    state: State<'_, AppEngine>,
+    id: u64,
+    files: Vec<usize>,
+) -> Result<(), String> {
     state
         .manager
-        .add_file(bytes, None)
-        .await
+        .set_file_selection(id, files)
         .map_err(|err| engine_error_text(&err))
 }
 
-/// Добавляет торрент из содержимого .torrent-файла.
-///
-/// `name_hint` используется только в тексте ошибки (например, имя файла при
-/// drag&drop), чтобы пользователь понимал, какой именно файл не подошёл.
+/// Задаёт лимиты скорости конкретного торрента (КиБ/с, `0` — без лимита).
 #[tauri::command]
-pub async fn add_torrent_bytes(
+pub async fn set_torrent_limits(
     state: State<'_, AppEngine>,
-    bytes: Vec<u8>,
-    name_hint: Option<String>,
-) -> Result<u64, String> {
-    let hint = name_hint
-        .as_deref()
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .map(str::to_string);
-
-    if bytes.is_empty() {
-        return Err(match &hint {
-            Some(name) => format!("файл «{name}» пустой"),
-            None => "получен пустой .torrent-файл".to_string(),
-        });
-    }
-    if bytes.len() > MAX_TORRENT_BYTES {
-        return Err(format!(
-            "файл слишком большой для .torrent ({} МиБ)",
-            bytes.len() / (1024 * 1024)
-        ));
-    }
-
+    id: u64,
+    down_kib: u32,
+    up_kib: u32,
+) -> Result<(), String> {
+    let (down_kib, up_kib) = clamp_limits(down_kib, up_kib);
     state
         .manager
-        .add_file(bytes, None)
-        .await
-        .map_err(|err| match &hint {
-            Some(name) => format!("«{name}»: {}", engine_error_text(&err)),
-            None => engine_error_text(&err),
-        })
-}
-
-/// Добавляет торрент по magnet-ссылке.
-#[tauri::command]
-pub async fn add_magnet(state: State<'_, AppEngine>, link: String) -> Result<u64, String> {
-    let trimmed = link.trim();
-    if trimmed.is_empty() {
-        return Err("укажите magnet-ссылку".to_string());
-    }
-    if !trimmed.to_ascii_lowercase().starts_with("magnet:") {
-        return Err("ссылка должна начинаться с magnet:".to_string());
-    }
-
-    state
-        .manager
-        .add_magnet(trimmed, None)
-        .await
+        .set_limits(id, down_kib, up_kib)
         .map_err(|err| engine_error_text(&err))
 }
 
@@ -221,13 +352,71 @@ pub async fn get_settings(state: State<'_, AppEngine>) -> Result<SettingsDto, St
     Ok(state.settings())
 }
 
-/// Сохраняет настройки и применяет их к движку; возвращает нормализованные.
+/// Сохраняет настройки, применяет их к движку и к заголовку окна.
+///
+/// Ошибки применения темы не ломают сохранение: настройки уже на диске.
 #[tauri::command]
 pub async fn set_settings(
+    app: AppHandle,
     state: State<'_, AppEngine>,
     settings: SettingsDto,
 ) -> Result<SettingsDto, String> {
-    state.apply_settings(settings)
+    let previous = state.settings();
+    let applied = state.apply_settings(settings)?;
+
+    crate::apply_theme(&app, &applied.theme);
+
+    if previous.auto_shutdown && !applied.auto_shutdown {
+        // Автовыключение выключили через общие настройки: снимаем таймер.
+        state.cancel_auto_shutdown();
+        emit_auto_shutdown_cancelled(&app);
+    }
+
+    Ok(applied)
+}
+
+/// Состояние автовыключения: включена ли настройка и сколько осталось.
+#[tauri::command]
+pub async fn get_auto_shutdown(state: State<'_, AppEngine>) -> Result<AutoShutdownDto, String> {
+    Ok(state.auto_shutdown_dto())
+}
+
+/// Включает или выключает автовыключение (настройка сохраняется на диск).
+#[tauri::command]
+pub async fn set_auto_shutdown(
+    app: AppHandle,
+    state: State<'_, AppEngine>,
+    enabled: bool,
+) -> Result<AutoShutdownDto, String> {
+    let dto = state.set_auto_shutdown(enabled)?;
+    if !dto.enabled {
+        emit_auto_shutdown_cancelled(&app);
+    }
+    Ok(dto)
+}
+
+/// Отменяет идущий обратный отсчёт и выключение компьютера.
+///
+/// Настройка при этом выключается: иначе наблюдатель увидит выполненное условие
+/// и взведёт таймер снова через секунду — кнопка «Отменить» была бы бесполезной.
+#[tauri::command]
+pub async fn cancel_auto_shutdown(
+    app: AppHandle,
+    state: State<'_, AppEngine>,
+) -> Result<AutoShutdownDto, String> {
+    // Сначала гасится настройка: иначе наблюдатель увидит выполненное условие и
+    // взведёт таймер снова через секунду — кнопка «Отменить» была бы бесполезной.
+    let dto = state.set_auto_shutdown(false)?;
+    state.cancel_auto_shutdown();
+    emit_auto_shutdown_cancelled(&app);
+    Ok(dto)
+}
+
+/// Отправляет фронтенду «отсчёт отменён» (`pending_seconds: null`).
+fn emit_auto_shutdown_cancelled(app: &AppHandle) {
+    if let Err(err) = app.emit(AUTO_SHUTDOWN_EVENT, AutoShutdownEvent::cancelled()) {
+        eprintln!("[torrenta] не удалось отправить событие автовыключения: {err}");
+    }
 }
 
 /// Открывает проводник с выделенным файлом (или каталогом) торрента.
@@ -304,6 +493,141 @@ fn allowed_external(url: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Временный каталог с уникальным именем (без внешних зависимостей).
+    fn test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "torrenta-cmd-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("временный каталог должен создаваться");
+        dir
+    }
+
+    #[test]
+    fn magnet_source_is_detected() {
+        let source = classify_source("  magnet:?xt=urn:btih:abc&dn=ubuntu  ").expect("magnet");
+        assert_eq!(
+            source,
+            TorrentSource::Magnet("magnet:?xt=urn:btih:abc&dn=ubuntu".to_string())
+        );
+
+        // Регистр префикса не важен — так же, как в 1.0.
+        assert!(matches!(
+            classify_source("MAGNET:?XT=urn:btih:abc"),
+            Ok(TorrentSource::Magnet(_))
+        ));
+    }
+
+    #[test]
+    fn magnet_without_info_hash_is_rejected() {
+        let err = classify_source("magnet:?dn=ubuntu").expect_err("без xt — ошибка");
+        assert!(err.contains("xt"), "неожиданный текст ошибки: {err}");
+    }
+
+    #[test]
+    fn empty_source_is_rejected() {
+        let err = classify_source("   ").expect_err("пустая строка — ошибка");
+        assert!(err.contains("magnet"), "неожиданный текст ошибки: {err}");
+    }
+
+    #[test]
+    fn torrent_file_source_is_detected() {
+        let dir = test_dir("source");
+        let path = dir.join("sample.torrent");
+        std::fs::write(&path, b"d4:infod4:name1:xe").expect("файл должен создаваться");
+
+        let source = classify_source(&path.to_string_lossy()).expect("путь");
+        assert_eq!(source, TorrentSource::File(path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_torrent_file_is_reported() {
+        let dir = test_dir("missing");
+        let path = dir.join("нет-такого.torrent");
+        let err = classify_source(&path.to_string_lossy()).expect_err("файла нет — ошибка");
+        assert!(err.contains("не найден"), "неожиданный текст ошибки: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cyrillic_source_does_not_panic() {
+        // Побайтовое сравнение префикса не должно падать на границе символа.
+        let err = classify_source("торрент").expect_err("не путь и не magnet");
+        assert!(err.contains("не найден"));
+        assert!(!has_magnet_prefix("магнит:?xt=1"));
+        assert!(!has_magnet_prefix("mag"));
+    }
+
+    #[test]
+    fn save_path_holes_become_none() {
+        assert_eq!(prepare_save_path(None).expect("None"), None);
+        assert_eq!(
+            prepare_save_path(Some("   ".to_string())).expect("пустая строка"),
+            None
+        );
+    }
+
+    #[test]
+    fn save_path_accepts_absolute_directory_and_creates_it() {
+        let dir = test_dir("save-path");
+        let target = dir.join("nested").join("downloads");
+        let prepared = prepare_save_path(Some(target.to_string_lossy().into_owned()))
+            .expect("абсолютный путь");
+        assert_eq!(prepared, Some(target.clone()));
+        assert!(target.is_dir(), "каталог должен создаваться заранее");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_path_rejects_relative_path() {
+        let err = prepare_save_path(Some("downloads".to_string())).expect_err("относительный путь");
+        assert!(err.contains("абсолютным"), "неожиданный текст: {err}");
+    }
+
+    #[test]
+    fn save_path_rejects_file_instead_of_directory() {
+        let dir = test_dir("save-file");
+        let file = dir.join("file.bin");
+        std::fs::write(&file, b"x").expect("файл должен создаваться");
+        let err = prepare_save_path(Some(file.to_string_lossy().into_owned()))
+            .expect_err("файл вместо каталога");
+        assert!(err.contains("не каталог"), "неожиданный текст: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_selection_is_normalized() {
+        assert_eq!(normalize_files(None), None);
+        assert_eq!(
+            normalize_files(Some(vec![2, 0, 2, 1])),
+            Some(vec![0, 1, 2]),
+            "дубли убираются, порядок стабилизируется"
+        );
+        assert_eq!(
+            normalize_files(Some(Vec::new())),
+            Some(Vec::new()),
+            "пустой список остаётся пустым — движок сообщит об ошибке выбора"
+        );
+    }
+
+    #[test]
+    fn limits_are_clamped() {
+        assert_eq!(clamp_limits(0, 0), (0, 0));
+        assert_eq!(clamp_limits(64, 4096), (64, 4096));
+        assert_eq!(
+            clamp_limits(u32::MAX, settings::MAX_RATE_LIMIT_KIB + 1),
+            (
+                settings::MAX_RATE_LIMIT_KIB,
+                settings::MAX_RATE_LIMIT_KIB
+            )
+        );
+    }
+
     #[test]
     fn external_links_are_restricted() {
         assert!(allowed_external("https://example.com"));
@@ -318,5 +642,34 @@ mod tests {
     #[test]
     fn torrent_size_limit_is_reasonable() {
         assert_eq!(MAX_TORRENT_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAGNET_PREVIEW_TIMEOUT, Duration::from_secs(25));
+    }
+
+    #[test]
+    fn torrent_file_reading_checks_size_and_emptiness() {
+        let dir = test_dir("read-torrent");
+
+        let empty = dir.join("empty.torrent");
+        std::fs::write(&empty, b"").expect("файл должен создаваться");
+        let err = read_torrent_bytes(&empty).expect_err("пустой файл — ошибка");
+        assert!(err.contains("пустой"), "неожиданный текст: {err}");
+
+        // Размер выставляется без записи данных: проверяется именно отказ до чтения.
+        let big = dir.join("big.torrent");
+        let file = std::fs::File::create(&big).expect("файл должен создаваться");
+        file.set_len(MAX_TORRENT_BYTES as u64 + 1)
+            .expect("размер должен выставляться");
+        drop(file);
+        let err = read_torrent_bytes(&big).expect_err("слишком большой файл — ошибка");
+        assert!(err.contains("слишком большой"), "неожиданный текст: {err}");
+
+        let ok = dir.join("ok.torrent");
+        std::fs::write(&ok, b"d4:infod4:name1:xe").expect("файл должен создаваться");
+        assert_eq!(
+            read_torrent_bytes(&ok).expect("нормальный файл читается"),
+            b"d4:infod4:name1:xe".to_vec()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

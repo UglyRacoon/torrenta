@@ -11,6 +11,8 @@ export interface AppState {
   query: string;
   sort: SortKey;
   selectedId: number | null;
+  /** Панель подробностей — отдельное состояние: выбор строки её не открывает. */
+  detailsOpen: boolean;
   theme: Theme;
 }
 
@@ -82,6 +84,7 @@ export class AppStore {
       ready: true,
       fatalError: null,
       selectedId: stillExists ? selected : null,
+      detailsOpen: stillExists ? this.#state.detailsOpen : false,
     };
   }
 

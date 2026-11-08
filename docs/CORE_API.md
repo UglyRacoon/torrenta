@@ -19,7 +19,8 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 | `peerid` | `generate_peer_id`, `client_name` | lead |
 | `storage` | `Storage` | lead |
 | `picker` | `PiecePicker`, `PieceStatus` | lead |
-| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, ... | lead |
+| `selection` | `Selection`, `wanted_pieces`, `wanted_downloaded`, `effective_limit` (crate-private) | core |
+| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `AddOptions`, `TorrentPreview`, ... | core |
 
 ## `bencode`
 
@@ -188,7 +189,7 @@ impl Default for EngineConfig { ... }
 #[serde(rename_all = "lowercase")]
 pub enum TorrentState { Queued, Metadata, Downloading, Seeding, Paused, Completed, Error }
 
-#[derive(Serialize, Clone)] pub struct FileView { pub path: String, pub length: u64, pub downloaded: u64 }
+#[derive(Serialize, Clone)] pub struct FileView { pub path: String, pub length: u64, pub downloaded: u64, pub selected: bool }
 #[derive(Serialize, Clone)] pub struct PeerView { pub addr: String, pub client: String, pub down_rate: f64, pub up_rate: f64, pub progress: f64, pub is_seed: bool }
 #[derive(Serialize, Clone)] pub struct TorrentSnapshot {
     pub id: u64,
@@ -196,18 +197,21 @@ pub enum TorrentState { Queued, Metadata, Downloading, Seeding, Paused, Complete
     pub info_hash: String,          // hex
     pub state: TorrentState,
     pub error: Option<String>,
-    pub total_bytes: u64,
+    pub total_bytes: u64,           // полный размер торрента
+    pub wanted_bytes: u64,          // объём выбранных файлов
     pub downloaded_bytes: u64,      // за сессию (полезные данные)
     pub uploaded_bytes: u64,
-    pub progress: f64,              // 0.0..=1.0
+    pub progress: f64,              // 0.0..=1.0 по выбранным файлам
     pub piece_count: u32,
     pub piece_length: u32,
-    pub pieces_have: u32,
+    pub pieces_have: u32,           // по всему торренту
     pub peers_connected: u32,
     pub peers_known: u32,
     pub down_rate: f64,             // байт/с
     pub up_rate: f64,
     pub eta_seconds: Option<u64>,
+    pub down_limit_kib: u32,        // действующий лимит: min(глобальный, торрентный)
+    pub up_limit_kib: u32,
     pub save_path: String,
     pub added_at: i64,              // unix seconds
     pub files: Vec<FileView>,
@@ -220,12 +224,27 @@ pub enum TorrentState { Queued, Metadata, Downloading, Seeding, Paused, Complete
     pub downloaded_bytes: u64, pub uploaded_bytes: u64,
 }
 #[derive(Debug, Clone)] pub enum AddSource { File(Vec<u8>), Magnet(String) }
+/// Настройки добавления: папка и индексы выбранных файлов (`None` = все).
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions { pub save_path: Option<PathBuf>, pub files: Option<Vec<usize>> }
+/// Файл в предпросмотре торрента до его добавления.
+#[derive(Debug, Clone, Serialize)] pub struct PreviewFile { pub index: usize, pub path: String, pub length: u64 }
+#[derive(Debug, Clone, Serialize)] pub struct TorrentPreview {
+    pub name: String,
+    pub info_hash: String,          // hex
+    pub total_bytes: u64,
+    pub piece_length: u32,
+    pub piece_count: u32,
+    pub files: Vec<PreviewFile>,
+    pub trackers: Vec<String>,
+}
 #[derive(Debug, thiserror::Error)] pub enum EngineError {
     #[error("некорректный .torrent: {0}")] Metainfo(String),
     #[error("некорректная magnet-ссылка: {0}")] Magnet(String),
     #[error("ошибка ввода-вывода: {0}")] Io(String),
     #[error("торрент {0} не найден")] NotFound(u64),
     #[error("торрент уже добавлен: {0}")] Duplicate(String),
+    #[error("некорректный выбор файлов: {0}")] Selection(String),
 }
 
 pub struct TorrentManager { /* private */ }
@@ -234,8 +253,14 @@ impl TorrentManager {
     pub fn config(&self) -> EngineConfig;
     pub fn set_config(&self, config: EngineConfig);
     pub fn listen_port(&self) -> u16;
+    pub fn preview_file(data: &[u8]) -> Result<TorrentPreview, EngineError>;
+    pub async fn preview_magnet(&self, link: &str, timeout: Duration) -> Result<TorrentPreview, EngineError>;
     pub async fn add_file(&self, data: Vec<u8>, save_path: Option<PathBuf>) -> Result<u64, EngineError>;
+    pub async fn add_file_with(&self, data: Vec<u8>, options: AddOptions) -> Result<u64, EngineError>;
     pub async fn add_magnet(&self, link: &str, save_path: Option<PathBuf>) -> Result<u64, EngineError>;
+    pub async fn add_magnet_with(&self, link: &str, options: AddOptions) -> Result<u64, EngineError>;
+    pub fn set_file_selection(&self, id: u64, files: Vec<usize>) -> Result<(), EngineError>;
+    pub fn set_limits(&self, id: u64, down_kib: u32, up_kib: u32) -> Result<(), EngineError>;
     pub fn pause(&self, id: u64) -> Result<(), EngineError>;
     pub fn resume(&self, id: u64) -> Result<(), EngineError>;
     pub fn pause_all(&self);
@@ -286,3 +311,46 @@ pub enum EngineEvent {
   слушающий сокет: цикл `accept` проверяет флаг остановки раз в 100 мс, поэтому
   после `shutdown()` (ожидание ~250 мс) порт можно занимать снова — например,
   новым `TorrentManager` в этом же процессе (используется в тестах).
+
+## Выборочная загрузка, лимиты и предпросмотр (1.1)
+
+**Выбор файлов.** `AddOptions.files` — индексы файлов в порядке `Metainfo`;
+`None` или пустой список означает «все файлы». Индексы вне диапазона и пустой
+итоговый выбор отклоняются `EngineError::Selection`. `set_file_selection(id,
+files)` меняет выбор на лету:
+
+* «нужный» кусок — тот, что пересекается хотя бы с одним выбранным файлом
+  (`selection::wanted_pieces`); планировщик выбирает только нужные куски;
+* снятые куски, которые ещё не скачаны, немедленно освобождаются: буферы
+  выбрасываются, запросы у пиров снимаются, куски возвращаются в раздачу;
+* уже скачанные данные не удаляются и остаются «на диске»; после расширения
+  выбора они не перекачиваются (кусок считается готовым по битфилду);
+* `progress`, `eta_seconds` и `FileView.downloaded` считаются по выбранным
+  файлам; `total_bytes` остаётся полным размером торрента, `wanted_bytes` —
+  объём выбора, `pieces_have`/`pieces_total` — по всему торренту;
+* завершение наступает, когда скачаны все **нужные** куски: состояние
+  `Seeding`/`Completed`, даже если `pieces_have < piece_count`;
+* `Selection` и его хелперы (`wanted_pieces`, `wanted_downloaded`,
+  `effective_limit`) — crate-private, снаружи виден только результат через
+  `TorrentSnapshot`/`FileView`.
+
+**Объявление трекеру.** В `left` уходит остаток только по выбранным файлам
+(`Runtime::wanted_left()`), в `downloaded` — фактические байты. Если завершение
+произошло из-за сужения выбора, цикл трекера будится сразу (`announce_now`) и
+отправляет `event=completed`, не дожидаясь интервала объявления.
+
+**Лимиты.** `set_limits(id, down_kib, up_kib)` задаёт лимит торрента, `0` — без
+своего потолка. Действующая скорость = `min(глобальный лимит, лимит торрента)`
+(`selection::effective_limit`), это же значение отдаётся в
+`snapshot.down_limit_kib`/`up_limit_kib`. На сессию существует один общий
+лимитер (`SharedLimiters` в `Inner`), поэтому N торрентов при глобальных
+1 МиБ/с вместе дают не больше 1 МиБ/с, а не N × 1 МиБ/с. Изменения настроек
+подхватываются на следующем запросе без перезапуска.
+
+**Предпросмотр.** `preview_file(&[u8])` разбирает `.torrent` без добавления;
+`preview_magnet(link, timeout)` идёт за метаданными по BEP 9 с ограничением по
+времени: до 5 трекеров по очереди, не более 64 кандидатов, проверка шанса
+совпадения `info_hash`; ручка в менеджере не регистрируется и фоновых задач не
+остаётся. Ошибка по таймауту: «не удалось получить метаданные за отведённое
+время». Ограничение: метаданные ищутся только у пиров с трекеров (без DHT/PEX),
+а у magnet-ссылки без списка файлов `add_magnet_with` получает полный выбор.

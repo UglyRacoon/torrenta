@@ -4,25 +4,41 @@
 //! * регистрирует плагины диалогов и открытия ссылок;
 //! * поднимает движок `torrent-core` с настройками из `settings.json`;
 //! * кладёт [`AppEngine`] в managed-состояние Tauri (его и видят команды);
+//! * применяет тему к главному окну при старте;
 //! * запускает тикер, который каждые 500 мс отправляет событие `engine://state`
 //!   с полным снимком состояния, а также транслирует события движка в
 //!   `engine://event`;
-//! * регистрирует 16 команд из [`commands`].
+//! * запускает наблюдатель автовыключения (`engine://auto-shutdown`);
+//! * регистрирует 20 команд из [`commands`].
 
+pub mod auto_shutdown;
 pub mod commands;
 pub mod settings;
 pub mod state;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tauri::{AppHandle, Emitter as _, Manager as _};
+use tauri::utils::config::Color;
+use tauri::{AppHandle, Emitter as _, Manager as _, Theme as NativeTheme};
 use torrent_core::TorrentManager;
 
+use crate::auto_shutdown::{AutoShutdownEvent, COUNTDOWN_INTERVAL, AUTO_SHUTDOWN_EVENT};
 use crate::state::{
     AppEngine, ENGINE_EVENT, SIGNIFICANT_MIN_INTERVAL, STATE_EVENT, TICK_INTERVAL,
 };
+
+/// Метка главного окна из `tauri.conf.json`.
+const MAIN_WINDOW: &str = "main";
+
+/// Значение темы «светлая» (совпадает с `settings::THEMES`).
+const LIGHT_THEME: &str = "light";
+
+/// Фон окна для тёмной темы — тот же, что в `tauri.conf.json`.
+const DARK_BACKGROUND: Color = Color(0x0F, 0x13, 0x19, 0xFF);
+
+/// Фон окна для светлой темы: без него при смене темы видна тёмная вспышка.
+const LIGHT_BACKGROUND: Color = Color(0xF2, 0xF5, 0xF9, 0xFF);
 
 /// Запускает приложение. Вызывается из `main.rs`.
 ///
@@ -33,14 +49,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            setup(app)?;
+            setup(app).map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
-            commands::add_torrent_file,
-            commands::add_torrent_bytes,
-            commands::add_magnet,
+            commands::preview_torrent,
+            commands::add_torrent,
+            commands::set_file_selection,
+            commands::set_torrent_limits,
             commands::pick_torrent_files,
             commands::pick_download_dir,
             commands::pause_torrent,
@@ -50,6 +67,9 @@ pub fn run() {
             commands::remove_torrent,
             commands::get_settings,
             commands::set_settings,
+            commands::get_auto_shutdown,
+            commands::set_auto_shutdown,
+            commands::cancel_auto_shutdown,
             commands::reveal_torrent,
             commands::open_download_dir,
             commands::open_external,
@@ -62,8 +82,11 @@ pub fn run() {
     }
 }
 
-/// Инициализация состояния: пути, настройки, движок, тикер.
-fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+/// Инициализация состояния: пути, настройки, движок, тема, фоновые задачи.
+///
+/// Ошибка означает, что приложение не может работать: каталог настроек не
+/// определяется, поэтому `run` печатает текст и завершает процесс.
+fn setup(app: &mut tauri::App) -> Result<(), String> {
     let app_dir = app
         .path()
         .app_config_dir()
@@ -89,17 +112,47 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = settings::to_engine_config(&loaded);
-    let manager: Arc<TorrentManager> =
-        tauri::async_runtime::block_on(async move { TorrentManager::new(config) });
+    // `TorrentManager::new` не требует tokio-рантайма: фоновые задачи движка
+    // стартуют при первой async-команде, уже внутри рантайма Tauri.
+    let manager = TorrentManager::new(config);
 
+    let theme = loaded.theme.clone();
     let engine = AppEngine::new(manager, loaded, app_dir, fallback_dir);
     let handle = app.handle().clone();
     let _ = app.manage(engine);
 
+    // Окна из `tauri.conf.json` уже созданы — тему можно ставить сразу.
+    apply_theme(&handle, &theme);
+
     spawn_state_ticker(handle.clone());
-    spawn_engine_event_forwarder(handle);
+    spawn_engine_event_forwarder(handle.clone());
+    spawn_auto_shutdown_watcher(handle);
 
     Ok(())
+}
+
+/// Применяет тему к главному окну: системное оформление заголовка и фон.
+///
+/// Вызывается при старте и после сохранения настроек. Ошибки только
+/// логируются: тема не должна ломать ни запуск, ни сохранение настроек.
+pub fn apply_theme(app: &AppHandle, theme: &str) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        eprintln!("[torrenta] окно «{MAIN_WINDOW}» не найдено: тема не применена");
+        return;
+    };
+
+    let (native, background) = if theme == LIGHT_THEME {
+        (NativeTheme::Light, LIGHT_BACKGROUND)
+    } else {
+        (NativeTheme::Dark, DARK_BACKGROUND)
+    };
+
+    if let Err(err) = window.set_theme(Some(native)) {
+        eprintln!("[torrenta] не удалось применить тему окна: {err}");
+    }
+    if let Err(err) = window.set_background_color(Some(background)) {
+        eprintln!("[torrenta] не удалось задать цвет фона окна: {err}");
+    }
 }
 
 /// Тикер состояния: раз в [`TICK_INTERVAL`] собирает снимок и отправляет его
@@ -176,7 +229,138 @@ fn spawn_engine_event_forwarder(app: AppHandle) {
     });
 }
 
-/// Длительность одного тика (для отладки и тестов).
-pub const fn tick_interval() -> Duration {
-    TICK_INTERVAL
+/// Наблюдатель автовыключения: условие проверяется на каждое событие движка и
+/// раз в секунду — чтобы отсчёт шёл и когда движок молчит.
+///
+/// Логика ровно по контракту:
+/// * условие выполнено и таймер не взведён — `shutdown.exe /s /t 60`, отсчёт
+///   начинается с 60 и сразу уходит в `engine://auto-shutdown`;
+/// * таймер взведён — каждую секунду отправляется остаток, вплоть до 0;
+/// * условие нарушилось (добавили торрент, сняли настройку) — `shutdown.exe /a`,
+///   отсчёт сбрасывается, в событие уходит `pending_seconds: null`.
+fn spawn_auto_shutdown_watcher(app: AppHandle) {
+    let Some(engine) = app.try_state::<AppEngine>() else {
+        eprintln!(
+            "[torrenta] состояние приложения не инициализировано: автовыключение недоступно"
+        );
+        return;
+    };
+    let shared = engine.auto_shutdown_handle();
+    let mut receiver = engine.manager.subscribe();
+    drop(engine);
+
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(COUNTDOWN_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_error: Option<String> = None;
+        let mut arm_failed = false;
+
+        loop {
+            tokio::select! {
+                event = receiver.recv() => match event {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = ticker.tick() => {}
+            }
+
+            // Состояние читается заново каждый шаг: подписка могла отстать.
+            let Some(engine) = app.try_state::<AppEngine>() else {
+                break;
+            };
+            let enabled = engine.settings().auto_shutdown;
+            let torrents = engine.manager.snapshot();
+            let ready = auto_shutdown::should_shutdown(enabled, &torrents);
+            let scheduled = shared.is_scheduled();
+            // Взвод таймера и старт отсчёта живут в `AppEngine`: так наблюдатель
+            // и команды не могут разойтись в поведении.
+            let armed = if ready && !scheduled && !arm_failed {
+                Some(engine.arm_auto_shutdown())
+            } else {
+                None
+            };
+            drop(engine);
+
+            if !ready {
+                arm_failed = false;
+                if shared.reset() {
+                    if let Err(err) = auto_shutdown::cancel_system_shutdown() {
+                        log_auto_shutdown_error(
+                            &mut last_error,
+                            format!("не удалось отменить выключение: {err}"),
+                        );
+                    }
+                    emit_auto_shutdown(&app, &mut last_error, None);
+                }
+                continue;
+            }
+
+            if let Some(armed) = armed {
+                match armed {
+                    Ok(remaining) => emit_auto_shutdown(&app, &mut last_error, Some(remaining)),
+                    Err(err) => {
+                        // Повторные попытки бессмысленны, пока условие не
+                        // изменится: иначе `shutdown.exe` дёргался бы каждую секунду.
+                        arm_failed = true;
+                        log_auto_shutdown_error(
+                            &mut last_error,
+                            format!("не удалось запланировать выключение: {err}"),
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if !scheduled {
+                // Таймер не взведён, но и взводить нечего (прошлая попытка
+                // упала) — ждём, пока условие не изменится.
+                continue;
+            }
+
+            // Отсчёт уже взведён: раз в секунду сообщаем остаток (до нуля).
+            if let Some(remaining) = shared.tick() {
+                emit_auto_shutdown(&app, &mut last_error, Some(remaining));
+            }
+        }
+    });
+}
+
+/// Отправляет событие автовыключения; сбой отправки не должен ронять задачу.
+fn emit_auto_shutdown(
+    app: &AppHandle,
+    last_error: &mut Option<String>,
+    pending_seconds: Option<u32>,
+) {
+    let event = AutoShutdownEvent { pending_seconds };
+    if let Err(err) = app.emit(AUTO_SHUTDOWN_EVENT, event) {
+        log_auto_shutdown_error(
+            last_error,
+            format!("не удалось отправить событие автовыключения: {err}"),
+        );
+    }
+}
+
+/// Пишет ошибку в stderr, но не повторяет одинаковые сообщения каждый тик.
+fn log_auto_shutdown_error(last_error: &mut Option<String>, message: String) {
+    if last_error.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    eprintln!("[torrenta] автовыключение: {message}");
+    *last_error = Some(message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn window_and_theme_constants_match_config() {
+        assert_eq!(MAIN_WINDOW, "main");
+        assert_eq!(LIGHT_THEME, settings::THEMES[1]);
+        assert_ne!(DARK_BACKGROUND, LIGHT_BACKGROUND);
+        assert_eq!(DARK_BACKGROUND.3, 0xFF, "фон должен быть непрозрачным");
+        assert_eq!(LIGHT_BACKGROUND.3, 0xFF, "фон должен быть непрозрачным");
+        assert_eq!(TICK_INTERVAL, Duration::from_millis(500));
+    }
 }

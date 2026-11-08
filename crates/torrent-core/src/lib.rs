@@ -23,6 +23,7 @@ pub mod magnet;
 pub mod metainfo;
 pub mod peerid;
 pub mod picker;
+pub(crate) mod selection;
 pub mod storage;
 pub mod tracker;
 pub mod wire;
@@ -30,8 +31,8 @@ pub mod wire;
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};
 pub use bitfield::Bitfield;
 pub use engine::{
-    AddSource, EngineConfig, EngineError, EngineEvent, FileView, GlobalTotals, TorrentManager,
-    TorrentSnapshot, TorrentState,
+    AddOptions, AddSource, EngineConfig, EngineError, EngineEvent, FileView, GlobalTotals,
+    PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot, TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};
 pub use metainfo::{FileEntry, InfoHash, Metainfo, MetainfoError};
