@@ -143,9 +143,8 @@ fn prepare_save_path(save_path: Option<String>) -> Result<Option<PathBuf>, Strin
         return Err(format!("«{trimmed}» существует, но это не каталог"));
     }
     if !path.is_dir() {
-        std::fs::create_dir_all(&path).map_err(|err| {
-            format!("не удалось создать каталог загрузки «{trimmed}»: {err}")
-        })?;
+        std::fs::create_dir_all(&path)
+            .map_err(|err| format!("не удалось создать каталог загрузки «{trimmed}»: {err}"))?;
     }
 
     Ok(Some(path))
@@ -486,7 +485,9 @@ pub async fn open_external(url: String) -> Result<(), String> {
 /// Разрешены ли ссылки с такой схемой (защита от `file:`, `javascript:` и т. п.).
 fn allowed_external(url: &str) -> bool {
     let lowered = url.to_ascii_lowercase();
-    lowered.starts_with("http://") || lowered.starts_with("https://") || lowered.starts_with("mailto:")
+    lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || lowered.starts_with("mailto:")
 }
 
 #[cfg(test)]
@@ -499,10 +500,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "torrenta-cmd-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("torrenta-cmd-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("временный каталог должен создаваться");
         dir
     }
@@ -621,10 +620,7 @@ mod tests {
         assert_eq!(clamp_limits(64, 4096), (64, 4096));
         assert_eq!(
             clamp_limits(u32::MAX, settings::MAX_RATE_LIMIT_KIB + 1),
-            (
-                settings::MAX_RATE_LIMIT_KIB,
-                settings::MAX_RATE_LIMIT_KIB
-            )
+            (settings::MAX_RATE_LIMIT_KIB, settings::MAX_RATE_LIMIT_KIB)
         );
     }
 

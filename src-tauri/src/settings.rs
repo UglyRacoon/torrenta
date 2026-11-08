@@ -56,6 +56,22 @@ pub struct SettingsDto {
     /// Само выключение выполняет наблюдатель движка (см. `auto_shutdown`),
     /// настройка лишь хранит выбор пользователя между запусками.
     pub auto_shutdown: bool,
+    /// Запускать Torrenta вместе с Windows.
+    ///
+    /// Значение хранится в `settings.json`, а сама запись в реестр
+    /// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) выполняется
+    /// модулем [`crate::autostart`] при старте и при сохранении настроек.
+    pub autostart: bool,
+    /// Запускать приложение сразу в трее, не показывая окно.
+    ///
+    /// Настройка действует только на старте: если окно не показано, его можно
+    /// открыть из меню иконки в трее.
+    pub start_minimized: bool,
+    /// Закрывать окно в трей вместо выхода из приложения.
+    ///
+    /// Когда флаг включён, крестик окна прячет окно, а приложение продолжает
+    /// работать в трее; выход выполняет пункт «Выход» меню трея.
+    pub close_to_tray: bool,
     /// Тема оформления: `"dark"` или `"light"`.
     pub theme: String,
 }
@@ -70,6 +86,9 @@ impl Default for SettingsDto {
             listen_port: 0,
             seed_after_complete: true,
             auto_shutdown: false,
+            autostart: false,
+            start_minimized: false,
+            close_to_tray: false,
             theme: DEFAULT_THEME.to_string(),
         }
     }
@@ -193,8 +212,10 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
 
 /// Обратное преобразование: конфигурация движка → DTO настроек.
 ///
-/// Тема и автовыключение не входят в `EngineConfig`, поэтому передаются
-/// отдельными аргументами.
+/// Тема, автовыключение и «оконные» флаги (`autostart`, `start_minimized`,
+/// `close_to_tray`) не входят в `EngineConfig`, поэтому передаются отдельно:
+/// первые два — аргументами, остальные всегда выключены — их хранит только
+/// `settings.json`, поэтому при обратном чтении их нужно брать с диска.
 pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: bool) -> SettingsDto {
     SettingsDto {
         download_dir: config.download_dir.to_string_lossy().into_owned(),
@@ -206,6 +227,9 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         listen_port: config.listen_port,
         seed_after_complete: config.seed_after_complete,
         auto_shutdown,
+        autostart: false,
+        start_minimized: false,
+        close_to_tray: false,
         theme: normalize_theme(theme),
     }
 }
@@ -324,6 +348,9 @@ mod tests {
             listen_port: 51413,
             seed_after_complete: false,
             auto_shutdown: true,
+            autostart: true,
+            start_minimized: true,
+            close_to_tray: true,
             theme: "light".to_string(),
         }
     }
@@ -337,6 +364,9 @@ mod tests {
         assert_eq!(dto.listen_port, 0);
         assert!(dto.seed_after_complete);
         assert!(!dto.auto_shutdown);
+        assert!(!dto.autostart);
+        assert!(!dto.start_minimized);
+        assert!(!dto.close_to_tray);
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert!(dto.download_dir.is_empty());
         assert_eq!(dto, dto.clone().normalized());
@@ -352,6 +382,9 @@ mod tests {
             listen_port: 65_535,
             seed_after_complete: true,
             auto_shutdown: true,
+            autostart: false,
+            start_minimized: false,
+            close_to_tray: false,
             theme: "  LIGHT  ".to_string(),
         };
         dto.normalize();
@@ -423,7 +456,10 @@ mod tests {
             ..SettingsDto::default()
         };
         let err = prepare(dto, &dir).expect_err("относительный путь должен отклоняться");
-        assert!(err.contains("абсолютным"), "неожиданный текст ошибки: {err}");
+        assert!(
+            err.contains("абсолютным"),
+            "неожиданный текст ошибки: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -437,7 +473,10 @@ mod tests {
             ..SettingsDto::default()
         };
         let err = prepare(dto, &dir).expect_err("файл вместо каталога должен отклоняться");
-        assert!(err.contains("не каталог"), "неожиданный текст ошибки: {err}");
+        assert!(
+            err.contains("не каталог"),
+            "неожиданный текст ошибки: {err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -453,7 +492,18 @@ mod tests {
         assert!(!config.seed_after_complete);
 
         let back = from_engine_config(&config, &dto.theme, dto.auto_shutdown);
-        assert_eq!(back, dto);
+        // «Оконные» флаги не входят в `EngineConfig`: обратное преобразование
+        // отдаёт их выключенными, настоящие значения живут только в `settings.json`.
+        assert!(!back.autostart);
+        assert!(!back.start_minimized);
+        assert!(!back.close_to_tray);
+        let expected = SettingsDto {
+            autostart: false,
+            start_minimized: false,
+            close_to_tray: false,
+            ..dto
+        };
+        assert_eq!(back, expected);
     }
 
     #[test]
@@ -496,6 +546,78 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_without_window_flags_load_as_disabled() {
+        let dir = test_dir("legacy-settings");
+        let path = settings_path(&dir);
+        // Файл от версии 1.1: новых ключей в нём ещё нет.
+        let legacy = r#"{
+  "download_dir": "C:\\Torrents",
+  "max_peers": 60,
+  "download_limit_kib": 0,
+  "upload_limit_kib": 100,
+  "listen_port": 51413,
+  "seed_after_complete": true,
+  "auto_shutdown": false,
+  "theme": "dark"
+}"#;
+        fs::write(&path, legacy).expect("старый settings.json должен записываться");
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert!(
+            !loaded.autostart,
+            "автозапуск должен читаться как выключенный"
+        );
+        assert!(
+            !loaded.start_minimized,
+            "запуск в трее должен быть выключен"
+        );
+        assert!(
+            !loaded.close_to_tray,
+            "закрытие в трей должно быть выключено"
+        );
+        assert_eq!(loaded.max_peers, 60);
+        assert_eq!(loaded.upload_limit_kib, 100);
+        assert!(loaded.seed_after_complete);
+        assert_eq!(loaded.theme, "dark");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_flags_survive_normalize_and_save() {
+        let dir = test_dir("window-flags");
+        let path = settings_path(&dir);
+        let dto = SettingsDto {
+            autostart: true,
+            start_minimized: true,
+            close_to_tray: true,
+            ..SettingsDto::default()
+        };
+        let normalized = dto.clone().normalized();
+        assert_eq!(
+            normalized, dto,
+            "нормализация не должна менять «оконные» флаги"
+        );
+
+        save(&path, &normalized).expect("настройки должны сохраняться");
+        let text = fs::read_to_string(&path).expect("файл настроек должен читаться");
+        assert!(
+            text.contains("\"autostart\": true"),
+            "нет ключа автозапуска: {text}"
+        );
+        assert!(
+            text.contains("\"start_minimized\": true"),
+            "нет ключа запуска в трее: {text}"
+        );
+        assert!(
+            text.contains("\"close_to_tray\": true"),
+            "нет ключа закрытия в трей: {text}"
+        );
+
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert!(loaded.autostart && loaded.start_minimized && loaded.close_to_tray);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_is_atomic_and_leaves_no_temp_file() {
         let dir = test_dir("atomic");
         let path = settings_path(&dir);
@@ -508,7 +630,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "остались временные файлы: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "остались временные файлы: {leftovers:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -545,7 +670,10 @@ mod tests {
         assert_eq!(loaded.max_peers, 7);
         assert_eq!(loaded.theme, DEFAULT_THEME);
         assert_eq!(loaded.download_limit_kib, 0);
-        assert!(!loaded.auto_shutdown, "старый settings.json не включает автовыключение");
+        assert!(
+            !loaded.auto_shutdown,
+            "старый settings.json не включает автовыключение"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -563,8 +691,13 @@ mod tests {
 
     #[test]
     fn settings_path_uses_app_dir() {
-        let path = settings_path(Path::new("C:\\Users\\user\\AppData\\Roaming\\com.torrenta.client"));
+        let path = settings_path(Path::new(
+            "C:\\Users\\user\\AppData\\Roaming\\com.torrenta.client",
+        ));
         assert!(path.ends_with(SETTINGS_FILE_NAME));
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(SETTINGS_FILE_NAME));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(SETTINGS_FILE_NAME)
+        );
     }
 }

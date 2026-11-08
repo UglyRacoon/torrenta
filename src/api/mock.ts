@@ -435,12 +435,15 @@ export async function createMockApi(): Promise<EngineApi> {
     listen_port: 51413,
     seed_after_complete: true,
     auto_shutdown: false,
+    autostart: false,
+    start_minimized: false,
+    close_to_tray: false,
     theme: "dark",
   };
 
   const app: AppInfoDto = {
     name: "Torrenta",
-    version: "1.1.0",
+    version: "1.2.0",
     engine: "torrent-core 0.2.0",
     listen_port: 51413,
     platform: "windows",
@@ -1074,6 +1077,11 @@ export async function createMockApi(): Promise<EngineApi> {
       settings.listen_port = port >= 0 && port <= 65535 ? port : 51413;
       settings.seed_after_complete = Boolean(next.seed_after_complete);
       settings.auto_shutdown = Boolean(next.auto_shutdown);
+      // 1.2: трей и автозагрузка. В демо-режиме ничего не делаем с системой,
+      // значения просто сохраняются, чтобы окно настроек показывало выбор.
+      settings.autostart = Boolean(next.autostart);
+      settings.start_minimized = Boolean(next.start_minimized);
+      settings.close_to_tray = Boolean(next.close_to_tray);
       if (!settings.auto_shutdown) {
         autoPending = null;
       }

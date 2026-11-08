@@ -9,12 +9,17 @@
 //!   с полным снимком состояния, а также транслирует события движка в
 //!   `engine://event`;
 //! * запускает наблюдатель автовыключения (`engine://auto-shutdown`);
+//! * создаёт иконку в трее ([`tray`]) и показывает окно, если не выбран запуск «в трее»;
+//! * синхронизирует автозапуск в реестре ([`autostart`]) с настройкой;
+//! * перехватывает закрытие окна, когда включено «закрывать в трей»;
 //! * регистрирует 20 команд из [`commands`].
 
 pub mod auto_shutdown;
+pub mod autostart;
 pub mod commands;
 pub mod settings;
 pub mod state;
+pub mod tray;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -23,13 +28,11 @@ use tauri::utils::config::Color;
 use tauri::{AppHandle, Emitter as _, Manager as _, Theme as NativeTheme};
 use torrent_core::TorrentManager;
 
-use crate::auto_shutdown::{AutoShutdownEvent, COUNTDOWN_INTERVAL, AUTO_SHUTDOWN_EVENT};
-use crate::state::{
-    AppEngine, ENGINE_EVENT, SIGNIFICANT_MIN_INTERVAL, STATE_EVENT, TICK_INTERVAL,
-};
+use crate::auto_shutdown::{AutoShutdownEvent, AUTO_SHUTDOWN_EVENT, COUNTDOWN_INTERVAL};
+use crate::state::{AppEngine, ENGINE_EVENT, SIGNIFICANT_MIN_INTERVAL, STATE_EVENT, TICK_INTERVAL};
 
-/// Метка главного окна из `tauri.conf.json`.
-const MAIN_WINDOW: &str = "main";
+/// Метка главного окна из `tauri.conf.json` (нужна модулю [`tray`]).
+pub(crate) const MAIN_WINDOW: &str = "main";
 
 /// Значение темы «светлая» (совпадает с `settings::THEMES`).
 const LIGHT_THEME: &str = "light";
@@ -117,12 +120,37 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     let manager = TorrentManager::new(config);
 
     let theme = loaded.theme.clone();
+    let start_minimized = loaded.start_minimized;
+    let autostart_enabled = loaded.autostart;
     let engine = AppEngine::new(manager, loaded, app_dir, fallback_dir);
     let handle = app.handle().clone();
     let _ = app.manage(engine);
 
     // Окна из `tauri.conf.json` уже созданы — тему можно ставить сразу.
     apply_theme(&handle, &theme);
+
+    // Трей создаём всегда: он нужен и для запуска «в трее», и для закрытия в трей.
+    let tray_ready = match tray::init(&handle) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("[torrenta] не удалось создать иконку в трее: {err}");
+            false
+        }
+    };
+
+    // Автозапуск всегда синхронизируется с настройкой: это заодно обновляет путь
+    // к exe после обновления приложения. Ошибка реестра не мешает старту.
+    if let Err(err) = autostart::apply(autostart_enabled) {
+        eprintln!("[torrenta] не удалось настроить автозапуск: {err}");
+    }
+
+    // Главное окно из конфигурации создаётся скрытым. Показываем его, если это не
+    // запуск в трее; без иконки в трее показываем всегда, иначе окно не найти.
+    if !start_minimized || !tray_ready {
+        tray::show_main(&handle);
+    }
+
+    watch_close_request(&handle);
 
     spawn_state_ticker(handle.clone());
     spawn_engine_event_forwarder(handle.clone());
@@ -153,6 +181,42 @@ pub fn apply_theme(app: &AppHandle, theme: &str) {
     if let Err(err) = window.set_background_color(Some(background)) {
         eprintln!("[torrenta] не удалось задать цвет фона окна: {err}");
     }
+}
+
+/// Перехватывает закрытие главного окна, когда включена настройка «закрывать в трей».
+///
+/// Флаг читается в момент события, поэтому переключатель в настройках работает
+/// без перезапуска приложения. При выключенном флаге окно закрывается обычным
+/// образом и приложение завершается вместе с ним.
+fn watch_close_request(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        eprintln!("[torrenta] окно «{MAIN_WINDOW}» не найдено: закрытие в трей недоступно");
+        return;
+    };
+
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+            return;
+        };
+
+        let close_to_tray = handle
+            .try_state::<AppEngine>()
+            .map(|engine| engine.settings().close_to_tray)
+            .unwrap_or(false);
+        if !close_to_tray {
+            return;
+        }
+
+        // Крестик только прячет окно: приложение живёт в трее, а завершает его
+        // пункт «Выход» меню трея (см. [`tray`]).
+        api.prevent_close();
+        if let Some(window) = handle.get_webview_window(MAIN_WINDOW) {
+            if let Err(err) = window.hide() {
+                eprintln!("[torrenta] не удалось скрыть окно в трей: {err}");
+            }
+        }
+    });
 }
 
 /// Тикер состояния: раз в [`TICK_INTERVAL`] собирает снимок и отправляет его
@@ -205,12 +269,17 @@ fn spawn_state_ticker(app: AppHandle) {
 /// Полное состояние всё равно приходит в `engine://state`, поэтому здесь
 /// достаточно тонкой обёртки: только чтобы UI мог мгновенно показывать тосты.
 fn spawn_engine_event_forwarder(app: AppHandle) {
-    let Some(engine) = app.try_state::<AppEngine>() else {
-        eprintln!("[torrenta] состояние приложения не инициализировано: события движка недоступны");
-        return;
+    // Подписка берётся в отдельном блоке: `State` держит заимствование `app`,
+    // а его нужно переместить в асинхронную задачу.
+    let mut receiver = {
+        let Some(engine) = app.try_state::<AppEngine>() else {
+            eprintln!(
+                "[torrenta] состояние приложения не инициализировано: события движка недоступны"
+            );
+            return;
+        };
+        engine.manager.subscribe()
     };
-    let mut receiver = engine.manager.subscribe();
-    drop(engine);
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -239,15 +308,16 @@ fn spawn_engine_event_forwarder(app: AppHandle) {
 /// * условие нарушилось (добавили торрент, сняли настройку) — `shutdown.exe /a`,
 ///   отсчёт сбрасывается, в событие уходит `pending_seconds: null`.
 fn spawn_auto_shutdown_watcher(app: AppHandle) {
-    let Some(engine) = app.try_state::<AppEngine>() else {
-        eprintln!(
-            "[torrenta] состояние приложения не инициализировано: автовыключение недоступно"
-        );
-        return;
+    // Как и у форвардера событий: `State` освобождается до перемещения `app`.
+    let (shared, mut receiver) = {
+        let Some(engine) = app.try_state::<AppEngine>() else {
+            eprintln!(
+                "[torrenta] состояние приложения не инициализировано: автовыключение недоступно"
+            );
+            return;
+        };
+        (engine.auto_shutdown_handle(), engine.manager.subscribe())
     };
-    let shared = engine.auto_shutdown_handle();
-    let mut receiver = engine.manager.subscribe();
-    drop(engine);
 
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(COUNTDOWN_INTERVAL);
@@ -265,21 +335,25 @@ fn spawn_auto_shutdown_watcher(app: AppHandle) {
             }
 
             // Состояние читается заново каждый шаг: подписка могла отстать.
-            let Some(engine) = app.try_state::<AppEngine>() else {
-                break;
+            // Состояние читается в отдельном блоке: `arm_auto_shutdown` требует
+            // `State`, а дальше по коду он уже не нужен.
+            let (ready, scheduled, armed) = {
+                let Some(engine) = app.try_state::<AppEngine>() else {
+                    break;
+                };
+                let enabled = engine.settings().auto_shutdown;
+                let torrents = engine.manager.snapshot();
+                let ready = auto_shutdown::should_shutdown(enabled, &torrents);
+                let scheduled = shared.is_scheduled();
+                // Взвод таймера и старт отсчёта живут в `AppEngine`: так наблюдатель
+                // и команды не могут разойтись в поведении.
+                let armed = if ready && !scheduled && !arm_failed {
+                    Some(engine.arm_auto_shutdown())
+                } else {
+                    None
+                };
+                (ready, scheduled, armed)
             };
-            let enabled = engine.settings().auto_shutdown;
-            let torrents = engine.manager.snapshot();
-            let ready = auto_shutdown::should_shutdown(enabled, &torrents);
-            let scheduled = shared.is_scheduled();
-            // Взвод таймера и старт отсчёта живут в `AppEngine`: так наблюдатель
-            // и команды не могут разойтись в поведении.
-            let armed = if ready && !scheduled && !arm_failed {
-                Some(engine.arm_auto_shutdown())
-            } else {
-                None
-            };
-            drop(engine);
 
             if !ready {
                 arm_failed = false;

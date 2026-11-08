@@ -17,6 +17,10 @@
   grid-area: sidebar;
   display: flex;
   flex-direction: column;
+  /* Общий столбец иконок: логотип, навигация и футер выровнены по нему. */
+  --side-leading: 24px;
+  --side-gap: 8px;
+  --side-pad-x: 8px;
   min-width: 56px;
   max-width: 360px;
   min-height: 0;
@@ -60,16 +64,17 @@
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 4px 8px 16px;
+  gap: var(--side-gap);
+  padding: 3px var(--side-pad-x) 16px;
 }
 
 .brand__mark {
   display: inline-flex;
+  flex: none;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--side-leading);
+  height: var(--side-leading);
   border-radius: var(--radius-md);
   background: var(--color-accent-soft);
   color: var(--color-accent);
@@ -91,10 +96,10 @@
   position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: var(--side-gap);
   height: 30px;
-  padding: 0 8px;
+  padding: 0 var(--side-pad-x);
   border-radius: var(--radius-sm);
   color: var(--color-text-muted);
   font-size: 12.5px;
@@ -102,6 +107,15 @@
   transition:
     background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
+}
+
+.nav__icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--side-leading);
+  height: var(--side-leading);
 }
 
 .nav__item:hover {
@@ -117,6 +131,7 @@
 }
 
 .nav__label {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -210,9 +225,10 @@
 .side-action {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: var(--side-gap);
   height: 30px;
-  padding: 0 8px;
+  padding: 0 var(--side-pad-x);
   border-radius: var(--radius-sm);
   color: var(--color-text-muted);
   font-size: 12.5px;
@@ -233,7 +249,20 @@
 
 .side-action__icon {
   display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--side-leading);
+  height: var(--side-leading);
   color: var(--color-text-faint);
+}
+
+.side-action__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .side-action:hover .side-action__icon {
@@ -290,7 +319,7 @@ html.is-resizing {
 /* Компактный режим: только иконки (ширина < 136 px). */
 .sidebar--compact .brand {
   justify-content: center;
-  padding-left: 0;
+  padding: 3px 0 16px;
 }
 
 .sidebar--compact .brand__name,

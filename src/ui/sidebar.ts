@@ -56,7 +56,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
   const brand = h(
     "div",
     { class: "brand" },
-    h("span", { class: "brand__mark", attrs: { title: "Torrenta" } }, brandMark(24)),
+    h("span", { class: "brand__mark", attrs: { title: "Torrenta" } }, brandMark(20)),
     h("span", { class: "brand__name", text: "Torrenta" }),
   );
 
@@ -70,7 +70,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
       class: "nav__item",
       attrs: { type: "button", "data-filter": item.key, title: item.label },
     });
-    button.append(icon(item.icon, 17), label, count);
+    button.append(h("span", { class: "nav__icon" }, icon(item.icon, 17)), label, count);
     button.addEventListener("click", () => options.onFilter(item.key));
     nav.append(button);
     navItems.set(item.key, { button, count });

@@ -13,6 +13,7 @@ use serde::Serialize;
 use torrent_core::{EngineError, GlobalTotals, TorrentManager, TorrentSnapshot, TorrentState};
 
 use crate::auto_shutdown::{self, AutoShutdown, AutoShutdownDto};
+use crate::autostart;
 use crate::settings::{self, SettingsDto};
 
 /// Событие с полным снимком состояния (payload — [`AppStateDto`]).
@@ -217,12 +218,37 @@ impl AppEngine {
 
     /// Проверяет, сохраняет на диск, применяет к движку и запоминает настройки.
     ///
-    /// Порядок важен: сначала валидация и запись, потом применение к движку —
-    /// при ошибке сохранения движок остаётся с прежней конфигурацией.
+    /// Порядок важен: сначала валидация, затем автозапуск, затем запись, и только
+    /// потом применение к движку — при ошибке на любом шаге настройки не меняются
+    /// ни в памяти, ни в файле, ни в реестре.
     pub fn apply_settings(&self, next: SettingsDto) -> Result<SettingsDto, String> {
         let prepared = settings::prepare(next, &self.fallback_dir)?;
-        settings::save(&self.settings_path, &prepared)?;
-        self.manager.set_config(settings::to_engine_config(&prepared));
+
+        // Автозапуск живёт в реестре, а не в `settings.json`, поэтому обновляем его
+        // до сохранения: если реестр недоступен, пользователь увидит ошибку, а
+        // настройки останутся прежними.
+        let current = self.settings();
+        let autostart_changed = prepared.autostart != current.autostart;
+        if autostart_changed {
+            autostart::apply(prepared.autostart)?;
+        }
+
+        if let Err(err) = settings::save(&self.settings_path, &prepared) {
+            // Запись на диск не удалась — возвращаем реестр к прежнему состоянию,
+            // иначе автозапуск разойдётся с настройками.
+            if autostart_changed {
+                if let Err(revert) = autostart::apply(current.autostart) {
+                    eprintln!(
+                        "[torrenta] не удалось вернуть автозапуск к значению {}: {revert}",
+                        current.autostart
+                    );
+                }
+            }
+            return Err(err);
+        }
+
+        self.manager
+            .set_config(settings::to_engine_config(&prepared));
         match self.settings.write() {
             Ok(mut guard) => *guard = prepared.clone(),
             Err(poisoned) => *poisoned.into_inner() = prepared.clone(),
@@ -451,15 +477,24 @@ mod tests {
 
         let mut limited = a.clone();
         limited.torrents[0].down_limit_kib = 256;
-        assert_ne!(a.fingerprints().significant, limited.fingerprints().significant);
+        assert_ne!(
+            a.fingerprints().significant,
+            limited.fingerprints().significant
+        );
 
         let mut limited = a.clone();
         limited.torrents[0].up_limit_kib = 64;
-        assert_ne!(a.fingerprints().significant, limited.fingerprints().significant);
+        assert_ne!(
+            a.fingerprints().significant,
+            limited.fingerprints().significant
+        );
 
         let mut wanted = a.clone();
         wanted.torrents[0].wanted_bytes = 5;
-        assert_ne!(a.fingerprints().significant, wanted.fingerprints().significant);
+        assert_ne!(
+            a.fingerprints().significant,
+            wanted.fingerprints().significant
+        );
     }
 
     #[test]
@@ -468,10 +503,14 @@ mod tests {
             engine_error_text(&EngineError::NotFound(7)),
             "торрент 7 не найден"
         );
-        assert!(engine_error_text(&EngineError::Duplicate("ubuntu.iso".into()))
-            .contains("уже добавлен"));
-        assert!(engine_error_text(&EngineError::Metainfo("нет announce".into()))
-            .contains("некорректный .torrent"));
+        assert!(
+            engine_error_text(&EngineError::Duplicate("ubuntu.iso".into()))
+                .contains("уже добавлен")
+        );
+        assert!(
+            engine_error_text(&EngineError::Metainfo("нет announce".into()))
+                .contains("некорректный .torrent")
+        );
         assert!(engine_error_text(&EngineError::Magnet("bad xt".into()))
             .contains("некорректная magnet-ссылка"));
         assert!(engine_error_text(&EngineError::Io("нет доступа".into()))

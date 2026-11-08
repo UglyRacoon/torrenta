@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(parse("http://example.com/x.torrent").unwrap_err(), MagnetError::NotMagnet);
         assert_eq!(parse("magnet:?").unwrap_err(), MagnetError::MissingInfoHash);
         assert_eq!(
-            parse(&format!("magnet:?dn=name&tr=http%3A%2F%2Ft.example%2Fa")).unwrap_err(),
+            parse("magnet:?dn=name&tr=http%3A%2F%2Ft.example%2Fa").unwrap_err(),
             MagnetError::MissingInfoHash
         );
         // Чужой xt (не btih) — как отсутствующий info-hash.

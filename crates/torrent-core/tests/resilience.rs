@@ -28,7 +28,7 @@ use torrent_core::{EngineConfig, TorrentManager, TorrentState};
 /// Минимальное число block-запросов, чтобы скачать торрент без единого повтора
 /// (блок движка — 16 КиБ).
 fn minimal_block_requests(bytes: usize) -> u32 {
-    ((bytes + 16 * 1024 - 1) / (16 * 1024)) as u32
+    bytes.div_ceil(16 * 1024) as u32
 }
 
 fn test_config(download_dir: &std::path::Path) -> EngineConfig {

@@ -289,14 +289,20 @@ mod tests {
         // Одни Paused/Error: качать нечего, но и завершённых загрузок нет.
         assert!(!should_shutdown(
             true,
-            &[snapshot(TorrentState::Paused), snapshot(TorrentState::Error)]
+            &[
+                snapshot(TorrentState::Paused),
+                snapshot(TorrentState::Error)
+            ]
         ));
         assert!(!should_shutdown(true, &[snapshot(TorrentState::Error)]));
         assert!(!should_shutdown(true, &[snapshot(TorrentState::Paused)]));
         // Error рядом с завершённым торрентом не мешает.
         assert!(should_shutdown(
             true,
-            &[snapshot(TorrentState::Completed), snapshot(TorrentState::Error)]
+            &[
+                snapshot(TorrentState::Completed),
+                snapshot(TorrentState::Error)
+            ]
         ));
     }
 
@@ -323,10 +329,16 @@ mod tests {
         ];
         assert!(!should_shutdown(true, &torrents));
 
-        let torrents = [snapshot(TorrentState::Metadata), snapshot(TorrentState::Seeding)];
+        let torrents = [
+            snapshot(TorrentState::Metadata),
+            snapshot(TorrentState::Seeding),
+        ];
         assert!(!should_shutdown(true, &torrents));
 
-        let torrents = [snapshot(TorrentState::Queued), snapshot(TorrentState::Completed)];
+        let torrents = [
+            snapshot(TorrentState::Queued),
+            snapshot(TorrentState::Completed),
+        ];
         assert!(!should_shutdown(true, &torrents));
     }
 

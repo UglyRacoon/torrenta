@@ -321,14 +321,14 @@ export function mountApp(): void {
     }
   }
 
-  function removeTorrent(id: number, withFiles = false): void {
+  function removeTorrent(id: number): void {
     const torrent = findTorrent(state(), id);
     if (!torrent) {
       return;
     }
     modals.confirmRemove(torrent.name, async (deleteFiles) => {
-      await api().remove(id, deleteFiles || withFiles);
-      toaster.push("success", "Торрент удалён", withFiles ? `${torrent.name} — вместе с файлами` : torrent.name);
+      await api().remove(id, deleteFiles);
+      toaster.push("success", "Торрент удалён", deleteFiles ? `${torrent.name} — вместе с файлами` : torrent.name);
     });
   }
 
@@ -400,12 +400,6 @@ export function mountApp(): void {
         danger: true,
         separatorBefore: true,
         onSelect: () => removeTorrent(torrent.id),
-      },
-      {
-        label: "Удалить торрент и файлы",
-        icon: "trash",
-        danger: true,
-        onSelect: () => removeTorrent(torrent.id, true),
       },
     ]);
   }

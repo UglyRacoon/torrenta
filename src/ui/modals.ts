@@ -795,6 +795,31 @@ export function createModalHost(root: HTMLElement): ModalHost {
       settings.seed_after_complete,
     );
 
+    // 1.2: автозагрузка и поведение окна в трее.
+    const autostart = checkboxRow(
+      "Запускать при входе в Windows",
+      "Torrenta будет добавляться в автозагрузку текущего пользователя.",
+      settings.autostart,
+    );
+    const startMinimized = checkboxRow(
+      "Запускать свёрнутым в трей",
+      "При запуске окно не открывается — приложение работает в трее.",
+      settings.start_minimized,
+    );
+    const closeToTray = checkboxRow(
+      "При закрытии окна сворачивать в трей",
+      "Крестик скрывает окно, загрузки продолжаются. Выход — через значок Torrenta в трее.",
+      settings.close_to_tray,
+    );
+    const trayGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Запуск и трей" }),
+      autostart.row,
+      startMinimized.row,
+      closeToTray.row,
+    );
+
     let theme: "dark" | "light" = settings.theme === "light" ? "light" : "dark";
     const themeSelect = createSelect({
       label: "Тема оформления",
@@ -827,6 +852,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Пиров на торрент", maxPeers),
       ),
       seed.row,
+      trayGroup,
       themeField,
       errorEl,
       h("p", { class: "modal__hint", text: "Порт 0 — выбрать свободный автоматически. Лимит 0 — без ограничения." }),
@@ -890,6 +916,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
         upload_limit_kib: upLimit,
         listen_port: Math.round(readNumber(port)),
         seed_after_complete: seed.input.checked,
+        autostart: autostart.input.checked,
+        start_minimized: startMinimized.input.checked,
+        close_to_tray: closeToTray.input.checked,
         theme,
         auto_shutdown: settings.auto_shutdown,
       };

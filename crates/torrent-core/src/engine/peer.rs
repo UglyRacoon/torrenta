@@ -235,8 +235,10 @@ async fn handle_message(
             index,
             begin,
             length,
-        } => match runtime.upload(index, begin, length) {
-            Ok(data) => {
+        } => {
+            // Отказ в отдаче (кусок не скачан, пир не разблокирован) — не ошибка
+            // протокола: запрос просто игнорируется, соединение остаётся живым.
+            if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
                 send(
                     writer,
@@ -250,8 +252,7 @@ async fn handle_message(
                 *last_write = Instant::now();
                 runtime.add_uploaded(id, sent);
             }
-            Err(_) => {}
-        },
+        }
         Message::Piece {
             index,
             begin,

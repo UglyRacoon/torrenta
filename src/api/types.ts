@@ -75,6 +75,12 @@ export interface SettingsDto {
   listen_port: number;
   seed_after_complete: boolean;
   auto_shutdown: boolean;
+  /** Автозапуск при входе в Windows (1.2). */
+  autostart: boolean;
+  /** Запуск свёрнутым в трей (1.2). */
+  start_minimized: boolean;
+  /** Крестик окна сворачивает в трей, а не закрывает приложение (1.2). */
+  close_to_tray: boolean;
   theme: ThemeName;
 }
 
