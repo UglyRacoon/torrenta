@@ -27,7 +27,8 @@ function nameOf(source: TorrentSource): string {
 }
 
 /**
- * Реальный движок: команды Tauri и события engine://state и engine://auto-shutdown.
+ * Реальный движок: команды Tauri и события engine://state, engine://auto-shutdown
+ * и engine://open-source (1.4: сигнал «открыли .torrent/magnet извне»).
  * Все аргументы — camelCase, как их ждёт #[tauri::command] на стороне Rust.
  */
 export async function createTauriApi(): Promise<EngineApi> {
@@ -93,6 +94,17 @@ export async function createTauriApi(): Promise<EngineApi> {
 
     revealTorrent: (id) => invoke<void>("reveal_torrent", { id }),
     openExternal: (url) => invoke<void>("open_external", { url }),
+
+    // 1.4: .torrent/magnet, открытый из проводника. Событие — только сигнал,
+    // сам источник забирается командой (он одноразовый).
+    takeOpenRequest: () => invoke<string | null>("take_open_request"),
+    subscribeOpenRequest: async (listener) => {
+      const unlisten = await listen("engine://open-source", () => {
+        listener();
+      });
+      return unlisten;
+    },
+    quitApp: () => invoke<void>("quit_app"),
 
     /**
      * Нативное перетаскивание Tauri: event.payload содержит пути.

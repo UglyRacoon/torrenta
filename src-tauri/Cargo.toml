@@ -25,3 +25,4 @@ tauri-plugin-opener = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tauri-plugin-single-instance = "2"

@@ -269,6 +269,16 @@
   color: var(--color-text-muted);
 }
 
+/* «Выход» (1.4): наведение подсвечиваем существующим danger-токеном,
+   новых цветов не вводим — иначе проверка контраста не узнает о паре. */
+.side-action--quit:hover {
+  color: var(--color-danger);
+}
+
+.side-action--quit:hover .side-action__icon {
+  color: var(--color-danger);
+}
+
 /* --- Изменение ширины панели ------------------------------------------- */
 
 .sidebar__resize {

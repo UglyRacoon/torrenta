@@ -3964,6 +3964,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "726b6da0dd5bd1344f84f4108a622c07d01923baacb5c803a605189672c5352f"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4320,7 +4336,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "torrent-core"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "percent-encoding",
  "rand 0.8.8",
@@ -4336,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "torrenta"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4344,6 +4360,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
  "tokio",
  "torrent-core",
 ]

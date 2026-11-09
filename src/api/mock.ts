@@ -20,6 +20,8 @@ import { basename, clamp } from "../lib/format";
 /**
  * Демо-движок для браузера: те же DTO, что отдаёт Rust, и живой тикер.
  * Нужен, чтобы весь интерфейс можно было открыть без Tauri.
+ * Внешние источники (1.4) сюда не приходят, а «Выход» ничего не завершает:
+ * закрывать вкладку браузера странице не разрешено.
  */
 
 const DOWNLOADS = String.raw`C:\Users\Пользователь\Downloads`;
@@ -1302,6 +1304,16 @@ export async function createMockApi(): Promise<EngineApi> {
     },
 
     openExternal: async () => {
+      await delay(100);
+    },
+
+    // Демо-режим: извне ничего не открывается и процесс не завершается —
+    // закрывать вкладку браузера скрипт не может, поэтому просто ничего не делаем.
+    takeOpenRequest: async () => null,
+
+    subscribeOpenRequest: async () => () => {},
+
+    quitApp: async () => {
       await delay(100);
     },
 

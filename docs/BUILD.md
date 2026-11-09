@@ -135,10 +135,21 @@ npm run tauri -- build
 | Что | Где |
 | --- | --- |
 | Исполняемый файл | `target\release\torrenta.exe` |
-| Установщик NSIS | `target\release\bundle\nsis\Torrenta_1.3.1_x64-setup.exe` |
-| Установщик MSI | `target\release\bundle\msi\Torrenta_1.3.1_x64_*.msi` |
+| Установщик NSIS | `target\release\bundle\nsis\Torrenta_1.4.0_x64-setup.exe` |
+| Установщик MSI | `target\release\bundle\msi\Torrenta_1.4.0_x64_*.msi` |
 
 Порядок и хуки: перед сборкой Rust Tauri сам запускает `beforeBuildCommand` из `src-tauri\tauri.conf.json` — то есть `npm run build`; результат попадает в `dist` (`frontendDist`) и встраивается в бинарник. Поэтому отдельный `npm run build` перед `tauri build` не обязателен: он нужен только для проверки типов и размера бандла без сборки приложения.
+
+Ассоциация `.torrent` объявлена в `bundle.fileAssociations` и создаётся только установщиком, поэтому `cargo build`/`cargo check` её не проверяют. После установки NSIS-версии стоит убедиться, что ключи появились и команда запуска содержит кавычки вокруг `%1`:
+
+```powershell
+Get-ItemProperty 'HKCU:\Software\Classes\.torrent'
+Get-ItemProperty 'HKCU:\Software\Classes\Torrenta.torrent\shell\open\command'
+```
+
+Ожидаемая команда: `"C:\Users\<вы>\AppData\Local\Torrenta\torrenta.exe" "%1"`. Если ключей нет (WiX пишет рекламируемые ключи, которые Windows создаёт при установке компонента, поэтому MSI-пакет стоит проверять отдельно), закрепите Torrenta через «Открыть с помощью → Выбрать другое приложение». Проверка единственного экземпляра — запустить `torrenta.exe` дважды: второго окна быть не должно, окно первого поднимается, а второй процесс исчезает из диспетчера задач.
+
+Отдельная ловушка сборки: описание файловой ассоциации в `tauri.conf.json` должно быть латиницей. WiX генерирует `main.wxs` с кодовой страницей 1252, и кириллица в `ProgId/@Description` валит MSI (`LGHT0311`), хотя NSIS при этом собирается. Поэтому в конфигурации стоит `"description": "Torrent file"`.
 
 Для быстрой итерации по интерфейсу без пересборки Rust:
 
@@ -281,9 +292,9 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 
 1. Повторить сборку: загрузка кэшируется в `%LOCALAPPDATA%\tauri`.
 2. Собрать только NSIS: `.\build-windows.ps1 -BundleOnly`.
-3. Проверить, что `Torrenta_1.3.1_x64-setup.exe` не запущен в этот момент.
+3. Проверить, что `Torrenta_1.4.0_x64-setup.exe` не запущен в этот момент.
 
-### 5.14 `error: package torrent-core v1.3.1 ... requires rustc 1.77`
+### 5.14 `error: package torrent-core v1.4.0 ... requires rustc 1.77`
 
 **Причина:** устаревший Rust.
 

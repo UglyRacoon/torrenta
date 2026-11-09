@@ -51,6 +51,12 @@ export interface EngineApi {
   subscribeAutoShutdown(listener: (state: AutoShutdownState) => void): Promise<() => void>;
   revealTorrent(id: number): Promise<void>;
   openExternal(url: string): Promise<void>;
+  /** Источник извне (файл .torrent или magnet из проводника), забирается один раз. */
+  takeOpenRequest(): Promise<string | null>;
+  /** Сигнал «появился внешний источник»: после него вызови takeOpenRequest. */
+  subscribeOpenRequest(listener: () => void): Promise<() => void>;
+  /** Полное завершение приложения (иконка «Выход» в сайдбаре). */
+  quitApp(): Promise<void>;
   /** Возвращает функцию отписки. */
   bindFileDrop(handlers: FileDropHandlers): () => void;
 }

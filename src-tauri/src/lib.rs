@@ -12,16 +12,19 @@
 //! * создаёт иконку в трее ([`tray`]) и показывает окно, если не выбран запуск «в трее»;
 //! * синхронизирует автозапуск в реестре ([`autostart`]) с настройкой;
 //! * перехватывает закрытие окна, когда включено «закрывать в трей»;
-//! * регистрирует 20 команд из [`commands`].
+//! * держит один экземпляр приложения и открывает `.torrent`/magnet из
+//!   проводника ([`single_instance`]);
+//! * регистрирует 24 команды из [`commands`] и [`single_instance`].
 
 pub mod auto_shutdown;
 pub mod autostart;
 pub mod commands;
 pub mod settings;
+pub mod single_instance;
 pub mod state;
 pub mod tray;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use tauri::utils::config::Color;
@@ -49,6 +52,19 @@ const LIGHT_BACKGROUND: Color = Color(0xF2, 0xF5, 0xF9, 0xFF);
 /// к аккуратному завершению процесса с кодом 1.
 pub fn run() {
     let result = tauri::Builder::default()
+        // Плагин единственного экземпляра обязан регистрироваться ПЕРВЫМ:
+        // он проверяет, что приложение уже запущено, и передаёт аргументы
+        // второго запуска в колбэк ниже, после чего второй процесс завершается.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            // Второй экземпляр после колбэка умирает сам: здесь только передача
+            // источника первому окну. `cwd` — каталог запуска, он нужен, если
+            // проводник передал относительный путь к `.torrent`-файлу.
+            match single_instance::source_from_args(argv, Some(Path::new(&cwd))) {
+                Some(source) => single_instance::queue_open(app, source),
+                // Источника нет (запуск ярлыка второй раз) — просто показываем окно.
+                None => tray::show_main(app),
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -78,6 +94,8 @@ pub fn run() {
             commands::reveal_torrent,
             commands::open_download_dir,
             commands::open_external,
+            commands::quit_app,
+            single_instance::take_open_request,
         ])
         .run(tauri::generate_context!());
 
@@ -127,6 +145,9 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     let engine = AppEngine::new(manager, loaded, app_dir, fallback_dir);
     let handle = app.handle().clone();
     let _ = app.manage(engine);
+    // Очередь «открыть источник»: плагин single-instance и стартовые аргументы
+    // складывают сюда `.torrent`-путь или magnet, пока фронтенд не готов.
+    let _ = app.manage(single_instance::PendingOpen::default());
 
     // Окна из `tauri.conf.json` уже созданы — тему можно ставить сразу.
     apply_theme(&handle, &theme);
@@ -153,6 +174,14 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     }
 
     watch_close_request(&handle);
+
+    // Старт с `.torrent`/magnet в аргументах (двойной щелчок в проводнике).
+    // Окно в этот момент ещё грузит фронтенд, поэтому источник остаётся в
+    // PendingOpen, а событие может потеряться — это нормально: фронтенд заберёт
+    // запрос командой `take_open_request` при инициализации.
+    if let Some(source) = single_instance::source_from_args(std::env::args().skip(1), None) {
+        single_instance::queue_open(&handle, source);
+    }
 
     spawn_state_ticker(handle.clone());
     spawn_engine_event_forwarder(handle.clone());

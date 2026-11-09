@@ -65,6 +65,13 @@ function isMagnetLink(value: string): boolean {
   return /^magnet:\?/i.test(value.trim());
 }
 
+/** Внешний источник приходит строкой: либо magnet-ссылка, либо путь к .torrent (1.4). */
+function sourceFromText(text: string): TorrentSource {
+  return isMagnetLink(text)
+    ? { kind: "magnet", link: text.trim() }
+    : { kind: "path", path: text };
+}
+
 /** Ступени ограничения скорости — общие для меню торрента (0 = без ограничения). */
 function limitItems(current: number, apply: (value: number) => void): MenuItem[] {
   const items: MenuItem[] = SPEED_STEPS.map((step) => ({
@@ -110,6 +117,7 @@ export function mountApp(): void {
   let engine: EngineApi | null = null;
   let unsubscribe: (() => void) | null = null;
   let unsubscribeAuto: (() => void) | null = null;
+  let unsubscribeOpen: (() => void) | null = null;
   let stopDrop: (() => void) | null = null;
   let tornDown = false;
   let autoState: AutoShutdownState = { enabled: false, pending_seconds: null };
@@ -206,6 +214,36 @@ export function mountApp(): void {
       return;
     }
     await openAdd(isMagnetLink(text) ? { kind: "magnet", link: text } : null);
+  }
+
+  // --- Внешние источники и выход (1.4) -------------------------------------
+
+  /**
+   * .torrent/magnet, открытый из проводника (или переданный вторым экземпляром):
+   * забираем источник один раз и показываем обычный диалог добавления.
+   */
+  async function consumeOpenRequest(): Promise<void> {
+    if (tornDown) {
+      return;
+    }
+    try {
+      const raw = await api().takeOpenRequest();
+      if (!raw || tornDown) {
+        return;
+      }
+      await openAdd(sourceFromText(raw));
+    } catch (reason) {
+      fail(reason, "Не удалось открыть торрент");
+    }
+  }
+
+  /** Полное завершение процесса (кнопка «Выход» в сайдбаре). */
+  async function quitApp(): Promise<void> {
+    try {
+      await api().quitApp();
+    } catch (reason) {
+      fail(reason, "Не удалось завершить приложение");
+    }
   }
 
   // --- Настройки и тема ---------------------------------------------------
@@ -422,6 +460,7 @@ export function mountApp(): void {
     onToggleTheme: toggleTheme,
     onOpenSettings: () => void openSettings(),
     onToggleAll: () => void toggleAll(),
+    onQuit: () => void quitApp(),
   });
 
   const list: TorrentList = createList(listMount, {
@@ -580,6 +619,18 @@ export function mountApp(): void {
       void engineApi.getAutoShutdown().then(applyAutoShutdown, () => {
         // Состояние автовыключения необязательно для работы интерфейса.
       });
+      if (unsubscribeOpen) {
+        unsubscribeOpen();
+        unsubscribeOpen = null;
+      }
+      unsubscribeOpen = await engineApi.subscribeOpenRequest(() => {
+        if (!tornDown) {
+          void consumeOpenRequest();
+        }
+      });
+      // Источник, переданный при первом запуске, мог появиться до подписки —
+      // событие к этому моменту уже ушло в пустоту, поэтому забираем сразу.
+      void consumeOpenRequest();
       if (!stopDrop) {
         stopDrop = engineApi.bindFileDrop({
           onEnter: () => {
@@ -609,6 +660,7 @@ export function mountApp(): void {
     tornDown = true;
     unsubscribe?.();
     unsubscribeAuto?.();
+    unsubscribeOpen?.();
     stopDrop?.();
   });
 

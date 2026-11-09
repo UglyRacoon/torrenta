@@ -25,6 +25,8 @@ export interface SidebarOptions {
   onToggleTheme(): void;
   onOpenSettings(): void;
   onToggleAll(): void;
+  /** Полное завершение приложения (1.4): кнопка «Выход» в футере. */
+  onQuit(): void;
 }
 
 export interface Sidebar {
@@ -137,7 +139,18 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     h("span", { class: "side-action__label", text: "Настройки" }),
   );
 
-  const footer = h("div", { class: "sidebar__footer" }, themeButton, settingsButton);
+  // 1.4: выход из приложения. Цвета — только существующие токены (см. layout.css),
+  // чтобы не расходиться с проверкой контраста.
+  const quitButton = h("button", {
+    class: "side-action side-action--quit",
+    attrs: { type: "button", title: "Выход (завершить приложение)" },
+  });
+  quitButton.append(
+    h("span", { class: "side-action__icon" }, icon("power", 16)),
+    h("span", { class: "side-action__label", text: "Выход" }),
+  );
+
+  const footer = h("div", { class: "sidebar__footer" }, themeButton, settingsButton, quitButton);
 
   const resize = h("div", {
     class: "sidebar__resize",
@@ -156,6 +169,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
 
   themeButton.addEventListener("click", () => options.onToggleTheme());
   settingsButton.addEventListener("click", () => options.onOpenSettings());
+  quitButton.addEventListener("click", () => options.onQuit());
   allButton.addEventListener("click", () => options.onToggleAll());
 
   let allMode: "pause" | "resume" | "idle" | null = null;
@@ -188,6 +202,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     }
     setAttr(themeButton, "aria-label", isCompact ? "Переключить тему" : null);
     setAttr(settingsButton, "aria-label", isCompact ? "Настройки" : null);
+    setAttr(quitButton, "aria-label", isCompact ? "Выход" : null);
     setAttr(allButton, "aria-label", allButton.dataset.label ?? "Пауза/возобновление");
   }
 
