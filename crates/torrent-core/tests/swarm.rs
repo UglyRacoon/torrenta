@@ -26,6 +26,8 @@ fn test_config(download_dir: &Path) -> EngineConfig {
     EngineConfig {
         download_dir: download_dir.to_path_buf(),
         listen_port: 0,
+        // DHT ходит в настоящую сеть — в тестах он не нужен и только шумит.
+        dht: false,
         ..EngineConfig::default()
     }
 }
@@ -154,6 +156,7 @@ async fn downloads_single_file_torrent_and_stops_in_completed_state() {
         download_dir: download_dir.clone(),
         listen_port: 0,
         seed_after_complete: false,
+        dht: false,
         ..EngineConfig::default()
     });
 
@@ -272,6 +275,7 @@ async fn global_limit_is_shared_between_torrents() {
         download_dir: root,
         listen_port: 0,
         download_limit_kib: 64,
+        dht: false,
         ..EngineConfig::default()
     });
 

@@ -7,7 +7,6 @@ import {
   fmtEta,
   fmtPercent,
   fmtRate,
-  fmtRatio,
   truncateMiddle,
 } from "../lib/format";
 import { h, setAttr, setScaleX, setText } from "../lib/dom";
@@ -83,8 +82,19 @@ function hashString(value: string): number {
   return hash >>> 0;
 }
 
+/** Ratio из снимка (1.6): движок уже поделил отдано на скачано. */
+function seedRatioText(ratio: number): string {
+  // Два знака и десятичная запятая — как у остальных чисел интерфейса.
+  const safe = Number.isFinite(ratio) && ratio > 0 ? ratio : 0;
+  return `×${safe.toFixed(2).replace(".", ",")}`;
+}
+
 function progressText(torrent: TorrentSnapshot): string {
   const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
+  // Лимит раздачи (1.6): торрент остановлен движком, а не пользователем.
+  if (torrent.seed_limit_reached) {
+    return "Раздача остановлена по лимиту";
+  }
   switch (torrent.state) {
     case "downloading":
       if (torrent.wanted_bytes === 0 && torrent.files.length > 0) {
@@ -136,6 +146,8 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     close,
   );
   const error = h("p", { class: "details__error", attrs: { role: "alert", hidden: true } });
+  // Лимит раздачи (1.6): торрент остановлен движком и ждёт ручного возобновления.
+  const limit = h("p", { class: "details__error", attrs: { role: "status", hidden: true } });
 
   const toggle = h("button", { class: "btn btn--soft details__toggle", attrs: { type: "button" } });
   const toggleIcon = h("span", { class: "btn__icon" });
@@ -293,6 +305,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   mount.replaceChildren(
     head,
     error,
+    limit,
     actions,
     progress,
     stats,
@@ -774,6 +787,12 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     } else {
       error.hidden = true;
     }
+    // Лимит раздачи (1.6): отдельная строка вместо ошибки — движок сам остановил
+    // раздачу, и снять это можно только кнопкой «Продолжить»/«Раздать».
+    limit.hidden = !torrent.seed_limit_reached;
+    if (torrent.seed_limit_reached) {
+      setText(limit, "Достигнут лимит раздачи — возобновите вручную");
+    }
 
     const actionState = toggleLabel(torrent.state);
     if (toggleState !== torrent.state) {
@@ -805,8 +824,10 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     );
     setText(uploaded.value, fmtBytes(torrent.uploaded_bytes));
     setText(uploaded.sub, "за сессию");
-    setText(ratio.value, fmtRatio(torrent.uploaded_bytes, torrent.downloaded_bytes));
-    setText(ratio.sub, "отдано / получено");
+    // Ratio из снимка (1.6): если ещё ничего не скачано, движок отдаёт 0.0 —
+    // показываем прочерк, а не «×0,00».
+    setText(ratio.value, torrent.downloaded_bytes > 0 ? seedRatioText(torrent.seed_ratio) : "—");
+    setText(ratio.sub, "Отдано/скачано");
     setText(left.value, remaining > 0 ? fmtBytes(remaining) : "—");
     setText(
       left.sub,

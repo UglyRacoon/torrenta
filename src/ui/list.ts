@@ -121,7 +121,19 @@ function metaMainText(torrent: TorrentSnapshot): string {
   return `${size} · пиры ${peers}`;
 }
 
+/** Ratio из снимка (1.6): движок уже поделил отдано на скачано. */
+function seedRatioText(ratio: number): string {
+  // Два знака и десятичная запятая — как у остальных чисел интерфейса.
+  const safe = Number.isFinite(ratio) && ratio > 0 ? ratio : 0;
+  return `×${safe.toFixed(2).replace(".", ",")}`;
+}
+
 function metaStatusText(torrent: TorrentSnapshot): string {
+  // Лимит раздачи (1.6) перебивает состояние: движок уже остановил торрент
+  // и ждёт ручного возобновления, поэтому ETA и даты здесь ни о чём не говорят.
+  if (torrent.seed_limit_reached) {
+    return `лимит раздачи · ${seedRatioText(torrent.seed_ratio)}`;
+  }
   switch (torrent.state) {
     case "downloading":
       // Все файлы исключены приоритетом «не скачивать»: качать нечего.
@@ -130,9 +142,9 @@ function metaStatusText(torrent: TorrentSnapshot): string {
       }
       return torrent.eta_seconds === null ? "ETA неизвестно" : `осталось ${fmtEta(torrent.eta_seconds)}`;
     case "seeding":
-      return `отдано ${fmtBytes(torrent.uploaded_bytes)}`;
+      return `отдано ${fmtBytes(torrent.uploaded_bytes)} · раздача ${seedRatioText(torrent.seed_ratio)}`;
     case "completed":
-      return `завершён ${fmtDate(torrent.added_at)}`;
+      return `завершён ${fmtDate(torrent.added_at)} · раздача ${seedRatioText(torrent.seed_ratio)}`;
     case "queued":
       return "ожидает запуска";
     case "metadata":
@@ -478,6 +490,13 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     setText(view.metaStatus, status);
     if (torrent.state === "error") {
       setAttr(view.metaStatus, "title", status);
+    } else {
+      // Подсказка к «лимит раздачи»: как состояние снимается (1.6).
+      setAttr(
+        view.metaStatus,
+        "title",
+        torrent.seed_limit_reached ? "Лимит раздачи достигнут — возобновите вручную" : null,
+      );
     }
 
     setScaleX(view.fill, torrent.progress, view.scale);

@@ -110,6 +110,35 @@ function limitOptions(current: number): SelectOption[] {
   return presets;
 }
 
+/**
+ * Проверка строки прокси (1.6): пусто — прокси выключен, иначе нужен
+ * адрес вида socks5://host:port или http(s)://host:port. `null` — значение корректно.
+ */
+function proxyProblem(raw: string): string | null {
+  const value = raw.trim();
+  if (value === "") {
+    return null;
+  }
+  if (!/^(socks5|https?):\/\//i.test(value)) {
+    return "Прокси: адрес начинается с socks5://, http:// или https://";
+  }
+  if (/\s/.test(value)) {
+    return "Прокси: в адресе не должно быть пробелов";
+  }
+  const authority = (value.replace(/^[a-z0-9+.-]+:\/\//i, "").split("/")[0] ?? "").trim();
+  // Логин и пароль отделяются от хоста последней «собакой»: socks5://user:pass@host:port.
+  const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
+  const portMatch = /:(\d{1,5})$/.exec(hostPort);
+  if (!portMatch || portMatch.index === 0) {
+    return "Прокси: укажите хост и порт, например socks5://127.0.0.1:1080";
+  }
+  const portNumber = Number(portMatch[1]);
+  if (portNumber < 1 || portNumber > 65535) {
+    return "Прокси: порт — целое число от 1 до 65535";
+  }
+  return null;
+}
+
 export function createModalHost(root: HTMLElement): ModalHost {
   const stack: StackEntry[] = [];
 
@@ -853,6 +882,77 @@ export function createModalHost(root: HTMLElement): ModalHost {
       h("p", { class: "field__hint", text: "0 — без ограничения." }),
     );
 
+    // 1.6: сеть — DHT, PEX, проброс порта на роутере, web seeds, порт DHT и прокси.
+    const dht = checkboxRow(
+      "DHT",
+      "Искать пиров без трекера через распределённую хеш-таблицу (BEP 5).",
+      settings.dht ?? true,
+    );
+    const pex = checkboxRow(
+      "PEX",
+      "Обмениваться адресами пиров с подключёнными клиентами (BEP 11).",
+      settings.pex ?? true,
+    );
+    const portMapping = checkboxRow(
+      "UPnP / NAT-PMP",
+      "Просить роутер открыть порт прослушивания автоматически.",
+      settings.port_mapping ?? true,
+    );
+    const webSeeds = checkboxRow(
+      "Web seeds",
+      "Качать данные по HTTP из url-list в .torrent (BEP 19).",
+      settings.web_seeds ?? true,
+    );
+    const dhtPort = numberInput(settings.dht_port ?? 0, { min: "0", max: "65535", step: "1" });
+    const proxyInput = h("input", {
+      class: "input",
+      attrs: {
+        type: "text",
+        value: settings.proxy ?? "",
+        placeholder: "Без прокси",
+        spellcheck: "false",
+        autocomplete: "off",
+      },
+    });
+    proxyInput.addEventListener("input", () => showError(errorEl, null));
+    const networkGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Сеть" }),
+      dht.row,
+      pex.row,
+      portMapping.row,
+      webSeeds.row,
+      h("div", { class: "field-row" }, field("Порт DHT", dhtPort), field("Прокси", proxyInput)),
+      h("p", {
+        class: "field__hint",
+        text: "Порт DHT 0 — свободный UDP-порт автоматически. Прокси: пусто — выключен; socks5://host:port или http://host:port, с логином и паролем — socks5://user:pass@host:port.",
+      }),
+    );
+
+    // 1.6: лимиты раздачи — по ratio и по времени.
+    const seedRatio = numberInput(settings.seed_ratio_limit ?? 0, { min: "0", step: "0.1" });
+    const seedTime = numberInput(settings.seed_time_limit_min ?? 0, {
+      min: "0",
+      max: "4294967295",
+      step: "1",
+    });
+    const seedGoalGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Раздача" }),
+      h(
+        "div",
+        { class: "field-row" },
+        field("Ограничение по ratio", seedRatio),
+        field("Ограничение по времени раздачи, мин", seedTime),
+      ),
+      h("p", {
+        class: "field__hint",
+        text: "0 — без ограничения. Раздача останавливается, когда достигнут любой из лимитов.",
+      }),
+    );
+
     // 1.2: автозагрузка и поведение окна в трее.
     const autostart = checkboxRow(
       "Запускать при входе в Windows",
@@ -917,7 +1017,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Порт прослушивания", port),
         field("Пиров на торрент", maxPeers),
       ),
+      networkGroup,
       behaviorGroup,
+      seedGoalGroup,
       queueGroup,
       trayGroup,
       themeField,
@@ -953,6 +1055,33 @@ export function createModalHost(root: HTMLElement): ModalHost {
       }
       if (!Number.isFinite(activeSeeds) || !Number.isInteger(activeSeeds) || activeSeeds < 0 || activeSeeds > 100) {
         return "Одновременно раздавать — целое число от 0 до 100";
+      }
+      // 1.6: порт DHT, прокси и лимиты раздачи.
+      const dhtPortValue = readNumber(dhtPort);
+      if (
+        !Number.isFinite(dhtPortValue) ||
+        !Number.isInteger(dhtPortValue) ||
+        dhtPortValue < 0 ||
+        dhtPortValue > 65535
+      ) {
+        return "Порт DHT — целое число от 0 до 65535";
+      }
+      const proxyIssue = proxyProblem(proxyInput.value);
+      if (proxyIssue) {
+        return proxyIssue;
+      }
+      const ratioValue = readNumber(seedRatio);
+      if (!Number.isFinite(ratioValue) || ratioValue < 0) {
+        return "Ограничение по ratio — число не меньше 0";
+      }
+      const minutesValue = readNumber(seedTime);
+      if (
+        !Number.isFinite(minutesValue) ||
+        !Number.isInteger(minutesValue) ||
+        minutesValue < 0 ||
+        minutesValue > 4_294_967_295
+      ) {
+        return "Ограничение по времени раздачи — целое число минут, не меньше 0";
       }
       return null;
     }
@@ -1004,6 +1133,8 @@ export function createModalHost(root: HTMLElement): ModalHost {
       const problem = validate();
       if (problem) {
         showError(errorEl, problem);
+        // Ошибка стоит в конце прокручиваемого тела — показываем её сразу (1.6).
+        errorEl.scrollIntoView({ block: "nearest" });
         return;
       }
       const next: SettingsDto = {
@@ -1022,6 +1153,15 @@ export function createModalHost(root: HTMLElement): ModalHost {
         watch_dir: watchDir.trim(),
         notify_on_complete: notify.input.checked,
         restore_session: restoreSession.input.checked,
+        // 1.6: сеть и лимиты раздачи.
+        dht: dht.input.checked,
+        pex: pex.input.checked,
+        dht_port: Math.round(readNumber(dhtPort)),
+        proxy: proxyInput.value.trim(),
+        port_mapping: portMapping.input.checked,
+        web_seeds: webSeeds.input.checked,
+        seed_ratio_limit: Math.round(readNumber(seedRatio) * 100) / 100,
+        seed_time_limit_min: Math.round(readNumber(seedTime)),
         theme,
         auto_shutdown: settings.auto_shutdown,
       };

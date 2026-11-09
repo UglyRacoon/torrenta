@@ -33,6 +33,7 @@ pub(crate) use torrent::{Env, SharedLimiters};
 use crate::magnet::Magnet;
 use crate::metainfo::{InfoHash, Metainfo};
 use crate::peerid;
+use crate::port_map::{MappingProtocol, PortMapping};
 pub(crate) use crate::selection::{effective_limit, Selection};
 use crate::tracker::{self, AnnounceEvent, AnnounceRequest};
 use crate::wire::Handshake;
@@ -43,6 +44,8 @@ pub(crate) const BLOCK_SIZE: u32 = 16 * 1024;
 pub(crate) const REQUEST_WINDOW: usize = 24;
 /// Период тика статистики.
 const STATS_TICK: Duration = Duration::from_millis(500);
+/// Срок аренды проброса порта на роутере, секунды.
+const PORT_MAP_LIFETIME_SECS: u32 = 3600;
 
 // ---------------------------------------------------------------------------
 // Вспомогательные функции для локов
@@ -73,6 +76,53 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// HTTP-клиент сессии, который можно пересобрать на лету.
+///
+/// Клиентом пользуются трекеры, magnet-запросы и web seeds. Торренты держат
+/// `Arc` на слот, а не сам клиент, поэтому смена настроек (например, прокси)
+/// подхватывается уже добавленными торрентами без перезапуска.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpClient {
+    inner: Arc<RwLock<reqwest::Client>>,
+}
+
+impl HttpClient {
+    fn new(client: reqwest::Client) -> Self {
+        HttpClient {
+            inner: Arc::new(RwLock::new(client)),
+        }
+    }
+
+    /// Снимок текущего клиента: `reqwest::Client` клонируется дёшево (общий пул).
+    pub(crate) fn get(&self) -> reqwest::Client {
+        rd(&self.inner).clone()
+    }
+
+    /// Подменяет клиента: новые запросы пойдут уже через него.
+    fn replace(&self, client: reqwest::Client) {
+        *wr(&self.inner) = client;
+    }
+}
+
+/// Собирает HTTP-клиент под текущие настройки (в первую очередь — прокси).
+fn build_http(config: &EngineConfig) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(peerid::client_name(&peerid::generate_peer_id()))
+        .connect_timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(40));
+    // Конфигурация уже прошла `sanitized()`, поэтому спецификация разбирается
+    // без ошибок; нераспознанную молча игнорируем — сеть пойдёт напрямую.
+    let proxy = config
+        .proxy
+        .as_deref()
+        .and_then(|spec| crate::proxy::ProxyConfig::parse(spec).ok())
+        .and_then(|proxy| reqwest::Proxy::all(proxy.to_url()).ok());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().unwrap_or_default()
 }
 
 /// Читает ровно `buf.len()` байт с таймаутом.
@@ -114,6 +164,27 @@ pub struct EngineConfig {
     pub max_active_downloads: usize,
     /// Сколько торрентов могут одновременно раздаваться (0 — без ограничения).
     pub max_active_seeds: usize,
+    /// Искать пиров через DHT (BEP 5).
+    pub dht: bool,
+    /// UDP-порт DHT (0 — выбрать свободный автоматически).
+    pub dht_port: u16,
+    /// Обмениваться пирами с соседями через PEX (BEP 11).
+    pub pex: bool,
+    /// Догружать недостающие куски с HTTP-источников (`url-list`, BEP 19).
+    pub web_seeds: bool,
+    /// Прокси для исходящих соединений: `socks5://user:pass@host:port`,
+    /// `socks5h://…`, `http://host:port` или `https://host:port`.
+    ///
+    /// Прокси используют только TCP-соединения: подключения к пирам, HTTP-трекеры
+    /// и web seeds. UDP-трекеры и DHT работают напрямую (у них нет туннеля), это
+    /// ограничение протокола, а не недоделка.
+    pub proxy: Option<String>,
+    /// Пробрасывать порты на роутере по UPnP-IGD/NAT-PMP (best effort).
+    pub port_mapping: bool,
+    /// Остановить раздачу при ratio ≥ значения (0.0 — без ограничения).
+    pub seed_ratio_limit: f64,
+    /// Остановить раздачу через столько минут раздачи (0 — без ограничения).
+    pub seed_time_limit_min: u32,
 }
 
 /// Предел лимитов активных торрентов: больше всё равно не имеет смысла.
@@ -130,6 +201,14 @@ impl Default for EngineConfig {
             seed_after_complete: true,
             max_active_downloads: 0,
             max_active_seeds: 0,
+            dht: true,
+            dht_port: 0,
+            pex: true,
+            web_seeds: true,
+            proxy: None,
+            port_mapping: true,
+            seed_ratio_limit: 0.0,
+            seed_time_limit_min: 0,
         }
     }
 }
@@ -144,6 +223,18 @@ impl EngineConfig {
         // 0 — «без ограничения», поэтому нижняя граница именно 0.
         self.max_active_downloads = self.max_active_downloads.min(MAX_ACTIVE_LIMIT);
         self.max_active_seeds = self.max_active_seeds.min(MAX_ACTIVE_LIMIT);
+        // Прокси: пустая строка означает «выключено», а нерабочая спецификация не
+        // должна ломать движок — просто отключаем прокси.
+        self.proxy = match self.proxy.as_deref().map(str::trim) {
+            Some(spec) if !spec.is_empty() && crate::proxy::ProxyConfig::parse(spec).is_ok() => {
+                Some(spec.to_string())
+            }
+            _ => None,
+        };
+        // Отрицательный, бесконечный или NaN лимит раздачи — то же, что «без лимита».
+        if !self.seed_ratio_limit.is_finite() || self.seed_ratio_limit < 0.0 {
+            self.seed_ratio_limit = 0.0;
+        }
         self
     }
 }
@@ -242,6 +333,10 @@ pub struct TorrentSnapshot {
     /// Действующий лимит отдачи, КиБ/с (0 — без ограничения).
     pub up_limit_kib: u32,
     pub eta_seconds: Option<u64>,
+    /// Соотношение отдано/скачано (0.0, если скачано ещё ничего).
+    pub seed_ratio: f64,
+    /// Сработал лимит раздачи: торрент ждёт ручного возобновления.
+    pub seed_limit_reached: bool,
     pub save_path: String,
     pub added_at: i64,
     pub files: Vec<FileView>,
@@ -401,6 +496,81 @@ impl Flags {
     pub(crate) fn set_removed(&self) {
         self.removed.store(true, Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Лимиты раздачи
+// ---------------------------------------------------------------------------
+
+/// Учёт ограничений раздачи: сколько торрент уже раздаёт и не сработал ли лимит.
+///
+/// Лимиты (`seed_ratio_limit`, `seed_time_limit_min`) действуют только на раздачу:
+/// после их срабатывания торрент останавливается и ждёт, пока пользователь не
+/// снимет его с паузы вручную — тогда учёт начинается заново.
+#[derive(Debug, Default)]
+pub(crate) struct SeedMeter {
+    /// Момент начала текущего непрерывного отрезка раздачи; `None` — не раздаём.
+    since: Mutex<Option<Instant>>,
+    /// Лимит уже сработал (флаг снимается только ручным возобновлением).
+    limit_reached: AtomicBool,
+}
+
+impl SeedMeter {
+    /// Отмечает, что торрент раздаёт: время копится с первого такого вызова.
+    pub(crate) fn note_seeding(&self) {
+        let mut since = lk(&self.since);
+        if since.is_none() {
+            *since = Some(Instant::now());
+        }
+    }
+
+    /// Торрент больше не раздаёт — время останавливается.
+    pub(crate) fn note_stopped(&self) {
+        *lk(&self.since) = None;
+    }
+
+    /// Сколько торрент раздаёт в текущем отрезке.
+    pub(crate) fn elapsed(&self) -> Duration {
+        match *lk(&self.since) {
+            Some(since) => since.elapsed(),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Сработал ли лимит раздачи.
+    pub(crate) fn limit_reached(&self) -> bool {
+        self.limit_reached.load(Ordering::Relaxed)
+    }
+
+    /// Запоминает, что лимит сработал.
+    pub(crate) fn mark_limit_reached(&self) {
+        self.limit_reached.store(true, Ordering::Relaxed);
+    }
+
+    /// Сбрасывает учёт: ручное возобновление начинает раздачу с чистого листа.
+    pub(crate) fn reset(&self) {
+        self.limit_reached.store(false, Ordering::Relaxed);
+        *lk(&self.since) = None;
+    }
+}
+
+/// Соотношение отдано/скачано; при нулевом скачивании считается нулевым.
+fn seed_ratio(uploaded: u64, downloaded: u64) -> f64 {
+    if downloaded == 0 {
+        0.0
+    } else {
+        uploaded as f64 / downloaded as f64
+    }
+}
+
+/// Проверяет, не пора ли остановить раздачу по лимитам соотношения и времени.
+///
+/// `limit_ratio` и `limit_minutes` в нуле означают «без ограничения».
+fn seed_limit_hit(limit_ratio: f64, limit_minutes: u32, ratio: f64, seeding: Duration) -> bool {
+    let ratio_hit = limit_ratio > 0.0 && ratio >= limit_ratio;
+    let minutes = limit_minutes as u64;
+    let time_hit = minutes > 0 && seeding >= Duration::from_secs(minutes * 60);
+    ratio_hit || time_hit
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +836,8 @@ pub(crate) struct TorrentHandle {
     pub(crate) pending_files: Mutex<Option<Vec<usize>>>,
     /// Приоритеты, заданные до получения метаданных (важнее `pending_files`).
     pub(crate) pending_priorities: Mutex<Option<Vec<FilePriority>>>,
+    /// Учёт лимитов раздачи по соотношению и времени.
+    pub(crate) seed_meter: SeedMeter,
 }
 
 impl TorrentHandle {
@@ -702,11 +874,14 @@ impl TorrentHandle {
             Some(runtime) => {
                 if !runtime.is_complete() {
                     PlanKind::Download
-                } else if rd(&self.env.config).seed_after_complete {
-                    PlanKind::Seed
-                } else {
+                } else if !rd(&self.env.config).seed_after_complete {
                     // Раздача выключена: слот не нужен.
                     PlanKind::Idle
+                } else if self.seed_meter.limit_reached() {
+                    // Лимит раздачи сработал: торрент ждёт ручного возобновления.
+                    PlanKind::Idle
+                } else {
+                    PlanKind::Seed
                 }
             }
             // Метаданные ещё не получены — это тоже активная загрузка.
@@ -817,6 +992,42 @@ impl TorrentHandle {
         if let Some(runtime) = self.runtime_clone() {
             runtime.sync_peer_view();
         }
+        self.tick_seed_limit();
+    }
+
+    /// Считает время раздачи и проверяет лимиты соотношения/времени.
+    ///
+    /// Вызывается тикером раз в 500 мс; сама по себе ничего не останавливает —
+    /// выставленный флаг увидит [`TorrentHandle::plan_kind`] и очередь снимет
+    /// торрент со слота.
+    fn tick_seed_limit(&self) {
+        let seeding = *lk(&self.stats.state) == TorrentState::Seeding;
+        if !seeding || self.flags.paused() {
+            // Вне раздачи время не копим, уже сработавший лимит не сбрасываем:
+            // это делает только ручное возобновление.
+            self.seed_meter.note_stopped();
+            return;
+        }
+        self.seed_meter.note_seeding();
+        if self.seed_meter.limit_reached() {
+            return;
+        }
+        let config = rd(&self.env.config).clone();
+        if config.seed_ratio_limit <= 0.0 && config.seed_time_limit_min == 0 {
+            return;
+        }
+        let ratio = seed_ratio(
+            self.stats.uploaded.load(Ordering::Relaxed),
+            self.stats.downloaded.load(Ordering::Relaxed),
+        );
+        if seed_limit_hit(
+            config.seed_ratio_limit,
+            config.seed_time_limit_min,
+            ratio,
+            self.seed_meter.elapsed(),
+        ) {
+            self.seed_meter.mark_limit_reached();
+        }
     }
 
     /// Доля скачанных байт по каждому файлу (для колонки «прогресс файла»).
@@ -877,6 +1088,8 @@ impl TorrentHandle {
         };
         let limits = *rd(&self.limits);
         let config = rd(&self.env.config).clone();
+        let downloaded = self.stats.downloaded.load(Ordering::Relaxed);
+        let uploaded = self.stats.uploaded.load(Ordering::Relaxed);
         TorrentSnapshot {
             id: self.id,
             name: rd(&self.stats.name).clone(),
@@ -885,8 +1098,8 @@ impl TorrentHandle {
             error: rd(&self.stats.error).clone(),
             total_bytes: total,
             wanted_bytes,
-            downloaded_bytes: self.stats.downloaded.load(Ordering::Relaxed),
-            uploaded_bytes: self.stats.uploaded.load(Ordering::Relaxed),
+            downloaded_bytes: downloaded,
+            uploaded_bytes: uploaded,
             progress: if wanted_bytes == 0 {
                 0.0
             } else {
@@ -902,6 +1115,8 @@ impl TorrentHandle {
             down_limit_kib: effective_limit(config.download_limit_kib, limits.down_kib),
             up_limit_kib: effective_limit(config.upload_limit_kib, limits.up_kib),
             eta_seconds: eta,
+            seed_ratio: seed_ratio(uploaded, downloaded),
+            seed_limit_reached: self.seed_meter.limit_reached(),
             save_path: self.save_dir.to_string_lossy().into_owned(),
             added_at: self.added_at,
             files,
@@ -920,7 +1135,8 @@ struct Inner {
     handles: RwLock<Vec<Arc<TorrentHandle>>>,
     next_id: AtomicU64,
     peer_id: [u8; 20],
-    http: reqwest::Client,
+    /// HTTP-клиент сессии; пересобирается при смене настроек (прокси).
+    http: HttpClient,
     events: broadcast::Sender<EngineEvent>,
     listener: Mutex<Option<std::net::TcpListener>>,
     listen_port: u16,
@@ -929,6 +1145,10 @@ struct Inner {
     shutdown: Arc<AtomicBool>,
     /// Общие на сессию ведра лимитов скорости: глобальный потолок один на всех.
     limiters: Arc<SharedLimiters>,
+    /// Проброшенные на роутере порты: нужны, чтобы снять их при остановке.
+    mapping: tokio::sync::Mutex<Vec<PortMapping>>,
+    /// Узел DHT сессии; поднимается и гасится вместе с настройкой `dht`.
+    dht: Arc<RwLock<Option<Arc<crate::dht::Dht>>>>,
 }
 
 /// Менеджер торрентов — единственная точка входа движка для Tauri-бэкенда.
@@ -944,12 +1164,7 @@ impl TorrentManager {
     pub fn new(config: EngineConfig) -> Arc<TorrentManager> {
         let config = config.sanitized();
         let (listener, listen_port) = bind_listener(config.listen_port);
-        let http = reqwest::Client::builder()
-            .user_agent(peerid::client_name(&peerid::generate_peer_id()))
-            .connect_timeout(Duration::from_secs(12))
-            .timeout(Duration::from_secs(40))
-            .build()
-            .unwrap_or_default();
+        let http = HttpClient::new(build_http(&config));
         let (events, _) = broadcast::channel(256);
         let manager = Arc::new(TorrentManager {
             inner: Arc::new(Inner {
@@ -965,6 +1180,8 @@ impl TorrentManager {
                 background: AtomicBool::new(false),
                 shutdown: Arc::new(AtomicBool::new(false)),
                 limiters: Arc::new(SharedLimiters::new()),
+                mapping: tokio::sync::Mutex::new(Vec::new()),
+                dht: Arc::new(RwLock::new(None)),
             }),
         });
         manager.ensure_background();
@@ -983,9 +1200,23 @@ impl TorrentManager {
 
     /// Применяет новую конфигурацию (каталог, лимиты, порт для новых сессий).
     pub fn set_config(&self, config: EngineConfig) {
-        *wr(&self.inner.config) = config.sanitized();
+        let previous = rd(&self.inner.config).clone();
+        let config = config.sanitized();
+        // Смена прокси касается всех HTTP-запросов сессии: собираем клиента
+        // заново, уже созданные торренты увидят его через общий слот.
+        if previous.proxy != config.proxy {
+            self.inner.http.replace(build_http(&config));
+        }
+        *wr(&self.inner.config) = config;
         // Лимиты активных торрентов могли поменяться — сразу пересобираем очередь.
         self.schedule();
+        // Проброс порта мог быть включён или выключен: применяем в фоне.
+        if let Some(runtime) = rd(&self.inner.rt).clone() {
+            let inner = self.inner.clone();
+            runtime.spawn(async move { refresh_port_mapping(&inner).await });
+            let inner = self.inner.clone();
+            runtime.spawn(async move { refresh_dht(&inner).await });
+        }
     }
 
     /// Порт, на котором движок слушает входящие подключения (0 — не слушает).
@@ -1195,6 +1426,8 @@ impl TorrentManager {
             timeout,
         };
         let mut candidates: Vec<SocketAddr> = Vec::new();
+        // Снимок HTTP-клиента: прокси берётся из настроек на момент вызова.
+        let http = self.inner.http.get();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1217,11 +1450,9 @@ impl TorrentManager {
                         num_want: Some(50),
                         key: None,
                     };
-                    let response = tokio::time::timeout(
-                        left,
-                        tracker::announce(&self.inner.http, url, &request, left),
-                    )
-                    .await;
+                    let response =
+                        tokio::time::timeout(left, tracker::announce(&http, url, &request, left))
+                            .await;
                     if let Ok(Ok(response)) = response {
                         for peer in response.peers {
                             let addr = SocketAddr::new(peer.ip, peer.port);
@@ -1288,6 +1519,8 @@ impl TorrentManager {
         self.ensure_background();
         let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
         handle.flags.set_user_paused(false);
+        // Ручное возобновление обнуляет лимит раздачи: сид получает новый отрезок.
+        handle.seed_meter.reset();
         // Дальше решает планировщик: активных торрентов может быть уже достаточно,
         // и тогда торрент подождёт в очереди.
         self.schedule();
@@ -1308,6 +1541,8 @@ impl TorrentManager {
         self.ensure_background();
         for handle in self.handles() {
             handle.flags.set_user_paused(false);
+            // Как и одиночное возобновление: лимит раздачи начинается заново.
+            handle.seed_meter.reset();
         }
         // Очередь распределит слоты по тем же правилам, что и при старте.
         self.schedule();
@@ -1423,6 +1658,11 @@ impl TorrentManager {
         // Ждём, пока циклы заметят флаг: приём входящих опрашивает его раз в
         // 100 мс, после выхода сокет закрывается и порт снова свободен.
         tokio::time::sleep(Duration::from_millis(250)).await;
+        // Проброс снимаем, пока менеджер ещё жив: флаг остановки уже поднят,
+        // поэтому `refresh_port_mapping` только удаляет записи с роутера.
+        refresh_port_mapping(&self.inner).await;
+        // DHT гасим явно: узел держит UDP-сокет и свои задачи.
+        refresh_dht(&self.inner).await;
     }
 
     /// Подписка на события движка.
@@ -1475,6 +1715,7 @@ impl TorrentManager {
                 shutdown: self.inner.shutdown.clone(),
                 limits: limits.clone(),
                 shared: self.inner.limiters.clone(),
+                dht: self.inner.dht.clone(),
             },
             added_at: now_unix(),
             save_dir,
@@ -1484,6 +1725,7 @@ impl TorrentManager {
             limits,
             pending_files: Mutex::new(None),
             pending_priorities: Mutex::new(None),
+            seed_meter: SeedMeter::default(),
         })
     }
 
@@ -1520,6 +1762,12 @@ impl TorrentManager {
         runtime.spawn(async move { ticker_loop(inner).await });
         let inner = self.inner.clone();
         runtime.spawn(async move { accept_loop(inner).await });
+        // Проброс порта на роутере — в фоне: UPnP-обнаружение не должно
+        // задерживать возврат из `new`/первого вызова движка.
+        let inner = self.inner.clone();
+        runtime.spawn(async move { refresh_port_mapping(&inner).await });
+        let inner = self.inner.clone();
+        runtime.spawn(async move { refresh_dht(&inner).await });
     }
 }
 
@@ -1537,6 +1785,60 @@ fn bind_listener(port: u16) -> (Option<std::net::TcpListener>, u16) {
             (Some(listener), actual)
         }
         None => (None, 0),
+    }
+}
+
+/// Держит проброс порта в соответствии с текущими настройками.
+///
+/// Вызывается при старте, при смене настроек и при остановке; повторные
+/// вызовы идемпотентны. UPnP/NAT-PMP — best effort: если роутер молчит или
+/// проброс запрещён, движок просто работает без него и ошибку не сообщает.
+async fn refresh_port_mapping(inner: &Arc<Inner>) {
+    let config = rd(&inner.config).clone();
+    let port = inner.listen_port;
+    let mut mapping = inner.mapping.lock().await;
+    let want = config.port_mapping && port != 0 && !inner.shutdown.load(Ordering::SeqCst);
+    if !want {
+        for item in mapping.drain(..) {
+            crate::port_map::unmap_port(&item).await;
+        }
+        return;
+    }
+    if !mapping.is_empty() {
+        return;
+    }
+    // Пробрасываем именно TCP: входящие соединения пиров приходят по нему.
+    if let Some(item) =
+        crate::port_map::map_port(port, MappingProtocol::Tcp, PORT_MAP_LIFETIME_SECS).await
+    {
+        mapping.push(item);
+    }
+}
+
+/// Поднимает или гасит узел DHT под текущую настройку.
+///
+/// Узел один на сессию: его порт и bootstrap-адреса одни для всех торрентов,
+/// а поиск идёт по конкретным `info_hash`. Если UDP-порт занят, DHT просто
+/// не поднимается — торренты продолжают работать через трекеры и PEX.
+async fn refresh_dht(inner: &Arc<Inner>) {
+    let config = rd(&inner.config).clone();
+    let running = rd(&inner.dht).clone();
+    if !config.dht || inner.shutdown.load(Ordering::SeqCst) {
+        if let Some(node) = running {
+            node.shutdown().await;
+        }
+        *wr(&inner.dht) = None;
+        return;
+    }
+    if running.is_some() {
+        return;
+    }
+    let node = Arc::new(crate::dht::Dht::new(crate::dht::DhtConfig {
+        port: config.dht_port,
+        ..Default::default()
+    }));
+    if node.start().await.is_ok() {
+        *wr(&inner.dht) = Some(node);
     }
 }
 
@@ -1634,6 +1936,7 @@ mod tests {
             seed_after_complete: true,
             max_active_downloads: 0,
             max_active_seeds: 0,
+            ..EngineConfig::default()
         }
         .sanitized();
         assert_eq!(config.max_peers_per_torrent, 1);
@@ -1641,6 +1944,10 @@ mod tests {
         // 0 — без ограничения, слишком большие значения подрезаются.
         assert_eq!(config.max_active_downloads, 0);
         assert_eq!(config.max_active_seeds, 0);
+        // Прокси по умолчанию выключен, лимиты раздачи тоже.
+        assert!(config.proxy.is_none());
+        assert_eq!(config.seed_ratio_limit, 0.0);
+        assert_eq!(config.seed_time_limit_min, 0);
         let huge = EngineConfig {
             max_active_downloads: 10_000,
             max_active_seeds: 10_000,
@@ -1649,6 +1956,50 @@ mod tests {
         .sanitized();
         assert_eq!(huge.max_active_downloads, MAX_ACTIVE_LIMIT);
         assert_eq!(huge.max_active_seeds, MAX_ACTIVE_LIMIT);
+    }
+
+    #[test]
+    fn config_sanitizes_proxy_and_seed_limits() {
+        let base = EngineConfig::default();
+        for bad in ["ftp://host:21", "socks5://", "", "   ", "не-url"] {
+            let config = EngineConfig {
+                proxy: Some(bad.to_string()),
+                ..base.clone()
+            }
+            .sanitized();
+            assert!(config.proxy.is_none(), "прокси {bad:?} должен отключаться");
+        }
+        let socks = EngineConfig {
+            proxy: Some(" socks5://user:pass@127.0.0.1:1080 ".to_string()),
+            ..base.clone()
+        }
+        .sanitized();
+        assert_eq!(
+            socks.proxy.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        // https-схема тоже допустима: прокси шифрует только туннель.
+        let https = EngineConfig {
+            proxy: Some("https://proxy.local:8443".to_string()),
+            ..base.clone()
+        }
+        .sanitized();
+        assert_eq!(https.proxy.as_deref(), Some("https://proxy.local:8443"));
+        // Отрицательный и NaN ratio — «без ограничения», время не трогаем.
+        let negative = EngineConfig {
+            seed_ratio_limit: -2.5,
+            seed_time_limit_min: 10,
+            ..base.clone()
+        }
+        .sanitized();
+        assert_eq!(negative.seed_ratio_limit, 0.0);
+        assert_eq!(negative.seed_time_limit_min, 10);
+        let nan = EngineConfig {
+            seed_ratio_limit: f64::NAN,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(nan.seed_ratio_limit, 0.0);
     }
 
     #[test]
@@ -1739,5 +2090,57 @@ mod tests {
     #[test]
     fn unix_time_is_positive() {
         assert!(now_unix() > 1_600_000_000);
+    }
+
+    #[test]
+    fn seed_ratio_counts_only_downloaded_bytes() {
+        // Скачано 0 — соотношение неизвестно, показываем ноль.
+        assert_eq!(seed_ratio(5_000, 0), 0.0);
+        assert_eq!(seed_ratio(0, 1_000), 0.0);
+        assert_eq!(seed_ratio(1_500, 1_000), 1.5);
+        // Отдали меньше, чем скачали, — доля меньше единицы.
+        assert!((seed_ratio(250, 1_000) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn seed_limits_trigger_on_ratio_and_time() {
+        let minute = Duration::from_secs(60);
+        // Нулевые лимиты — без ограничений, даже при огромном соотношении.
+        assert!(!seed_limit_hit(0.0, 0, 99.0, minute * 60));
+        // Соотношение: строго по порогу, ниже порога раздаём дальше.
+        assert!(seed_limit_hit(2.0, 0, 2.0, Duration::ZERO));
+        assert!(!seed_limit_hit(2.0, 0, 1.99, Duration::ZERO));
+        // Время: сравниваем с лимитом в минутах.
+        assert!(seed_limit_hit(0.0, 30, 0.0, minute * 30));
+        assert!(!seed_limit_hit(
+            0.0,
+            30,
+            0.0,
+            minute * 30 - Duration::from_secs(1)
+        ));
+        // Любой из двух сработавших лимитов достаточен.
+        assert!(seed_limit_hit(1.0, 60, 1.0, Duration::ZERO));
+    }
+
+    #[test]
+    fn seed_meter_stops_and_resets() {
+        let meter = SeedMeter::default();
+        assert!(!meter.limit_reached());
+        assert_eq!(meter.elapsed(), Duration::ZERO);
+        meter.note_seeding();
+        // Повторная отметка не обнуляет уже накопленное время.
+        meter.note_seeding();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(meter.elapsed() > Duration::ZERO);
+        meter.mark_limit_reached();
+        assert!(meter.limit_reached());
+        // Остановка раздачи сбрасывает только счётчик времени, но не флаг.
+        meter.note_stopped();
+        assert_eq!(meter.elapsed(), Duration::ZERO);
+        assert!(meter.limit_reached());
+        // Ручное возобновление снимает флаг.
+        meter.reset();
+        assert!(!meter.limit_reached());
+        assert_eq!(meter.elapsed(), Duration::ZERO);
     }
 }

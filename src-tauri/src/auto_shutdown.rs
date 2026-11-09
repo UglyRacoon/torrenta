@@ -228,6 +228,10 @@ mod tests {
             down_rate: 0.0,
             up_rate: 0.0,
             eta_seconds: None,
+            // P2: счётчик ratio и признак лимита раздачи к тесту отношения не
+            // имеют — берём значения по умолчанию.
+            seed_ratio: 0.0,
+            seed_limit_reached: false,
             wanted_bytes: 1024,
             down_limit_kib: 0,
             up_limit_kib: 0,

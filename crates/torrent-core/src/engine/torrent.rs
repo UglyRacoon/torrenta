@@ -13,8 +13,8 @@ use sha1::{Digest, Sha1};
 
 use super::peer;
 use super::{
-    effective_limit, lk, rd, wr, EngineConfig, EngineEvent, Flags, Limits, Selection, Stats,
-    TorrentHandle, TorrentState, BLOCK_SIZE,
+    effective_limit, lk, rd, wr, EngineConfig, EngineEvent, Flags, HttpClient, Limits, Selection,
+    Stats, TorrentHandle, TorrentState, BLOCK_SIZE,
 };
 use crate::bitfield::Bitfield;
 use crate::metainfo::{InfoHash, Metainfo};
@@ -24,6 +24,16 @@ use crate::tracker::{self, AnnounceEvent, AnnounceRequest, PeerAddr};
 
 /// Период кондуктора: как часто проверяем, нужны ли новые пиры.
 const DRIVE_TICK: Duration = Duration::from_millis(400);
+/// Как часто забираем из DHT найденных пиров.
+const DHT_POLL: Duration = Duration::from_secs(30);
+/// Как часто повторяем `announce_peer` в DHT.
+const DHT_ANNOUNCE: Duration = Duration::from_secs(300);
+/// Пауза цикла веб-сидов, когда качать нечего (нет нужных кусков или пауза).
+const WEB_SEED_IDLE: Duration = Duration::from_secs(5);
+/// Пауза после неудачной попытки, прежде чем пробовать следующий веб-сид.
+const WEB_SEED_RETRY: Duration = Duration::from_secs(5);
+/// Предельное время одной попытки скачать кусок с веб-сида.
+const WEB_SEED_DEADLINE: Duration = Duration::from_secs(90);
 /// Сколько новых соединений открываем за один такт кондуктора.
 const CONNECT_BURST: usize = 8;
 
@@ -32,7 +42,8 @@ const CONNECT_BURST: usize = 8;
 #[derive(Clone)]
 pub(crate) struct Env {
     pub(crate) peer_id: [u8; 20],
-    pub(crate) http: reqwest::Client,
+    /// HTTP-клиент сессии: общий слот, который переживает смену прокси.
+    pub(crate) http: HttpClient,
     pub(crate) config: Arc<std::sync::RwLock<EngineConfig>>,
     pub(crate) port: u16,
     pub(crate) events: broadcast::Sender<EngineEvent>,
@@ -40,6 +51,8 @@ pub(crate) struct Env {
     pub(crate) limits: Arc<std::sync::RwLock<Limits>>,
     /// Общие на сессию ведра лимитов скорости (одно на менеджер торрентов).
     pub(crate) shared: Arc<SharedLimiters>,
+    /// Узел DHT сессии: общий слот на все торренты, `None` — DHT выключен.
+    pub(crate) dht: Arc<std::sync::RwLock<Option<Arc<crate::dht::Dht>>>>,
 }
 
 /// Запрос блока у пира.
@@ -344,6 +357,14 @@ impl Runtime {
         }
         let runtime = self.clone();
         tokio::spawn(async move { runtime.drive_loop().await });
+        // DHT — отдельный цикл: опрос найденных пиров и анонс раздаваемого порта.
+        let runtime = self.clone();
+        tokio::spawn(async move { runtime.dht_loop().await });
+        // Веб-сиды нужны только если в метаинфо они вообще объявлены.
+        if !self.meta.url_list.is_empty() {
+            let runtime = self.clone();
+            tokio::spawn(async move { runtime.web_seed_loop().await });
+        }
     }
 
     pub(crate) fn stopping(&self) -> bool {
@@ -510,6 +531,30 @@ impl Runtime {
         while state.pending.len() > 256 {
             state.pending.pop_back();
         }
+    }
+
+    /// Адреса, которые можно предложить пиру по PEX (BEP 11).
+    ///
+    /// Сначала идут подключённые пиры — они заведомо живые, затем остальные
+    /// известные адреса. Адрес самого получателя не предлагается.
+    pub(crate) fn pex_candidates(&self, exclude: SocketAddr, limit: usize) -> Vec<SocketAddr> {
+        let state = lk(&self.state);
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for peer in state.peers.values() {
+            if peer.addr != exclude && !out.contains(&peer.addr) {
+                out.push(peer.addr);
+            }
+        }
+        for addr in &state.known {
+            if out.len() >= limit {
+                break;
+            }
+            if *addr != exclude && !out.contains(addr) {
+                out.push(*addr);
+            }
+        }
+        out.truncate(limit);
+        out
     }
 
     pub(crate) fn take_candidate(&self) -> Option<SocketAddr> {
@@ -1188,6 +1233,190 @@ impl Runtime {
         }
     }
 
+    /// Цикл DHT: забирает найденных пиров и время от времени анонсирует порт.
+    ///
+    /// Работает и на паузе: найденные адреса просто копятся в списке
+    /// кандидатов, а обмен начнётся после возобновления.
+    async fn dht_loop(self: Arc<Self>) {
+        let mut poll = tokio::time::interval(DHT_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut announce_at = Instant::now();
+        loop {
+            poll.tick().await;
+            if self.stopping() {
+                break;
+            }
+            let Some(node) = rd(&self.env.dht).clone() else {
+                continue;
+            };
+            // DHT отдаёт готовые адреса; кондуктору нужен тип трекера.
+            let found: Vec<PeerAddr> = node
+                .take_peers(&self.meta.info_hash)
+                .into_iter()
+                .map(|addr| PeerAddr {
+                    ip: addr.ip(),
+                    port: addr.port(),
+                })
+                .collect();
+            if !found.is_empty() {
+                self.add_candidates(found);
+            }
+            if Instant::now() < announce_at {
+                continue;
+            }
+            let port = self.env.port;
+            // Порт 0 — входящих подключений нет, анонсировать нечего.
+            if port == 0 {
+                announce_at = Instant::now() + DHT_POLL;
+                continue;
+            }
+            announce_at = Instant::now() + DHT_ANNOUNCE;
+            let hash = self.meta.info_hash;
+            let node = node.clone();
+            // Сетевой раунд `get_peers` — в отдельной задаче, чтобы не
+            // задерживать опрос уже известных пиров.
+            tokio::spawn(async move {
+                let _ = node.announce(hash, port).await;
+            });
+        }
+    }
+
+    /// Цикл веб-сидов (BEP 19): добирает недостающие куски по HTTP.
+    ///
+    /// Кусок занимается у планировщика так же, как под пира, поэтому сеть и
+    /// веб-сид не качают одно и то же. Работаем по одному куску за раз:
+    /// серверы из `url-list` обычно узкие, а параллельность внутри одного
+    /// сервера настраивается в `web_seed::WebSeedConfig`.
+    async fn web_seed_loop(self: Arc<Self>) {
+        let mut proxy = rd(&self.env.config).proxy.clone();
+        let mut seeds = self.web_seeds(proxy.as_deref());
+        let mut next_seed = 0usize;
+        loop {
+            if self.stopping() {
+                return;
+            }
+            let (enabled, proxy_now) = {
+                let config = rd(&self.env.config);
+                (config.web_seeds, config.proxy.clone())
+            };
+            // Выключили на ходу — не выходим: настройку могут вернуть обратно.
+            if !enabled {
+                tokio::time::sleep(WEB_SEED_IDLE).await;
+                continue;
+            }
+            if proxy_now != proxy {
+                proxy = proxy_now;
+                seeds = self.web_seeds(proxy.as_deref());
+                next_seed = 0;
+            }
+            if seeds.is_empty() {
+                return;
+            }
+            if self.flags.paused() {
+                tokio::time::sleep(WEB_SEED_IDLE).await;
+                continue;
+            }
+            // Лимит скорости загрузки общий для пиров и веб-сидов: если ведро
+            // пустое, ждём, а не качаем мимо лимита.
+            let block = BLOCK_SIZE as usize;
+            let piece_blocks = (self.meta.info.piece_length as usize).div_ceil(block);
+            if self.seed_download_budget(piece_blocks) == 0 {
+                tokio::time::sleep(WEB_SEED_IDLE).await;
+                continue;
+            }
+            let Some(index) = self.claim_seed_piece() else {
+                if self.is_complete() {
+                    return;
+                }
+                tokio::time::sleep(WEB_SEED_IDLE).await;
+                continue;
+            };
+            let Some((offset, len)) = self.piece_window(index) else {
+                lk(&self.state).picker.release(index as usize);
+                tokio::time::sleep(WEB_SEED_IDLE).await;
+                continue;
+            };
+            let seed = &seeds[next_seed % seeds.len()];
+            let fetched =
+                tokio::time::timeout(WEB_SEED_DEADLINE, seed.fetch_range(offset, len)).await;
+            let data = match fetched {
+                Ok(Ok(data)) if data.len() == len as usize => data,
+                // Сервер не отдал кусок целиком: возвращаем его в пул и
+                // пробуем следующий — возможно, он отзывчивее.
+                _ => {
+                    lk(&self.state).picker.release(index as usize);
+                    next_seed = next_seed.wrapping_add(1);
+                    tokio::time::sleep(WEB_SEED_RETRY).await;
+                    continue;
+                }
+            };
+            match self.complete_piece(index, &data) {
+                Ok(true) => {}
+                // Хэш не сошёлся: кусок уже отложен планировщиком с паузой.
+                Ok(false) => next_seed = next_seed.wrapping_add(1),
+                Err(message) => {
+                    let _ = self.env.events.send(EngineEvent::Error {
+                        id: self.id,
+                        message,
+                    });
+                    tokio::time::sleep(WEB_SEED_RETRY).await;
+                }
+            }
+        }
+    }
+
+    /// Клиенты веб-сидов из `url-list` метаинфо; битые URL молча отбрасываем.
+    fn web_seeds(&self, proxy: Option<&str>) -> Vec<crate::web_seed::WebSeed> {
+        self.meta
+            .url_list
+            .iter()
+            .filter_map(|url| {
+                crate::web_seed::WebSeed::new(url, proxy, crate::web_seed::WebSeedConfig::default())
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// Списывает из лимитов загрузки бюджет одного куска (в блоках по
+    /// [`BLOCK_SIZE`]); `0` означает «ведро пустое, надо подождать».
+    fn seed_download_budget(&self, blocks: usize) -> usize {
+        let (global, local) = {
+            let config = rd(&self.env.config);
+            (config.download_limit_kib, rd(&self.env.limits).down_kib)
+        };
+        grant_download(
+            &self.down_limiter,
+            &self.env.shared.down,
+            global,
+            local,
+            blocks,
+        )
+    }
+
+    /// Занимает у планировщика один нужный кусок под загрузку с веб-сида.
+    fn claim_seed_piece(&self) -> Option<u32> {
+        // Веб-сид отдаёт любой кусок целиком, поэтому «что есть у пира» —
+        // полная карта; дальше решает планировщик (нужные, редкость, паузы).
+        let full = Bitfield::all_set(self.meta.info.piece_count());
+        let mut state = lk(&self.state);
+        state
+            .picker
+            .pick(&full, &HashSet::new())
+            .map(|index| index as u32)
+    }
+
+    /// Смещение куска в файле и его длина (последний кусок короче остальных).
+    fn piece_window(&self, index: u32) -> Option<(u64, u32)> {
+        let offset = self.meta.info.piece_offset(index as usize);
+        let total = self.meta.info.total_length;
+        if offset >= total {
+            return None;
+        }
+        let len = (total - offset).min(u64::from(self.meta.info.piece_length));
+        let len = u32::try_from(len).ok().filter(|len| *len > 0)?;
+        Some((offset, len))
+    }
+
     async fn tracker_loop(self: Arc<Self>, url: String) {
         let mut first = true;
         let mut failures: u32 = 0;
@@ -1221,7 +1450,8 @@ impl Runtime {
                 num_want: Some(50),
                 key: None,
             };
-            match tracker::announce(&self.env.http, &url, &request, Duration::from_secs(25)).await {
+            let http = self.env.http.get();
+            match tracker::announce(&http, &url, &request, Duration::from_secs(25)).await {
                 Ok(response) => {
                     first = false;
                     failures = 0;
@@ -1378,9 +1608,9 @@ async fn metadata_task(handle: Arc<TorrentHandle>) {
                     num_want: Some(50),
                     key: None,
                 };
+                let http = handle.env.http.get();
                 if let Ok(response) =
-                    tracker::announce(&handle.env.http, url, &request, Duration::from_secs(20))
-                        .await
+                    tracker::announce(&http, url, &request, Duration::from_secs(20)).await
                 {
                     for peer in response.peers {
                         let addr = SocketAddr::new(peer.ip, peer.port);

@@ -148,6 +148,8 @@ pub struct Metainfo {
     pub info_hash: InfoHash,
     /// Сырые байты bencode-словаря `info` (нужны для magnet/metadata и DHT).
     pub raw_info: Vec<u8>,
+    /// HTTP-источники кусков из `url-list` (BEP 19), только `http`/`https`.
+    pub url_list: Vec<String>,
 }
 
 /// Ошибки разбора метаинформации.
@@ -196,6 +198,7 @@ impl Metainfo {
             info,
             info_hash,
             raw_info,
+            url_list: url_list_of(dict),
         })
     }
 
@@ -216,6 +219,9 @@ impl Metainfo {
             info,
             info_hash,
             raw_info: raw_info.to_vec(),
+            // В метаданных magnet-ссылки верхнеуровневых полей нет: `url-list`
+            // может прийти только с полноценным `.torrent`.
+            url_list: Vec::new(),
         })
     }
 
@@ -339,6 +345,17 @@ fn announce_list_of(dict: &BTreeMap<Vec<u8>, Value>) -> Vec<String> {
         }
     }
     out
+}
+
+/// HTTP-источники из `url-list` (BEP 19): строка или список строк.
+///
+/// Разбор и фильтрацию схем делает [`crate::web_seed::parse_url_list`], чтобы
+/// правила «только http/https» жили в одном месте.
+fn url_list_of(dict: &BTreeMap<Vec<u8>, Value>) -> Vec<String> {
+    match dict.get(b"url-list".as_slice()) {
+        Some(value) => crate::web_seed::parse_url_list(value),
+        None => Vec::new(),
+    }
 }
 
 /// Разбирает `info`-словарь из его сырых байтов.
@@ -593,6 +610,52 @@ mod tests {
                 "http://t2.example/announce".to_string(),
             ]
         );
+    }
+
+    /// Торрент с верхнеуровневым `url-list` (BEP 19) произвольной формы.
+    fn torrent_with_url_list(url_list: Value) -> Vec<u8> {
+        bencode::encode(&Value::Dict(BTreeMap::from([
+            (b"info".to_vec(), single_file_info()),
+            (b"url-list".to_vec(), url_list),
+        ])))
+    }
+
+    #[test]
+    fn parses_url_list_as_string_and_as_list() {
+        // Одиночная строка — самая частая форма; пробелы по краям обрезаются.
+        let single = Metainfo::parse(&torrent_with_url_list(Value::string(
+            "  http://seed.example/files/  ",
+        )))
+        .unwrap();
+        assert_eq!(
+            single.url_list,
+            vec!["http://seed.example/files/".to_string()]
+        );
+
+        // Список: не-http схемы, не-строки и дубликаты отбрасываются.
+        let listed = Metainfo::parse(&torrent_with_url_list(Value::List(vec![
+            Value::string("https://cdn.example/torrents/"),
+            Value::string("ftp://bad.example/pub/"),
+            Value::string("http://dup.example/x/"),
+            Value::string("http://dup.example/x/"),
+            Value::int(7),
+        ])))
+        .unwrap();
+        assert_eq!(
+            listed.url_list,
+            vec![
+                "https://cdn.example/torrents/".to_string(),
+                "http://dup.example/x/".to_string(),
+            ]
+        );
+
+        // Без поля список пуст, и из сырых байтов info (magnet) он не появляется.
+        let without = Metainfo::parse(&single_file_torrent()).unwrap();
+        assert!(without.url_list.is_empty());
+        let from_raw =
+            Metainfo::from_raw_info(&bencode::encode(&single_file_info()), Vec::new(), None)
+                .unwrap();
+        assert!(from_raw.url_list.is_empty());
     }
 
     #[test]

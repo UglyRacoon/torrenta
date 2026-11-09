@@ -70,6 +70,14 @@ function plausibleSize(seed: string): number {
   return Math.round((0.8 + (value % 3400) / 1000) * GB);
 }
 
+/**
+ * Соотношение отдано/скачано как в движке (1.6): при нулевом скачивании — 0.0,
+ * поэтому деления на ноль и NaN здесь не бывает.
+ */
+function ratioOf(uploaded: number, downloaded: number): number {
+  return downloaded > 0 ? uploaded / downloaded : 0;
+}
+
 function baseName(name: string): string {
   const cleaned = basename(name).replace(/\.torrent$/i, "").trim();
   return cleaned || "Новый торрент";
@@ -115,6 +123,8 @@ interface FixtureOptions {
   down: number;
   up: number;
   eta: number | null;
+  /** Демо-состояние «лимит раздачи достигнут» (1.6): торрент ждёт ручного возобновления. */
+  seedLimitReached?: boolean;
   minutesAgo: number;
   files: FixtureFile[];
   trackers: string[];
@@ -155,6 +165,8 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     down_limit_kib: 0,
     up_limit_kib: 0,
     eta_seconds: options.eta,
+    seed_ratio: ratioOf(options.uploaded, options.downloaded),
+    seed_limit_reached: options.seedLimitReached ?? false,
     save_path: DOWNLOADS,
     added_at: Math.floor(now / 1000) - options.minutesAgo * 60,
     files,
@@ -374,6 +386,41 @@ function buildFixtures(now: number): TorrentSnapshot[] {
       },
       now,
     ),
+    // Раздача остановлена лимитом (1.6): скачано всё, ratio упёрся в предел,
+    // движок поставил торрент на паузу — ждём ручного возобновления.
+    fixture(
+      {
+        id: 7,
+        name: "archlinux-2024.11.01-x86_64.iso",
+        seed: "arch-linux-2024-11",
+        state: "paused",
+        total: 1_080_000_000,
+        downloaded: 1_080_000_000,
+        uploaded: 2_160_000_000,
+        pieces: 515,
+        piecesHave: 515,
+        peersConnected: 0,
+        peersKnown: 12,
+        down: 0,
+        up: 0,
+        eta: null,
+        seedLimitReached: true,
+        minutesAgo: 3 * 24 * 60,
+        files: [
+          {
+            path: "archlinux-2024.11.01-x86_64.iso",
+            length: 1_079_999_744,
+            downloaded: 1_079_999_744,
+          },
+        ],
+        trackers: [
+          "udp://tracker.opentrackr.org:1337/announce",
+          "https://mirrors.kernel.org/archlinux/iso/announce",
+        ],
+        peers: [],
+      },
+      now,
+    ),
   ];
 }
 
@@ -460,13 +507,21 @@ export async function createMockApi(): Promise<EngineApi> {
     watch_dir: "",
     notify_on_complete: true,
     restore_session: true,
+    dht: true,
+    pex: true,
+    dht_port: 0,
+    proxy: "",
+    port_mapping: true,
+    web_seeds: true,
+    seed_ratio_limit: 0,
+    seed_time_limit_min: 0,
     theme: "dark",
   };
 
   const app: AppInfoDto = {
     name: "Torrenta",
-    version: "1.3.0",
-    engine: "torrent-core 0.2.0",
+    version: "1.6.0",
+    engine: "torrent-core 1.6.0",
     listen_port: 51413,
     platform: "windows",
   };
@@ -866,6 +921,11 @@ export async function createMockApi(): Promise<EngineApi> {
         torrent.uploaded_bytes += (torrent.up_rate * TICK_MS) / 1000;
       }
     }
+    // Ratio (1.6) считается движком на каждом тике: после любых изменений
+    // отданного/скачанного снимок отдаёт актуальное значение.
+    for (const torrent of torrents) {
+      torrent.seed_ratio = ratioOf(torrent.uploaded_bytes, torrent.downloaded_bytes);
+    }
     emit();
   }
 
@@ -922,6 +982,8 @@ export async function createMockApi(): Promise<EngineApi> {
       down_limit_kib: 0,
       up_limit_kib: 0,
       eta_seconds: null,
+      seed_ratio: 0,
+      seed_limit_reached: false,
       save_path: options.savePath ?? settings.download_dir,
       added_at: Math.floor(Date.now() / 1000),
       files,
@@ -1171,6 +1233,8 @@ export async function createMockApi(): Promise<EngineApi> {
       }
       // Возобновление тоже отменяет отсчёт автовыключения.
       cancelPending();
+      // Ручное возобновление снимает лимит раздачи: движок начинает счёт заново (1.6).
+      torrent.seed_limit_reached = false;
       // Из ошибки возвращаемся в загрузку: движок заново опрашивает трекер.
       if (torrent.state === "error") {
         torrent.error = null;
@@ -1238,6 +1302,8 @@ export async function createMockApi(): Promise<EngineApi> {
         if (torrent.state !== "paused") {
           continue;
         }
+        // «Продолжить все» тоже снимает лимит раздачи (1.6).
+        torrent.seed_limit_reached = false;
         if (torrent.total_bytes <= 0) {
           torrent.state = "metadata";
           continue;
@@ -1302,6 +1368,19 @@ export async function createMockApi(): Promise<EngineApi> {
       settings.watch_dir = String(next.watch_dir ?? "").trim();
       settings.notify_on_complete = Boolean(next.notify_on_complete);
       settings.restore_session = Boolean(next.restore_session);
+      // 1.6: сеть (DHT, PEX, проброс порта, web seeds, прокси) и лимиты раздачи.
+      settings.dht = Boolean(next.dht);
+      settings.pex = Boolean(next.pex);
+      settings.port_mapping = Boolean(next.port_mapping);
+      settings.web_seeds = Boolean(next.web_seeds);
+      const dhtPort = Math.round(Number(next.dht_port) || 0);
+      settings.dht_port = dhtPort >= 0 && dhtPort <= 65535 ? dhtPort : 0;
+      settings.proxy = String(next.proxy ?? "").trim();
+      settings.seed_ratio_limit = Math.max(0, Number(next.seed_ratio_limit) || 0);
+      settings.seed_time_limit_min = Math.min(
+        4_294_967_295,
+        Math.max(0, Math.round(Number(next.seed_time_limit_min) || 0)),
+      );
       if (!settings.auto_shutdown) {
         autoPending = null;
       }

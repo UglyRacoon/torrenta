@@ -112,6 +112,9 @@ impl AppStateDto {
             torrent.wanted_bytes.hash(&mut significant);
             torrent.down_limit_kib.hash(&mut significant);
             torrent.up_limit_kib.hash(&mut significant);
+            // Переход «лимит раздачи достигнут» виден в интерфейсе (значок на
+            // карточке) и происходит один раз, поэтому это значимое изменение.
+            torrent.seed_limit_reached.hash(&mut significant);
 
             for file in &torrent.files {
                 file.path.hash(&mut significant);
@@ -127,6 +130,9 @@ impl AppStateDto {
             torrent.down_rate.to_bits().hash(&mut dynamic);
             torrent.up_rate.to_bits().hash(&mut dynamic);
             torrent.eta_seconds.hash(&mut dynamic);
+            // Ratio растёт почти каждый тик, как и скорости: без него счётчик в
+            // интерфейсе «замирал» бы до следующего значимого изменения.
+            torrent.seed_ratio.to_bits().hash(&mut dynamic);
         }
 
         StateFingerprint {
@@ -379,6 +385,10 @@ mod tests {
             down_rate: 0.0,
             up_rate: 0.0,
             eta_seconds: None,
+            // P2: счётчик ratio и признак «лимит раздачи достигнут» приходят из
+            // движка, у нового торрента они нулевые.
+            seed_ratio: 0.0,
+            seed_limit_reached: false,
             wanted_bytes: 1024,
             down_limit_kib: 0,
             up_limit_kib: 0,
@@ -459,6 +469,26 @@ mod tests {
 
         assert_eq!(a.fingerprints().significant, b.fingerprints().significant);
         assert_ne!(a.fingerprints().dynamic, b.fingerprints().dynamic);
+    }
+
+    #[test]
+    fn seed_ratio_lands_in_dynamic_and_limit_flag_is_significant() {
+        // Ratio растёт на каждом тике — он должен попадать в живую часть, иначе
+        // счётчик в интерфейсе не обновлялся бы.
+        let a = state_with(vec![torrent(1, TorrentState::Seeding)]);
+        let mut b = a.clone();
+        b.torrents[0].seed_ratio = 1.25;
+        assert_eq!(a.fingerprints().significant, b.fingerprints().significant);
+        assert_ne!(a.fingerprints().dynamic, b.fingerprints().dynamic);
+
+        // Достижение лимита раздачи — разовое событие, его место в значимой
+        // части: интерфейс должен показать значок, даже если скорости нулевые.
+        let mut limited = a.clone();
+        limited.torrents[0].seed_limit_reached = true;
+        assert_ne!(
+            a.fingerprints().significant,
+            limited.fingerprints().significant
+        );
     }
 
     #[test]

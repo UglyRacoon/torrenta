@@ -31,6 +31,12 @@ pub const MAX_ACTIVE_LIMIT: u32 = 100;
 pub const MAX_RATE_LIMIT_KIB: u32 = 1_048_576;
 /// Верхняя граница listen-порта: `0` означает «выбрать свободный».
 pub const MAX_LISTEN_PORT: u16 = u16::MAX;
+/// Схемы прокси, которые принимает приложение (в нижнем регистре).
+///
+/// Список повторяет разбор движка ([`torrent_core::proxy::ProxyConfig::parse`]):
+/// приложение не придумывает собственных правил, поэтому всё, что понимает
+/// движок, сохраняется без изменений, и наоборот.
+pub const PROXY_SCHEMES: [&str; 4] = ["socks5://", "socks5h://", "http://", "https://"];
 /// Допустимые темы оформления.
 pub const THEMES: [&str; 2] = ["dark", "light"];
 /// Тема оформления по умолчанию.
@@ -40,7 +46,12 @@ pub const DEFAULT_THEME: &str = "dark";
 ///
 /// Все поля в `snake_case` — это контракт с фронтендом, договорённый в
 /// `docs/PRODUCT.md` / задаче; переименовывать их без согласования нельзя.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Eq` не выводится сознательно: среди полей есть `f64` (`seed_ratio_limit`),
+/// а сравнение чисел с плавающей точкой на равенство некорректно (`NaN`).
+/// Сравнение настроек идёт через `PartialEq`, а `Hash` для отпечатков
+/// состояния реализован вручную (см. ниже).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SettingsDto {
     /// Каталог, куда сохраняются данные торрентов. Абсолютный путь.
@@ -59,8 +70,35 @@ pub struct SettingsDto {
     pub upload_limit_kib: u32,
     /// Порт для входящих подключений, `0` — свободный порт.
     pub listen_port: u16,
+    /// Включить DHT (BEP 5): поиск пиров без трекера.
+    pub dht: bool,
+    /// UDP-порт DHT, `0` — любой свободный.
+    ///
+    /// Порт DHT не связан с [`SettingsDto::listen_port`] из TCP: движок слушает
+    /// его отдельным UDP-сокетом, и нулевое значение выбирает свободный порт.
+    pub dht_port: u16,
+    /// Включить PEX (BEP 11): обмен пирами через подключённых соседей.
+    pub pex: bool,
+    /// Прокси для исходящих TCP-соединений; пустая строка — прокси выключен.
+    ///
+    /// Поддерживаются схемы `socks5://`, `http://` и `https://`, дальше обязателен
+    /// `хост:порт`; логин и пароль необязательны и пишутся перед хостом через `@`
+    /// (`socks5://user:pass@127.0.0.1:1080`). Строка неверного формата не ломает
+    /// настройки: нормализация сбрасывает её в пустую и пишет причину в лог.
+    pub proxy: String,
+    /// Пробрасывать порт на роутере через UPnP-IGD или NAT-PMP.
+    pub port_mapping: bool,
+    /// Использовать web seeds из `url-list` торрента (BEP 19).
+    pub web_seeds: bool,
     /// Раздавать после завершения загрузки.
     pub seed_after_complete: bool,
+    /// Останавливать раздачу при достижении ratio `N` (`0` — без ограничения).
+    ///
+    /// Раздача прекращается, когда отдано не меньше `N` объёма загрузки; значение
+    /// меньше нуля и `NaN`/бесконечность считаются выключенным ограничением.
+    pub seed_ratio_limit: f64,
+    /// Останавливать раздачу через N минут после завершения (`0` — без ограничения).
+    pub seed_time_limit_min: u32,
     /// Выключать компьютер, когда все загрузки завершены.
     ///
     /// Само выключение выполняет наблюдатель движка (см. `auto_shutdown`),
@@ -102,6 +140,41 @@ pub struct SettingsDto {
     pub theme: String,
 }
 
+/// Хеш настроек для отпечатков состояния (см. `AppStateDto::fingerprints`).
+///
+/// Реализован вручную, потому что `Hash` нельзя вывести вместе с `f64`-полем:
+/// для `seed_ratio_limit` хешируются биты. `Eq` при этом не реализуется —
+/// для чисел с плавающей точкой сравнение на равенство даёт `false` для `NaN`,
+/// а хеш нужен только как «отпечаток изменившихся настроек».
+impl std::hash::Hash for SettingsDto {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.download_dir.hash(state);
+        self.max_peers.hash(state);
+        self.max_active_downloads.hash(state);
+        self.max_active_seeds.hash(state);
+        self.download_limit_kib.hash(state);
+        self.upload_limit_kib.hash(state);
+        self.listen_port.hash(state);
+        self.dht.hash(state);
+        self.dht_port.hash(state);
+        self.pex.hash(state);
+        self.proxy.hash(state);
+        self.port_mapping.hash(state);
+        self.web_seeds.hash(state);
+        self.seed_after_complete.hash(state);
+        self.seed_ratio_limit.to_bits().hash(state);
+        self.seed_time_limit_min.hash(state);
+        self.auto_shutdown.hash(state);
+        self.autostart.hash(state);
+        self.start_minimized.hash(state);
+        self.close_to_tray.hash(state);
+        self.notify_on_complete.hash(state);
+        self.watch_dir.hash(state);
+        self.restore_session.hash(state);
+        self.theme.hash(state);
+    }
+}
+
 impl Default for SettingsDto {
     fn default() -> Self {
         Self {
@@ -112,7 +185,15 @@ impl Default for SettingsDto {
             download_limit_kib: 0,
             upload_limit_kib: 0,
             listen_port: 0,
+            dht: true,
+            dht_port: 0,
+            pex: true,
+            proxy: String::new(),
+            port_mapping: true,
+            web_seeds: true,
             seed_after_complete: true,
+            seed_ratio_limit: 0.0,
+            seed_time_limit_min: 0,
             auto_shutdown: false,
             autostart: false,
             start_minimized: false,
@@ -146,6 +227,10 @@ impl SettingsDto {
         self.max_active_seeds = clamp_active(self.max_active_seeds);
         self.download_limit_kib = clamp_rate(self.download_limit_kib);
         self.upload_limit_kib = clamp_rate(self.upload_limit_kib);
+        self.proxy = normalize_proxy(&self.proxy);
+        self.seed_ratio_limit = normalize_seed_ratio(self.seed_ratio_limit);
+        // `dht_port` и `seed_time_limit_min` зажимать не нужно: их типы (`u16`
+        // и `u32`) и есть допустимый диапазон, а `0` — законное «без значения».
         self.theme = normalize_theme(&self.theme);
     }
 
@@ -183,6 +268,51 @@ pub fn normalize_theme(raw: &str) -> String {
         lowered
     } else {
         DEFAULT_THEME.to_string()
+    }
+}
+
+/// Приводит лимит ratio к неотрицательному конечному числу.
+///
+/// `0.0` означает «без ограничения». Отрицательное число, `NaN` и бесконечность
+/// не имеют смысла и могли попасть в `settings.json` только правкой вручную,
+/// поэтому молча становятся `0.0`: из-за опечатки в одном числе приложение не
+/// должно терять остальные настройки.
+pub fn normalize_seed_ratio(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+/// Приводит строку прокси к пригодному виду.
+///
+/// Пустая строка — прокси выключен. Строка обрезается по краям и проверяется
+/// разбором движка ([`torrent_core::proxy::ProxyConfig::parse`]), поэтому
+/// правила приложения и движка не расходятся: допустимы схемы из
+/// [`PROXY_SCHEMES`], логин и пароль пишутся перед хостом через `@`
+/// (`socks5://логин:пароль@хост:порт`), порт можно опустить — движок подставит
+/// 1080 для SOCKS5 и 8080 для HTTP. Строка неверного формата сбрасывается в
+/// пустую, чтобы опечатка не оставила пользователя без сети, а причина уходит
+/// в лог.
+pub fn normalize_proxy(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Разбор общий с движком: `torrent_core::proxy::ProxyConfig::parse` уже
+    // проверяет схему, хост и порт и возвращает причину на русском.
+    match torrent_core::proxy::ProxyConfig::parse(trimmed) {
+        Ok(_) => trimmed.to_string(),
+        Err(err) => {
+            eprintln!(
+                "[torrenta] прокси «{trimmed}» отключён: {err}; поддерживаются схемы {} \
+                 (логин:пароль@ необязателен, порт по умолчанию — 1080 у SOCKS5 и 8080 у HTTP)",
+                PROXY_SCHEMES.join(", ")
+            );
+            String::new()
+        }
     }
 }
 
@@ -293,6 +423,19 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
         seed_after_complete: dto.seed_after_complete,
         max_active_downloads: dto.max_active_downloads as usize,
         max_active_seeds: dto.max_active_seeds as usize,
+        dht: dto.dht,
+        dht_port: dto.dht_port,
+        pex: dto.pex,
+        web_seeds: dto.web_seeds,
+        // Пустая строка в настройках — «прокси выключен», движок ждёт `None`.
+        proxy: if dto.proxy.is_empty() {
+            None
+        } else {
+            Some(dto.proxy.clone())
+        },
+        port_mapping: dto.port_mapping,
+        seed_ratio_limit: dto.seed_ratio_limit,
+        seed_time_limit_min: dto.seed_time_limit_min,
     }
 }
 
@@ -311,7 +454,19 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         download_limit_kib: clamp_rate(config.download_limit_kib),
         upload_limit_kib: clamp_rate(config.upload_limit_kib),
         listen_port: config.listen_port,
+        dht: config.dht,
+        dht_port: config.dht_port,
+        pex: config.pex,
+        // Движок хранит прокси как `Option<String>`: `None` — выключено, а в
+        // настройках это пустая строка. Значение движка уже проверено в
+        // `EngineConfig::sanitized`, но нормализация здесь бесплатна и держит
+        // инвариант DTO.
+        proxy: normalize_proxy(config.proxy.as_deref().unwrap_or("")),
+        port_mapping: config.port_mapping,
+        web_seeds: config.web_seeds,
         seed_after_complete: config.seed_after_complete,
+        seed_ratio_limit: normalize_seed_ratio(config.seed_ratio_limit),
+        seed_time_limit_min: config.seed_time_limit_min,
         max_active_downloads: clamp_active(
             u32::try_from(config.max_active_downloads).unwrap_or(MAX_ACTIVE_LIMIT),
         ),
@@ -445,6 +600,17 @@ mod tests {
             download_limit_kib: 4096,
             upload_limit_kib: 512,
             listen_port: 51413,
+            // P2-поля пока не входят в `EngineConfig`, поэтому в образце они
+            // остаются по умолчанию; их поведение проверяют отдельные тесты
+            // (`p2_*`), где значения заведомо отличаются от дефолтных.
+            dht: true,
+            dht_port: 0,
+            pex: true,
+            proxy: String::new(),
+            port_mapping: true,
+            web_seeds: true,
+            seed_ratio_limit: 0.0,
+            seed_time_limit_min: 0,
             seed_after_complete: false,
             auto_shutdown: true,
             autostart: true,
@@ -489,6 +655,14 @@ mod tests {
             download_limit_kib: u32::MAX,
             upload_limit_kib: MAX_RATE_LIMIT_KIB + 1,
             listen_port: 65_535,
+            dht: false,
+            dht_port: 54_321,
+            pex: false,
+            proxy: "  socks5://127.0.0.1:1080  ".to_string(),
+            port_mapping: false,
+            web_seeds: false,
+            seed_ratio_limit: 3.0,
+            seed_time_limit_min: 120,
             seed_after_complete: true,
             auto_shutdown: true,
             autostart: false,
@@ -509,6 +683,16 @@ mod tests {
         assert_eq!(dto.upload_limit_kib, MAX_RATE_LIMIT_KIB);
         assert_eq!(dto.theme, "light");
         assert!(dto.auto_shutdown);
+        assert_eq!(
+            dto.proxy, "socks5://127.0.0.1:1080",
+            "прокси обрезается по краям и сохраняется"
+        );
+        assert_eq!(dto.seed_ratio_limit, 3.0, "положительный ratio не трогаем");
+        assert_eq!(
+            dto.dht_port, 54_321,
+            "порт DHT — любой u16, зажимать нечего"
+        );
+        assert_eq!(dto.seed_time_limit_min, 120);
 
         let mut dto = SettingsDto {
             max_peers: MAX_PEERS_LIMIT + 100,
@@ -640,6 +824,8 @@ mod tests {
             seed_after_complete: true,
             max_active_downloads: usize::MAX,
             max_active_seeds: 5000,
+            // Поля P2 к этому тесту отношения не имеют: берём значения движка.
+            ..EngineConfig::default()
         };
         let dto = from_engine_config(&config, "unknown", false);
         assert_eq!(dto.max_peers, MAX_PEERS_LIMIT);
@@ -663,6 +849,61 @@ mod tests {
         assert_eq!(dto.max_peers, 1);
         assert_eq!(dto.max_active_downloads, 0);
         assert_eq!(dto.max_active_seeds, 0);
+    }
+
+    #[test]
+    fn p2_settings_reach_engine_config() {
+        // Поля P2 должны доезжать до движка, а не подменяться значениями по
+        // умолчанию: иначе настройки «сохраняются», но ни на что не влияют.
+        let dto = SettingsDto {
+            dht: false,
+            dht_port: 6881,
+            pex: false,
+            web_seeds: false,
+            proxy: "socks5://user:pass@127.0.0.1:1080".to_string(),
+            port_mapping: false,
+            seed_ratio_limit: 1.5,
+            seed_time_limit_min: 240,
+            ..SettingsDto::default()
+        }
+        .normalized();
+
+        let config = to_engine_config(&dto);
+        assert!(!config.dht, "DHT не доехал до движка");
+        assert_eq!(config.dht_port, 6881);
+        assert!(!config.pex, "PEX не доехал до движка");
+        assert!(!config.web_seeds, "web seeds не доехали до движка");
+        assert_eq!(
+            config.proxy.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080"),
+            "прокси не доехал до движка"
+        );
+        assert!(!config.port_mapping, "проброс порта не доехал до движка");
+        assert_eq!(config.seed_ratio_limit, 1.5);
+        assert_eq!(config.seed_time_limit_min, 240);
+
+        // Обратное преобразование возвращает те же значения, а не заглушки.
+        let back = from_engine_config(&config, DEFAULT_THEME, false);
+        assert!(!back.dht);
+        assert_eq!(back.dht_port, 6881);
+        assert!(!back.pex);
+        assert!(!back.web_seeds);
+        assert_eq!(back.proxy, "socks5://user:pass@127.0.0.1:1080");
+        assert!(!back.port_mapping);
+        assert_eq!(back.seed_ratio_limit, 1.5);
+        assert_eq!(back.seed_time_limit_min, 240);
+
+        // Пустая строка настроек — это `None` для движка (прокси выключен),
+        // и обратно в настройки она возвращается пустой строкой.
+        let disabled = to_engine_config(&SettingsDto::default().normalized());
+        assert_eq!(disabled.proxy, None, "пустая строка — прокси выключен");
+        assert_eq!(disabled.seed_ratio_limit, 0.0, "0.0 — без ограничения");
+        assert_eq!(disabled.seed_time_limit_min, 0);
+        assert_eq!(disabled.dht_port, 0, "0 — свободный UDP-порт для DHT");
+        assert!(disabled.dht && disabled.pex && disabled.web_seeds && disabled.port_mapping);
+        assert!(from_engine_config(&disabled, DEFAULT_THEME, false)
+            .proxy
+            .is_empty());
     }
 
     #[test]
@@ -793,6 +1034,244 @@ mod tests {
 
         let loaded = load(&path, Path::new("C:\\Fallback"));
         assert_eq!(loaded, dto);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p2_fields_default_to_enabled() {
+        let dto = SettingsDto::default();
+        assert!(dto.dht, "DHT включён по умолчанию");
+        assert_eq!(dto.dht_port, 0, "порт DHT по умолчанию — любой свободный");
+        assert!(dto.pex, "PEX включён по умолчанию");
+        assert!(dto.proxy.is_empty(), "прокси по умолчанию выключен");
+        assert!(dto.port_mapping, "проброс порта включён по умолчанию");
+        assert!(dto.web_seeds, "web seeds включены по умолчанию");
+        assert_eq!(
+            dto.seed_ratio_limit, 0.0,
+            "лимит ratio по умолчанию выключен"
+        );
+        assert_eq!(
+            dto.seed_time_limit_min, 0,
+            "лимит времени раздачи по умолчанию выключен"
+        );
+    }
+
+    #[test]
+    fn p2_fields_use_snake_case_keys_and_survive_roundtrip() {
+        let dir = test_dir("p2-keys");
+        let path = settings_path(&dir);
+        let dto = SettingsDto {
+            download_dir: "C:\\Fallback".to_string(),
+            dht: false,
+            dht_port: 6881,
+            pex: false,
+            proxy: "socks5://user:pass@127.0.0.1:1080".to_string(),
+            port_mapping: false,
+            web_seeds: false,
+            seed_ratio_limit: 2.5,
+            seed_time_limit_min: 120,
+            ..SettingsDto::default()
+        };
+        save(&path, &dto).expect("настройки должны сохраняться");
+
+        let text = fs::read_to_string(&path).expect("файл настроек должен читаться");
+        for expected in [
+            "\"dht\": false",
+            "\"dht_port\": 6881",
+            "\"pex\": false",
+            "\"port_mapping\": false",
+            "\"web_seeds\": false",
+            "\"seed_ratio_limit\": 2.5",
+            "\"seed_time_limit_min\": 120",
+        ] {
+            assert!(text.contains(expected), "нет ключа {expected}: {text}");
+        }
+        assert!(
+            text.contains("\"proxy\": \"socks5://user:pass@127.0.0.1:1080\""),
+            "нет ключа прокси: {text}"
+        );
+
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert_eq!(loaded, dto, "поля P2 должны пережить сохранение и чтение");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_seed_ratio_drops_negative_and_nan() {
+        // Недопустимые значения превращаются в «без ограничения», а не ломают
+        // остальные настройки.
+        assert_eq!(normalize_seed_ratio(-1.5), 0.0);
+        assert_eq!(normalize_seed_ratio(f64::NAN), 0.0);
+        assert_eq!(normalize_seed_ratio(f64::INFINITY), 0.0);
+        assert_eq!(normalize_seed_ratio(f64::NEG_INFINITY), 0.0);
+        assert_eq!(normalize_seed_ratio(-0.0), 0.0);
+        // Положительное значение — законный лимит ratio.
+        assert_eq!(normalize_seed_ratio(1.5), 1.5);
+
+        let mut dto = SettingsDto {
+            seed_ratio_limit: -3.0,
+            ..SettingsDto::default()
+        };
+        dto.normalize();
+        assert_eq!(dto.seed_ratio_limit, 0.0, "отрицательный ratio обнуляется");
+
+        let mut dto = SettingsDto {
+            seed_ratio_limit: f64::NAN,
+            ..SettingsDto::default()
+        };
+        dto.normalize();
+        assert_eq!(dto.seed_ratio_limit, 0.0, "NaN не должен попасть в файл");
+        assert_eq!(
+            dto.clone().normalized(),
+            dto,
+            "после исправления нормализация идемпотентна"
+        );
+    }
+
+    #[test]
+    fn normalize_proxy_keeps_valid_and_drops_broken() {
+        // Валидные строки сохраняются (по краям обрезаются). Правила — те же,
+        // что у движка: `torrent_core::proxy::ProxyConfig::parse`.
+        for spec in [
+            "socks5://127.0.0.1:1080",
+            "  socks5://127.0.0.1:1080  ",
+            "http://proxy.local:3128",
+            "https://proxy.local:8443",
+            "SOCKS5://user:pass@127.0.0.1:1080",
+            "socks5://user:pass@127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+            "socks5://[::1]:1080",
+            // Порт можно опустить: движок подставит 1080 для SOCKS5 и 8080 для
+            // HTTP, поэтому такие строки не считаем опечаткой.
+            "socks5://127.0.0.1",
+            "http://proxy.local",
+            // Путь движок игнорирует (см. `ProxyConfig::parse`), так что строка
+            // не ломается даже если пользователь скопировал её из браузера.
+            "http://proxy.local:3128/path",
+            // Логин без пароля движок принимает — не придумываем правил строже.
+            "socks5://user@127.0.0.1:1080",
+        ] {
+            assert_eq!(
+                normalize_proxy(spec),
+                spec.trim(),
+                "прокси «{spec}» должен сохраниться"
+            );
+        }
+
+        // Опечатка не должна оставлять пользователя без сети: строка
+        // сбрасывается в пустую (прокси выключен).
+        for spec in [
+            "127.0.0.1:1080",
+            "socks4://127.0.0.1:1080",
+            "proxy.local:3128",
+            "socks5://",
+            "socks5://127.0.0.1:0",
+            "socks5://127.0.0.1:port",
+            "socks5://127.0.0.1:99999",
+            "socks5://:1080",
+            "socks5://::1:1080",
+            "socks5://127.0.0.1:1080 с пробелом",
+        ] {
+            assert!(
+                normalize_proxy(spec).is_empty(),
+                "прокси «{spec}» должен отбрасываться"
+            );
+        }
+
+        assert!(normalize_proxy("").is_empty(), "пустая строка — выключено");
+        assert!(
+            normalize_proxy("   ").is_empty(),
+            "пробелы — тоже выключено"
+        );
+
+        // Нормализация полного DTO отбрасывает негодный прокси, но сохраняет
+        // остальные настройки нетронутыми.
+        let mut dto = SettingsDto {
+            proxy: "socks4://127.0.0.1:1080".to_string(),
+            max_peers: 77,
+            ..SettingsDto::default()
+        };
+        dto.normalize();
+        assert!(dto.proxy.is_empty());
+        assert_eq!(dto.max_peers, 77);
+    }
+
+    #[test]
+    fn serialized_settings_have_exactly_the_contract_keys() {
+        // Контракт с фронтендом: JSON — плоский объект с snake_case-ключами и
+        // без «лишних» полей (лишний ключ — повод для несовпадения версий).
+        let value = serde_json::to_value(SettingsDto::default())
+            .expect("настройки должны сериализоваться в JSON");
+        let object = value.as_object().expect("настройки — JSON-объект");
+        let mut actual: Vec<&str> = object.keys().map(String::as_str).collect();
+        actual.sort_unstable();
+
+        let mut expected = vec![
+            "auto_shutdown",
+            "autostart",
+            "close_to_tray",
+            "dht",
+            "dht_port",
+            "download_dir",
+            "download_limit_kib",
+            "listen_port",
+            "max_active_downloads",
+            "max_active_seeds",
+            "max_peers",
+            "notify_on_complete",
+            "pex",
+            "port_mapping",
+            "proxy",
+            "restore_session",
+            "seed_after_complete",
+            "seed_ratio_limit",
+            "seed_time_limit_min",
+            "start_minimized",
+            "theme",
+            "upload_limit_kib",
+            "watch_dir",
+            "web_seeds",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected, "набор ключей разошёлся с контрактом");
+        for (key, value) in object {
+            assert!(
+                key.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+                "ключ «{key}» не в snake_case"
+            );
+            assert!(!value.is_null(), "поле «{key}» не должно быть null");
+        }
+    }
+
+    #[test]
+    fn old_settings_without_p2_fields_get_p2_defaults() {
+        let dir = test_dir("p2-legacy");
+        let path = settings_path(&dir);
+        // `settings.json` версии 1.5: полей P2 в нём ещё нет.
+        let legacy = r#"{
+  "download_dir": "C:\\Torrents",
+  "max_peers": 60,
+  "listen_port": 51413,
+  "seed_after_complete": true,
+  "theme": "dark"
+}"#;
+        fs::write(&path, legacy).expect("старый settings.json должен записываться");
+
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert!(loaded.dht, "DHT включается по умолчанию");
+        assert_eq!(loaded.dht_port, 0);
+        assert!(loaded.pex, "PEX включается по умолчанию");
+        assert!(loaded.proxy.is_empty(), "прокси выключен");
+        assert!(loaded.port_mapping, "проброс порта включён по умолчанию");
+        assert!(loaded.web_seeds, "web seeds включены по умолчанию");
+        assert_eq!(loaded.seed_ratio_limit, 0.0);
+        assert_eq!(loaded.seed_time_limit_min, 0);
+        // Остальные поля читаются как раньше.
+        assert_eq!(loaded.max_peers, 60);
+        assert_eq!(loaded.listen_port, 51413);
+        assert_eq!(loaded.theme, "dark");
         let _ = fs::remove_dir_all(&dir);
     }
 

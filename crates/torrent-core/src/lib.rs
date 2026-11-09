@@ -18,14 +18,19 @@
 
 pub mod bencode;
 pub mod bitfield;
+pub mod dht;
 pub mod engine;
 pub mod magnet;
 pub mod metainfo;
 pub mod peerid;
+pub mod pex;
 pub mod picker;
+pub mod port_map;
+pub mod proxy;
 pub(crate) mod selection;
 pub mod storage;
 pub mod tracker;
+pub mod web_seed;
 pub mod wire;
 
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};

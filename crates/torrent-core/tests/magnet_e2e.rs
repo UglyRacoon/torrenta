@@ -17,6 +17,8 @@ fn test_config(download_dir: &std::path::Path) -> EngineConfig {
     EngineConfig {
         download_dir: download_dir.to_path_buf(),
         listen_port: 0,
+        // DHT ходит в настоящую сеть — в тестах он не нужен и только шумит.
+        dht: false,
         ..EngineConfig::default()
     }
 }

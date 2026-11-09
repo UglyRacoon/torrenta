@@ -20,6 +20,11 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 | `storage` | `Storage`, `release_writes`/`acquire_writes`/`writes_released`, общий режим доступа к файлам | lead |
 | `picker` | `PiecePicker`, `PieceStatus`, `set_levels`/`level`/`reset_have` | lead |
 | `selection` | `Selection`, `wanted_pieces`, `wanted_downloaded`, `effective_limit`, `piece_levels`/`level_of` (crate-private) | core |
+| `dht` | `Dht`, `DhtConfig`, `DhtStats`, `DhtError`, `DEFAULT_BOOTSTRAP`, `announce`/`take_peers` (BEP 5) | core |
+| `pex` | `PexMessage`, `EXT_PEX`, `encode`, `decode`, `diff` (BEP 11) | core |
+| `port_map` | `MappingProtocol`, `PortMapping`, `PortMapError`, `map_port`, `unmap_port` (UPnP-IGD, NAT-PMP) | core |
+| `proxy` | `ProxyKind`, `ProxyConfig`, `ProxyError`, `parse`, `connect` (SOCKS5 / HTTP CONNECT) | core |
+| `web_seed` | `WebSeed`, `WebSeedConfig`, `WebSeedError`, `parse_url_list` (BEP 19) | core |
 | `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `AddOptions`, `TorrentPreview`, `FilePriority`, `FileView`, `PlanKind`/`plan` (crate-private) | core |
 
 ## `bencode`
@@ -64,6 +69,7 @@ pub struct Info {
 impl Info { pub fn piece_count(&self)->usize; pub fn piece_size(&self,i:usize)->u32; pub fn piece_offset(&self,i:usize)->u64; }
 pub struct Metainfo {
     pub announce: Option<String>, pub announce_list: Vec<String>,
+    pub url_list: Vec<String>,      // 1.6: `url-list` (BEP 19), только http(s)
     pub comment: Option<String>, pub created_by: Option<String>, pub creation_date: Option<i64>,
     pub info: Info, pub info_hash: InfoHash, pub raw_info: Vec<u8>,
 }
@@ -81,6 +87,11 @@ impl Metainfo {
 `path = name`; multi-file (`files`) — путь через `/`, `offset` считается
 последовательно; `pieces` обязана делиться на 20; `private = info.private == 1`;
 `info_hash = sha1(raw_info)`.
+
+`url_list` — ключ `url-list`: строка или список строк, каждая обрезается,
+остаются только `http(s)` с хостом, дубликаты выбрасываются с сохранением
+первого вхождения (разбор — `web_seed::parse_url_list`); отсутствие ключа —
+пустой вектор.
 
 ## `magnet`
 
@@ -172,6 +183,173 @@ announce (action 1), transaction id случайный, таймаут и оди
 - хвост UDP-ответа, не кратный 6, молча обрезается;
 - `failure reason` важнее кривого тела; хвостовые `\n`/пробелы у HTTP-ответа терпим.
 
+## `dht`
+
+```rust
+pub const DEFAULT_BOOTSTRAP: &[&str];   // router.bittorrent.com:6881,
+                                        // dht.transmissionbt.com:6881,
+                                        // router.utorrent.com:6881
+pub struct DhtConfig {
+    pub port: u16,               // 0 = свободный UDP-порт
+    pub bootstrap: Vec<String>,  // пусто = DEFAULT_BOOTSTRAP
+    pub max_nodes: usize,        // по умолчанию 1024
+}
+impl Default for DhtConfig { ... }
+pub struct DhtStats { pub running: bool, pub nodes: usize, pub peer_cache: usize, pub queries: u64, pub responses: u64 }
+pub enum DhtError { Closed, Io, Timeout, Protocol(String), Remote(String) }
+pub struct Dht { /* private */ }
+impl Dht {
+    pub fn new(config: DhtConfig) -> Self;                            // сеть не трогается
+    pub fn node_id(&self) -> [u8; 20];
+    pub async fn start(self: &Arc<Self>) -> std::io::Result<u16>;     // фактический порт
+    pub async fn announce(&self, info_hash: InfoHash, port: u16) -> Result<(), DhtError>;
+    pub fn take_peers(&self, info_hash: &InfoHash) -> Vec<SocketAddr>; // опустошает кэш
+    pub fn stats(&self) -> DhtStats;
+    pub async fn shutdown(&self);
+}
+```
+
+Жизненный цикл: `new` → `start` → `announce`/`take_peers` → `shutdown`. `start`
+идемпотентен (повторный вызов возвращает тот же порт), `shutdown` тоже; после
+остановки `announce` возвращает `DhtError::Closed`, `port == 0` — `Protocol`,
+пустая таблица маршрутизации или молчание всех узлов — `Timeout`. Паники на
+сетевых сбоях нет: если bootstrap не ответил, узел живёт с пустой таблицей.
+`take_peers` забирает накопленные адреса и чистит кэш по этому `info_hash`.
+
+Ограничения (сознательные, чтобы модуль не выглядел полным BEP 5):
+
+* один раунд `get_peers` по ближайшим известным узлам — без итеративного обхода
+  `nodes`;
+* `announce_peer` уходит fire-and-forget, без ожидания полного раунда;
+* токены подписываются статическим секретом;
+* таблица IPv4-only: компактные `nodes` — только IPv4, IPv6-пиры из `values`
+  разбираются, но новых узлов из них не появляется;
+* BEP 42 (secure node id) не поддерживается, защиты от Sybil нет;
+* сообщения `port` (BEP 5 relay) не обрабатываются.
+
+## `pex`
+
+```rust
+pub const EXT_PEX: u8 = 1;    // локальный id ut_pex; лимит — 50 адресов на поле
+pub struct PexMessage { pub added: Vec<SocketAddr>, pub dropped: Vec<SocketAddr> }
+impl PexMessage {
+    pub fn encode(&self) -> Vec<u8>;
+    pub fn decode(payload: &[u8]) -> Result<Self, PexError>;
+    pub fn diff(known: &[SocketAddr], fresh: &[SocketAddr], dropped: &[SocketAddr]) -> PexMessage;
+}
+pub enum PexError {
+    Bencode(String), NotDict, Malformed(&'static str), Truncated(&'static str),
+    TooMany { field: &'static str, count: usize, limit: usize },
+}
+```
+
+Адреса — compact по 6 байт (IPv4). `encode` не пишет пустые поля (пустое
+сообщение — `de`), IPv6 молча отбрасывает, `added.f` заполняет нулями. `decode`
+читает `added`/`dropped`, поля `added6`/`dropped6` игнорирует (IPv6-пиры из PEX
+не попадают); больше 50 адресов в поле — `TooMany`.
+
+`diff(known, fresh, dropped)` — что отправить соседу: дедупликация, не больше 50
+адресов на поле, отбрасываются порт 0, `0.0.0.0`, широковещательные и
+multicast-адреса, IPv6; адрес, попавший и в `fresh`, и в `dropped`, считается
+живым (уходит только в `added`). Loopback и приватные адреса сохраняются: в
+локальной сети они рабочие.
+
+## `web_seed`
+
+```rust
+pub struct WebSeedConfig { pub connect_timeout: Duration, pub read_timeout: Duration, pub max_parallel: usize }
+impl Default for WebSeedConfig { ... }   // 10 с / 30 с / 4
+pub struct WebSeed { /* private */ }
+impl WebSeed {
+    pub fn new(url: &str, proxy: Option<&str>, config: WebSeedConfig) -> Result<Self, WebSeedError>;
+    pub fn url(&self) -> &str;
+    pub async fn fetch_range(&self, offset: u64, len: u32) -> Result<Vec<u8>, WebSeedError>;
+}
+pub fn parse_url_list(value: &bencode::Value) -> Vec<String>;   // значение `url-list`
+pub enum WebSeedError {
+    BadUrl(String), Http(String), Status(u16), ShortBody,
+    RangeMismatch { want: u64, got: u64 }, BadRange { offset: u64, len: u32 }, Timeout,
+}
+```
+
+`new` проверяет схему и хост (`http`/`https`), собирает клиент с `.no_proxy()`
+(прокси передаётся аргументом), не более 5 редиректов.
+
+`fetch_range` запрашивает `Range: bytes=<offset>-<offset+len-1>`:
+
+* `206` — начало `Content-Range` сверяется с `offset` (расхождение —
+  `RangeMismatch`), отсутствующий заголовок означает «доверяем запросу», тело
+  короче `len` — `ShortBody`;
+* `200` — тело читается потоком с пропуском `offset` (буфер 64 КиБ,
+  `read_timeout` на каждое чтение), короткое тело — `ShortBody`;
+* `416` и любой другой статус — `Status(code)`, отдельной ветки для 416 нет;
+* `len == 0` — пустой `Vec` без запроса; нулевой/некорректный диапазон —
+  `BadRange`.
+
+`parse_url_list` принимает строку или список: обрезает, оставляет только
+`http(s)` с хостом, выбрасывает нестроковые элементы и дубликаты (порядок первого
+вхождения сохраняется).
+
+## `proxy`
+
+```rust
+pub enum ProxyKind { Socks5, Http }
+impl ProxyKind { pub fn as_scheme(self) -> &'static str }   // "socks5" | "http"
+pub struct ProxyConfig {
+    pub kind: ProxyKind, pub host: String, pub port: u16,
+    pub username: Option<String>, pub password: Option<String>,
+}
+impl ProxyConfig {
+    pub fn parse(spec: &str) -> Result<Self, ProxyError>;
+    pub fn to_url(&self) -> String;
+}
+pub enum ProxyError { BadScheme(String), BadHost(String), BadPort(String) }
+pub async fn connect(config: &ProxyConfig, target: SocketAddr) -> std::io::Result<TcpStream>;
+```
+
+`parse`: `socks5://` и `socks5h://` → `Socks5`, `http://` и `https://` → `Http`;
+порт по умолчанию 1080/8080; пустая спецификация — `BadScheme`, без хоста —
+`BadHost`, порт 0 — `BadPort`; путь и query игнорируются, пароль без логина
+отбрасывается. `to_url` percent-кодирует userinfo и всегда пишет схему из
+`ProxyKind`, поэтому `https://`-спецификация сериализуется как `http://`.
+
+`connect` — TCP до прокси (12 с) и рукопожатие (15 с), затем `set_nodelay`:
+
+* SOCKS5 (RFC 1928/1929): авторизация по логину/паролю предлагается только если
+  логин задан; ответы 1–8 отображаются в `Other`/`PermissionDenied`/
+  `NotConnected`/`AddrNotAvailable`/`ConnectionRefused`/`TimedOut`/`Unsupported`;
+* HTTP CONNECT: `CONNECT host:port HTTP/1.1`, `Host`, при логине и пароле —
+  `Proxy-Authorization: Basic`, `User-Agent: Torrenta`, `Proxy-Connection: Keep-Alive`;
+  не-`200` — `PermissionDenied` только для 407, остальные — `Other`.
+
+Ограничения: только TCP `CONNECT` (BIND и UDP ASSOCIATE не нужны — DHT и
+UDP-трекеры идут напрямую); цель обязана быть уже разрешённым `SocketAddr`
+(ATYP=3 не используется); `socks5h` трактуется как `socks5` — DNS разрешается
+локально; для HTTP — только Basic-авторизация.
+
+## `port_map`
+
+```rust
+pub enum MappingProtocol { Tcp, Udp }
+impl MappingProtocol { pub fn as_str(self) -> &'static str }   // "TCP" | "UDP"
+pub struct PortMapping { pub gateway: IpAddr, pub external_port: u16, pub protocol: MappingProtocol, pub lifetime: Duration }
+pub enum PortMapError { Network(String), Parse(String), Soap { code: String, message: String } }
+pub async fn map_port(internal_port: u16, protocol: MappingProtocol, lifetime_secs: u32) -> Option<PortMapping>;
+pub async fn unmap_port(mapping: &PortMapping);
+```
+
+`map_port(0, ...)` → `None`; `lifetime_secs` зажимается в 60…604 800. Порядок
+попыток — сначала UPnP-IGD (SSDP-поиск → описание устройства → `AddPortMapping`),
+затем NAT-PMP (RFC 6886); внешний порт равен внутреннему. Ошибки наружу не
+выходят: не получилось — вернулся `None`, движок продолжает без проброса.
+`unmap_port` пробует оба протокола и ошибки игнорирует (каждый вызов под
+таймаутом 6 с).
+
+Ограничения: только IPv4; шлюз для NAT-PMP ищется эвристикой «локальный адрес с
+последним октетом 1» (чтение таблицы маршрутов потребовало бы новых
+зависимостей), поэтому в нестандартной сети NAT-PMP может не найтись, и UPnP
+остаётся запасным путём.
+
 ## `engine` (контракт для Tauri-бэкенда)
 
 ```rust
@@ -184,6 +362,15 @@ pub struct EngineConfig {
     pub seed_after_complete: bool,      // по умолчанию true
     pub max_active_downloads: usize,    // 1.3: 0 = без ограничения
     pub max_active_seeds: usize,        // 1.3: 0 = без ограничения
+    // 1.6
+    pub dht: bool,                      // по умолчанию true: искать пиров через DHT (BEP 5)
+    pub dht_port: u16,                  // 0 = свободный UDP-порт узла DHT
+    pub pex: bool,                      // по умолчанию true: обмен пирами (BEP 11)
+    pub web_seeds: bool,                // по умолчанию true: качать с веб-сидов (BEP 19)
+    pub proxy: Option<String>,          // None = напрямую; например "socks5://user:pass@host:port"
+    pub port_mapping: bool,             // по умолчанию true: проброс порта (best effort)
+    pub seed_ratio_limit: f64,          // 0.0 = без ограничения
+    pub seed_time_limit_min: u32,       // 0 = без ограничения
 }
 impl Default for EngineConfig { ... }
 
@@ -216,6 +403,8 @@ pub enum FilePriority { Skip, Low, #[default] Normal, High }
     pub down_rate: f64,             // байт/с
     pub up_rate: f64,
     pub eta_seconds: Option<u64>,
+    pub seed_ratio: f64,            // 1.6: отдано/скачано; 0.0, пока скачано 0
+    pub seed_limit_reached: bool,   // 1.6: лимит раздачи сработал, ждём ручного resume
     pub down_limit_kib: u32,        // действующий лимит: min(глобальный, торрентный)
     pub up_limit_kib: u32,
     pub save_path: String,
@@ -291,6 +480,15 @@ pub enum EngineEvent {
     Removed { id: u64 },
 }
 ```
+
+**Настройки и `sanitized()`.** `TorrentManager::new` и `set_config` прогоняют
+`EngineConfig::sanitized()`: пустой `download_dir` заменяется каталогом по
+умолчанию, `max_peers_per_torrent` зажимается в 1…200, `max_active_*` — не больше
+`MAX_ACTIVE_LIMIT = 500`; `proxy` обрезается от пробелов, пустая строка или
+неразбираемая спецификация превращаются в `None` (движок молча работает
+напрямую); нечисловой (`NaN`, ∞) или отрицательный `seed_ratio_limit` становится
+`0.0`. В `EngineConfig` включён `#[serde(default)]`, поэтому старые настройки
+Tauri без новых полей читаются без миграции.
 
 Поведение:
 
@@ -373,7 +571,8 @@ files)` меняет выбор на лету:
 времени: до 5 трекеров по очереди, не более 64 кандидатов, проверка шанса
 совпадения `info_hash`; ручка в менеджере не регистрируется и фоновых задач не
 остаётся. Ошибка по таймауту: «не удалось получить метаданные за отведённое
-время». Ограничение: метаданные ищутся только у пиров с трекеров (без DHT/PEX),
+время». Ограничение именно предпросмотра: `preview_magnet` не использует DHT и
+PEX — метаданные ищутся только у пиров с трекеров,
 а у magnet-ссылки без списка файлов `add_magnet_with` получает полный выбор.
 
 ## Приоритеты, очередь и перепроверка (1.3)
@@ -437,3 +636,62 @@ files)` меняет выбор на лету:
 `PermissionDenied` — это ожидаемое поведение, а не сбой. Проверки при добавлении
 торрента по-прежнему нет: диск не хэшируется, пока пользователь явно не вызовет
 `recheck`.
+
+## DHT, PEX, веб-сиды, прокси, проброс и лимиты раздачи (1.6)
+
+**DHT.** Узел один на сессию (`Inner.dht`): поднимается и гасится вместе с
+настройкой `dht` при старте, в `set_config` и в `shutdown` (`refresh_dht`). Порт —
+`dht_port`, `0` = свободный; если UDP-порт занят, узел просто не поднимается, а
+торренты продолжают работать через трекеры и PEX. Каждый торрент крутит
+`Runtime::dht_loop`: раз в 30 с (`DHT_POLL`) забирает `take_peers` и отдаёт
+адреса кондуктору; `announce` уходит сразу после старта и затем раз в 300 с
+(`DHT_ANNOUNCE`) отдельной задачей, чтобы сетевой раунд не задерживал опрос уже
+известных пиров. При `listen_port == 0` анонс не отправляется (входящих
+соединений нет), но цикл продолжает искать пиров в кэш.
+
+**PEX.** `our_extended_handshake` объявляет `ut_metadata: 1` и `ut_pex: 2`;
+входящий extended-`0` запоминает `ut_pex` пира, после чего каждое сообщение
+`ut_pex` разбирается в `PexMessage`, а его адреса становятся кандидатами.
+Исходящий дифф строится раз в 60 с (`PEX_INTERVAL`), не больше 50 адресов
+(`PEX_MAX_ADDRESSES`), и отправляется только тем, кто объявил `ut_pex`. Номер в
+сообщении берётся из handshake пира, а `pex::EXT_PEX = 1` — внутреннее соглашение
+модуля, на провод оно не влияет.
+
+**Веб-сиды.** `web_seed_loop` запускается, только если `Metainfo.url_list`
+непуст, и качает по одному куску за раз: занимает кусок у общего `picker`
+(`Bitfield::all_set`), берёт окно через `piece_window`, качает `fetch_range` и
+сдаёт `complete_piece`. Пересечься с пирами куски не могут — планировщик один.
+Перед попыткой списывается бюджет общего лимитера (`grant_download` на
+`piece_blocks`), пустое ведро — пауза 5 с. Отказ или короткое тело: `picker.release`, ротация на следующий веб-сид и пауза
+5 с (`WEB_SEED_RETRY`); несовпадение SHA-1 откладывает сам планировщик, сид тоже
+меняется. На один запрос отводится 90 с (`WEB_SEED_DEADLINE`). Выключение
+`web_seeds` цикл не убивает — он спит по 5 с и проверяет настройку снова; смена
+`proxy` пересобирает клиентов на ходу. Бюджет списывается куском целиком
+(`piece_length`), поэтому при очень узком лимите возможно превышение на один
+кусок. `WebSeedConfig` берётся по умолчанию (10 с / 30 с / 4); если все URL в
+`url-list` битые, клиентов не остаётся и цикл выходит, как и у докачанного
+торрента.
+
+**Прокси.** При заданном `proxy` TCP-соединения с пирами идут через
+`proxy::connect`, а HTTP-клиент сессии (`HttpClient` в `Inner`, `build_http`)
+собирается с тем же прокси — через него работают HTTP-трекеры, веб-сиды и
+запросы за метаданными magnet. `set_config` пересоздаёт клиент сразу, не
+дожидаясь перезапуска торрентов. UDP-трекеры и DHT прокси не используют:
+UDP-туннеля нет, это ограничение протокола, а не недоделка.
+
+**Проброс портов.** При старте и в `set_config` поднимается TCP-проброс
+`listen_port` на 3600 с (`PORT_MAP_LIFETIME_SECS`); при `shutdown` и при
+выключении `port_mapping` проброс снимается. Порт `0` не пробрасывается. UDP-порт
+DHT не пробрасывается: входящие соединения пиров приходят только по TCP, а DHT
+работает исходящими запросами. Всё best effort — ошибок и событий в UI нет,
+неудача ничего не ломает (UPnP → NAT-PMP).
+
+**Лимиты раздачи.** `seed_ratio_limit` (отдано/скачано) и `seed_time_limit_min`
+(минуты в состоянии `Seeding`) проверяются на тике (`tick_seed_limit`).
+`seed_ratio` в снапшоте — `uploaded / downloaded`, `0.0`, пока ничего не скачано;
+порог срабатывает включительно (`>=`), а время считается только пока торрент
+действительно раздаёт (`Seeding`). Лимит сработал → `seed_limit_reached = true`,
+`plan_kind()` возвращает `Idle`: слот раздачи освобождается, торрент стоит до
+ручного `resume`, который обнуляет счётчик (`SeedMeter::reset`) и начинает отрезок
+заново. `0` в любой из настроек — без ограничения; проверка идёт по статистике и
+докачке не мешает.

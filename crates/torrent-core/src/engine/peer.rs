@@ -14,7 +14,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use super::torrent::Runtime;
-use super::{read_exact_timeout, REQUEST_WINDOW};
+use super::{rd, read_exact_timeout, REQUEST_WINDOW};
 use crate::bencode::{self, Value};
 use crate::metainfo::InfoHash;
 use crate::wire::{Handshake, Message, HANDSHAKE_LEN};
@@ -31,6 +31,16 @@ const KEEPALIVE: Duration = Duration::from_secs(100);
 const MAX_MESSAGE: usize = 512 * 1024;
 /// Локальный идентификатор ut_metadata в наших extended-сообщениях.
 const OUR_UT_METADATA: u8 = 1;
+/// Локальный идентификатор ut_pex в наших extended-сообщениях (BEP 11).
+///
+/// Пир шлёт нам PEX именно с этим номером: в присланных сообщениях `ext_id`
+/// означает идентификатор из *нашего* handshake. Обратно мы обязаны писать
+/// номер, который объявил сам пир, — он приходит в его `m`-словаре.
+const OUR_UT_PEX: u8 = 2;
+/// Как часто отправляем пиру дифф списка пиров.
+const PEX_INTERVAL: Duration = Duration::from_secs(60);
+/// Сколько адресов максимум отдаём в одном PEX-сообщении.
+const PEX_MAX_ADDRESSES: usize = 50;
 /// Предельный размер метаданных, который принимаем от пира.
 const MAX_METADATA: usize = 8 * 1024 * 1024;
 /// Размер куска метаданных по BEP 9.
@@ -38,7 +48,35 @@ const METADATA_PIECE: usize = 16 * 1024;
 /// Сколько запросов метаданных держим в полёте.
 const METADATA_INFLIGHT: usize = 32;
 
-/// Параметры получения метаданных.
+/// Состояние PEX в рамках одного соединения.
+///
+/// Списком пиров обмениваются только с теми, кто объявил `ut_pex`; дифф
+/// считается от того, что мы этому пиру уже отдали, чтобы не повторяться.
+struct PexSession {
+    /// Адрес самого пира: свой собственный адрес ему не предлагаем.
+    peer_addr: SocketAddr,
+    /// Идентификатор `ut_pex` из handshake пира; `None` — PEX он не умеет.
+    peer_id: Option<u8>,
+    /// Адреса, отправленные пиру в прошлый раз.
+    known: Vec<SocketAddr>,
+    /// Когда отправляли дифф последний раз.
+    last_sent: Instant,
+    /// Первый дифф отправляем сразу после рукопожатия, не ожидая интервала.
+    first: bool,
+}
+
+impl PexSession {
+    fn new(peer_addr: SocketAddr) -> PexSession {
+        PexSession {
+            peer_addr,
+            peer_id: None,
+            known: Vec::new(),
+            last_sent: Instant::now(),
+            first: true,
+        }
+    }
+}
+
 pub(crate) struct MetadataFetch {
     pub(crate) info_hash: InfoHash,
     pub(crate) peer_id: [u8; 20],
@@ -50,8 +88,21 @@ pub(crate) struct MetadataFetch {
 // ---------------------------------------------------------------------------
 
 /// Исходящее соединение с пиром из списка трекера.
+///
+/// При включённом прокси TCP-соединение открывается через него (SOCKS5 или
+/// HTTP CONNECT): иначе пиры видели бы настоящий адрес клиента.
 pub(crate) async fn connect(runtime: Arc<Runtime>, addr: SocketAddr) {
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+    let proxy = rd(&runtime.env.config)
+        .proxy
+        .as_deref()
+        .and_then(|spec| crate::proxy::ProxyConfig::parse(spec).ok());
+    let result = match &proxy {
+        Some(proxy) => {
+            tokio::time::timeout(CONNECT_TIMEOUT, crate::proxy::connect(proxy, addr)).await
+        }
+        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await,
+    };
+    let stream = match result {
         Ok(Ok(stream)) => stream,
         _ => {
             runtime.candidate_failed(addr);
@@ -131,9 +182,10 @@ async fn run(
         }
     });
 
+    let mut pex = PexSession::new(addr);
     let result = match remote.supports_extended() {
-        true => session_loop(&runtime, id, &mut messages, &mut writer, true).await,
-        false => session_loop(&runtime, id, &mut messages, &mut writer, false).await,
+        true => session_loop(&runtime, id, &mut messages, &mut writer, true, &mut pex).await,
+        false => session_loop(&runtime, id, &mut messages, &mut writer, false, &mut pex).await,
     };
     reader_task.abort();
     runtime.unregister(id);
@@ -143,6 +195,7 @@ async fn run(
 fn our_extended_handshake(runtime: &Runtime) -> Vec<u8> {
     let mut extensions = BTreeMap::new();
     extensions.insert(b"ut_metadata".to_vec(), Value::Int(OUR_UT_METADATA as i64));
+    extensions.insert(b"ut_pex".to_vec(), Value::Int(OUR_UT_PEX as i64));
     let mut dict = BTreeMap::new();
     dict.insert(b"m".to_vec(), Value::Dict(extensions));
     dict.insert(
@@ -170,6 +223,7 @@ async fn session_loop(
     messages: &mut mpsc::Receiver<Result<Message, String>>,
     writer: &mut OwnedWriteHalf,
     extended: bool,
+    pex: &mut PexSession,
 ) -> Result<(), String> {
     let mut have_rx = runtime.have_tx.subscribe();
     let mut ticker = tokio::time::interval(TICK);
@@ -191,7 +245,8 @@ async fn session_loop(
             Ev::Message(Some(Err(message))) => return Err(message),
             Ev::Message(Some(Ok(Message::KeepAlive))) => {}
             Ev::Message(Some(Ok(message))) => {
-                handle_message(runtime, id, writer, message, extended, &mut last_write).await?;
+                handle_message(runtime, id, writer, message, extended, &mut last_write, pex)
+                    .await?;
             }
             Ev::Have(Ok(index)) => {
                 send(writer, &Message::Have(index)).await?;
@@ -200,6 +255,7 @@ async fn session_loop(
             Ev::Have(Err(_)) => {}
             Ev::Tick => {
                 tick(runtime, id, writer, &mut interested, &mut last_write).await?;
+                send_pex(runtime, writer, pex, &mut last_write).await?;
             }
         }
     }
@@ -212,6 +268,7 @@ async fn handle_message(
     message: Message,
     extended: bool,
     last_write: &mut Instant,
+    pex: &mut PexSession,
 ) -> Result<(), String> {
     match message {
         Message::KeepAlive => {}
@@ -252,12 +309,18 @@ async fn handle_message(
             }
             match ext_id {
                 0 => {
-                    // Приветствие пира: нам достаточно факта поддержки расширений.
+                    // Приветствие пира: запоминаем, под каким номером он ждёт PEX.
+                    if let Some(id) = extension_id(&payload, b"ut_pex") {
+                        pex.peer_id = Some(id);
+                    }
                 }
                 OUR_UT_METADATA => {
+                    // Пир также мог объявить ut_metadata другим номером, но
+                    // запросы он шлёт по нашему — отдельное сопоставление не нужно.
                     serve_metadata(runtime, writer, &payload).await?;
                     *last_write = Instant::now();
                 }
+                OUR_UT_PEX => on_pex(runtime, &payload),
                 _ => {}
             }
         }
@@ -307,6 +370,90 @@ async fn serve_metadata(
         },
     )
     .await
+}
+
+/// Достаёт из extended-handshake пира номер, под которым он ждёт расширение.
+fn extension_id(payload: &[u8], name: &[u8]) -> Option<u8> {
+    let (value, _) = bencode::decode(payload).ok()?;
+    let dict = value.as_dict()?;
+    let extensions = dict.get(b"m".as_slice())?.as_dict()?;
+    let id = extensions.get(name)?.as_int()?;
+    u8::try_from(id).ok().filter(|id| *id != 0)
+}
+
+/// Принимает список пиров от пира (BEP 11) и ставит новые адреса в очередь.
+///
+/// Отброшенные адреса (`dropped`) игнорируем: у нас свой учёт мёртвых пиров,
+/// и чужое мнение о них не должно выкидывать рабочие соединения.
+fn on_pex(runtime: &Arc<Runtime>, payload: &[u8]) {
+    let Ok(message) = crate::pex::PexMessage::decode(payload) else {
+        return;
+    };
+    let peers: Vec<crate::tracker::PeerAddr> = message
+        .added
+        .into_iter()
+        .map(|addr| crate::tracker::PeerAddr {
+            ip: addr.ip(),
+            port: addr.port(),
+        })
+        .collect();
+    if !peers.is_empty() {
+        runtime.add_candidates(peers);
+    }
+}
+
+/// Отправляет пиру дифф списка известных нам адресов.
+async fn send_pex(
+    runtime: &Arc<Runtime>,
+    writer: &mut OwnedWriteHalf,
+    pex: &mut PexSession,
+    last_write: &mut Instant,
+) -> Result<(), String> {
+    let Some(peer_id) = pex.peer_id else {
+        return Ok(());
+    };
+    if !pex.first && pex.last_sent.elapsed() < PEX_INTERVAL {
+        return Ok(());
+    }
+    pex.first = false;
+    pex.last_sent = Instant::now();
+    let fresh = runtime.pex_candidates(pex.peer_addr, PEX_MAX_ADDRESSES);
+    // Устаревшими считаем то, что пир уже видел от нас, а сейчас недоступно.
+    let dropped: Vec<SocketAddr> = pex
+        .known
+        .iter()
+        .copied()
+        .filter(|addr| !fresh.contains(addr))
+        .collect();
+    let message = crate::pex::PexMessage::diff(&pex.known, &fresh, &dropped);
+    if message.added.is_empty() && message.dropped.is_empty() {
+        return Ok(());
+    }
+    send(
+        writer,
+        &Message::Extended {
+            ext_id: peer_id,
+            payload: message.encode(),
+        },
+    )
+    .await?;
+    *last_write = Instant::now();
+    // Следующий дифф считаем от того, что пир теперь знает: что осталось
+    // актуальным из прошлой отправки плюс новые адреса.
+    let mut known: Vec<SocketAddr> = pex
+        .known
+        .iter()
+        .copied()
+        .filter(|addr| fresh.contains(addr))
+        .collect();
+    for addr in message.added {
+        if !known.contains(&addr) {
+            known.push(addr);
+        }
+    }
+    known.truncate(PEX_MAX_ADDRESSES);
+    pex.known = known;
+    Ok(())
 }
 
 /// Периодические действия: интерес, запросы блоков, keep-alive.

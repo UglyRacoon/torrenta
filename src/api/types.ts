@@ -59,6 +59,13 @@ export interface TorrentSnapshot {
   /** 0 — без ограничения. */
   up_limit_kib: number;
   eta_seconds: number | null;
+  /**
+   * Соотношение отдано/скачано (1.6): 0.0, если скачано ещё ничего.
+   * Считается движком, поэтому NaN здесь не бывает.
+   */
+  seed_ratio: number;
+  /** Сработал лимит раздачи (1.6): торрент остановлен и ждёт ручного возобновления. */
+  seed_limit_reached: boolean;
   save_path: string;
   added_at: number;
   files: FileView[];
@@ -99,6 +106,22 @@ export interface SettingsDto {
   notify_on_complete: boolean;
   /** Восстанавливать список торрентов при запуске (1.5). */
   restore_session: boolean;
+  /** Искать пиров через DHT без трекера, BEP 5 (1.6). */
+  dht: boolean;
+  /** Обмениваться адресами пиров с соседями, BEP 11 (1.6). */
+  pex: boolean;
+  /** UDP-порт DHT (1.6); 0 — выбрать свободный автоматически. */
+  dht_port: number;
+  /** Прокси (1.6): пусто — выключен, иначе socks5://host:port или http(s)://host:port. */
+  proxy: string;
+  /** Пробрасывать порт на роутере через UPnP/NAT-PMP (1.6). */
+  port_mapping: boolean;
+  /** Качать данные по HTTP из url-list в .torrent, BEP 19 (1.6). */
+  web_seeds: boolean;
+  /** Останавливать раздачу при ratio ≥ N (1.6); 0 — без ограничения. */
+  seed_ratio_limit: number;
+  /** Останавливать раздачу через N минут (1.6); 0 — без ограничения. */
+  seed_time_limit_min: number;
   theme: ThemeName;
 }
 
