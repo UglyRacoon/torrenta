@@ -4,10 +4,14 @@ import type {
   AddOptions,
   AddResult,
   AppPayload,
+  AssociationDto,
   AutoShutdownState,
+  DiagnosticsDto,
+  PortableInfoDto,
   SettingsDto,
   TorrentPreview,
   TorrentSource,
+  UpdateStateDto,
 } from "./types";
 import type { EngineApi, FileDropHandlers } from "./engine";
 import { basename } from "../lib/format";
@@ -64,6 +68,18 @@ export async function createTauriApi(): Promise<EngineApi> {
 
     setTorrentLimits: (id, downKib, upKib) =>
       invoke<void>("set_torrent_limits", { id, downKib, upKib }),
+
+    // 1.7: последовательная загрузка, трекеры и диагностика.
+    setTorrentSequential: (id, on) => invoke<void>("set_torrent_sequential", { id, on }),
+    torrentTrackers: (id) => invoke<string[]>("torrent_trackers", { id }),
+    setTorrentTrackers: (id, urls) => invoke<void>("set_torrent_trackers", { id, urls }),
+    reannounceTorrent: (id) => invoke<void>("reannounce_torrent", { id }),
+    engineDiagnostics: () => invoke<DiagnosticsDto>("engine_diagnostics"),
+    portableInfo: () => invoke<PortableInfoDto>("portable_info"),
+    checkUpdate: () => invoke<UpdateStateDto>("check_update"),
+    // 1.7 (баг-репорт): кто открывает .torrent и починка привязки.
+    associationStatus: () => invoke<AssociationDto>("association_status"),
+    repairAssociation: () => invoke<AssociationDto>("repair_association"),
 
     pickTorrentFiles: async () => {
       const paths = await invoke<string[]>("pick_torrent_files");

@@ -6,7 +6,6 @@ import type {
   FilePriority,
   FilterKey,
   SettingsDto,
-  SortKey,
   TorrentSnapshot,
   TorrentSource,
   TorrentState,
@@ -413,6 +412,26 @@ export function mountApp(): void {
     }
   }
 
+  // 1.7: трекеры и последовательная загрузка — ошибки показываем тостом и
+  // возвращаем промис, чтобы панель вернула переключатель в прежнее положение.
+  async function reannounceTrackers(id: number): Promise<void> {
+    try {
+      await api().reannounceTorrent(id);
+    } catch (reason) {
+      fail(reason, "Не удалось обновить трекеры");
+      throw reason;
+    }
+  }
+
+  async function changeSequential(id: number, enabled: boolean): Promise<void> {
+    try {
+      await api().setTorrentSequential(id, enabled);
+    } catch (reason) {
+      fail(reason, "Не удалось изменить режим загрузки");
+      throw reason;
+    }
+  }
+
   function contextMenu(torrent: TorrentSnapshot, anchor: ContextAnchor): void {
     const checking = torrent.state === "checking";
     // Во время перепроверки торрент не на паузе, поэтому пункт остаётся «Пауза» —
@@ -485,7 +504,6 @@ export function mountApp(): void {
     },
     onAdd: () => void openAdd(),
     onQuery: (query) => store.patch({ query }),
-    onSort: (sort: SortKey) => store.patch({ sort }),
     onClearFilters: () => store.patch({ filter: "all", query: "" }),
     onRetry: () => void bootstrap(),
   });
@@ -497,6 +515,11 @@ export function mountApp(): void {
     onRemove: (id) => removeTorrent(id),
     onOpenExternal: (url) => openExternal(url),
     onFilePriorities: (id, priorities) => changeFilePriorities(id, priorities),
+    onReannounce: (id) => reannounceTrackers(id),
+    onSequentialChange: (id, enabled) => changeSequential(id, enabled),
+    // Редактор трекеров живёт в modals.ts (frontend-p1); сам он сохраняет
+    // список через `set_torrent_trackers` и заодно просит reannounce.
+    onEditTrackers: (id) => modals.openTrackerEditor(id),
   });
 
   const statusbar = createStatusbar(statusbarMount, {
@@ -545,6 +568,11 @@ export function mountApp(): void {
       return;
     }
     if (event.key === "Escape") {
+      // Модалка гасит Escape через preventDefault (stopPropagation не глушит
+      // соседние обработчики на том же узле): иначе Esc закрывал бы ещё и панель.
+      if (event.defaultPrevented) {
+        return;
+      }
       // Меню/подменю закрывает свой обработчик; здесь — только панель и выбор.
       if (closeMenu()) {
         return;

@@ -6,6 +6,15 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 Крейт: `crates/torrent-core`, имя пакета `torrent-core`, подключение:
 `use torrent_core::{...};`
 
+Версия контракта: **1.7**. Подсистемы: bencode и метаинформация
+(`announce` + `announce-list`), magnet-ссылки с `ut_metadata` (BEP 9),
+wire-протокол, HTTP- и UDP-трекеры, DHT (BEP 5), расширения (BEP 10), PEX
+(BEP 11), веб-сиды (BEP 19), SOCKS5 (RFC 1928/1929) и HTTP CONNECT, проброс
+портов (UPnP-IGD, NAT-PMP — RFC 6886). В 1.7 добавлены последовательная
+загрузка (`picker::PickOrder`), расписание ограничений, ручное управление
+трекерами и `TorrentManager::diagnostics()`; подробности — в одноимённом разделе
+в конце.
+
 ## Карта модулей
 
 | Модуль | Содержимое | Владелец |
@@ -18,14 +27,14 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 | `bitfield` | `Bitfield` | lead |
 | `peerid` | `generate_peer_id`, `client_name` | lead |
 | `storage` | `Storage`, `release_writes`/`acquire_writes`/`writes_released`, общий режим доступа к файлам | lead |
-| `picker` | `PiecePicker`, `PieceStatus`, `set_levels`/`level`/`reset_have` | lead |
+| `picker` | `PiecePicker`, `PieceStatus`, `PickOrder`, `set_levels`/`level`/`reset_have`, `order`/`set_order` | lead |
 | `selection` | `Selection`, `wanted_pieces`, `wanted_downloaded`, `effective_limit`, `piece_levels`/`level_of` (crate-private) | core |
 | `dht` | `Dht`, `DhtConfig`, `DhtStats`, `DhtError`, `DEFAULT_BOOTSTRAP`, `announce`/`take_peers` (BEP 5) | core |
 | `pex` | `PexMessage`, `EXT_PEX`, `encode`, `decode`, `diff` (BEP 11) | core |
 | `port_map` | `MappingProtocol`, `PortMapping`, `PortMapError`, `map_port`, `unmap_port` (UPnP-IGD, NAT-PMP) | core |
 | `proxy` | `ProxyKind`, `ProxyConfig`, `ProxyError`, `parse`, `connect` (SOCKS5 / HTTP CONNECT) | core |
 | `web_seed` | `WebSeed`, `WebSeedConfig`, `WebSeedError`, `parse_url_list` (BEP 19) | core |
-| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `AddOptions`, `TorrentPreview`, `FilePriority`, `FileView`, `PlanKind`/`plan` (crate-private) | core |
+| `engine` | `EngineConfig`, `TorrentManager`, `TorrentSnapshot`, `Diagnostics`, `EngineError`, `EngineEvent`, `AddOptions`, `TorrentPreview`, `FilePriority`, `FileView`, `PlanKind`/`plan` (crate-private) | core |
 
 ## `bencode`
 
@@ -371,6 +380,13 @@ pub struct EngineConfig {
     pub port_mapping: bool,             // по умолчанию true: проброс порта (best effort)
     pub seed_ratio_limit: f64,          // 0.0 = без ограничения
     pub seed_time_limit_min: u32,       // 0 = без ограничения
+    // 1.7
+    pub sequential: bool,               // по умолчанию false: новые торренты качаются по порядку кусков
+    pub schedule_enabled: bool,         // по умолчанию false: расписание ограничений скорости
+    pub schedule_from_min: u32,         // начало окна, минуты от полуночи (0..=1439)
+    pub schedule_to_min: u32,           // конец окна; from > to — окно через полночь (23:00 → 07:00)
+    pub schedule_download_limit_kib: u32, // лимит загрузки внутри окна, КиБ/с (0 = без ограничения)
+    pub schedule_upload_limit_kib: u32, // лимит отдачи внутри окна, КиБ/с (0 = без ограничения)
 }
 impl Default for EngineConfig { ... }
 
@@ -405,8 +421,9 @@ pub enum FilePriority { Skip, Low, #[default] Normal, High }
     pub eta_seconds: Option<u64>,
     pub seed_ratio: f64,            // 1.6: отдано/скачано; 0.0, пока скачано 0
     pub seed_limit_reached: bool,   // 1.6: лимит раздачи сработал, ждём ручного resume
-    pub down_limit_kib: u32,        // действующий лимит: min(глобальный, торрентный)
-    pub up_limit_kib: u32,
+    pub sequential: bool,           // 1.7: этот торрент качается по порядку кусков
+    pub down_limit_kib: u32,        // действующий лимит: min(эффективный глобальный, лимит торрента)
+    pub up_limit_kib: u32,          // «эффективный глобальный» уже с учётом окна расписания (1.7)
     pub save_path: String,
     pub added_at: i64,              // unix seconds
     pub files: Vec<FileView>,
@@ -417,6 +434,31 @@ pub enum FilePriority { Skip, Low, #[default] Normal, High }
     pub torrents: u32, pub active: u32,
     pub down_rate: f64, pub up_rate: f64,
     pub downloaded_bytes: u64, pub uploaded_bytes: u64,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Diagnostics {
+    pub listen_port: u16,            // 0 — не слушаем входящие
+    pub dht: bool,                   // включён в настройках
+    pub dht_port: u16,               // настроенный порт (0 = автоматически), не фактически занятый
+    pub dht_nodes: usize,            // узлов в таблице DHT сейчас (0, если DHT выключен)
+    pub pex: bool,
+    pub web_seeds: bool,
+    pub proxy: Option<String>,       // None — напрямую
+    pub port_mapping: bool,
+    pub mapped_external: Option<String>, // "192.168.1.1:5678" — шлюз и внешний порт, не внешний IP
+    pub schedule_enabled: bool,
+    pub schedule_from_min: u32,
+    pub schedule_to_min: u32,
+    pub schedule_active: bool,       // окно расписания активно прямо сейчас
+    pub download_limit_kib: u32,     // действующий лимит с учётом расписания (0 = без ограничения)
+    pub upload_limit_kib: u32,
+    pub sequential: bool,            // значение из настроек для новых торрентов
+    pub torrents: usize,
+    pub active: usize,               // загрузка, раздача, ожидание метаданных
+    pub peers: usize,                // подключённых пиров по всем торрентам
+    pub download_bps: u64,           // байт/с
+    pub upload_bps: u64,
+    pub uptime_secs: u64,            // сколько живёт менеджер
 }
 #[derive(Debug, Clone)] pub enum AddSource { File(Vec<u8>), Magnet(String) }
 /// Настройки добавления: папка и индексы выбранных файлов (`None` = все).
@@ -441,6 +483,7 @@ pub struct AddOptions { pub save_path: Option<PathBuf>, pub files: Option<Vec<us
     #[error("торрент уже добавлен: {0}")] Duplicate(String),
     #[error("не выбран ни один файл")] Selection,
     #[error("торрент ещё не готов к перепроверке")] NotReady,
+    #[error("{0}")] InvalidInput(String),   // 1.7: значение ввода не принято (список трекеров)
 }
 
 pub struct TorrentManager { /* private */ }
@@ -459,6 +502,11 @@ impl TorrentManager {
     pub fn set_file_priorities(&self, id: u64, priorities: Vec<FilePriority>) -> Result<(), EngineError>;
     pub fn recheck(&self, id: u64) -> Result<(), EngineError>;
     pub fn set_limits(&self, id: u64, down_kib: u32, up_kib: u32) -> Result<(), EngineError>;
+    pub fn set_sequential(&self, id: u64, on: bool) -> Result<(), EngineError>;
+    pub fn trackers(&self, id: u64) -> Result<Vec<String>, EngineError>;
+    pub fn set_trackers(&self, id: u64, urls: Vec<String>) -> Result<(), EngineError>;
+    pub fn reannounce(&self, id: u64) -> Result<(), EngineError>;
+    pub fn diagnostics(&self) -> Diagnostics;
     pub fn pause(&self, id: u64) -> Result<(), EngineError>;
     pub fn resume(&self, id: u64) -> Result<(), EngineError>;
     pub fn pause_all(&self);
@@ -487,7 +535,12 @@ pub enum EngineEvent {
 `MAX_ACTIVE_LIMIT = 500`; `proxy` обрезается от пробелов, пустая строка или
 неразбираемая спецификация превращаются в `None` (движок молча работает
 напрямую); нечисловой (`NaN`, ∞) или отрицательный `seed_ratio_limit` становится
-`0.0`. В `EngineConfig` включён `#[serde(default)]`, поэтому старые настройки
+`0.0`. Расписание (1.7) нормализуется там же: `schedule_from_min`/`schedule_to_min`
+приводятся к суткам (`% 1440`), лимиты окна зажимаются сверху
+`MAX_SCHEDULE_LIMIT_KIB = 1 048 576` КиБ/с (осмысленный предел: `u32` в КиБ/с
+легко переполняется), а окно нулевой длины (`schedule_from_min == schedule_to_min`)
+выключает расписание — `schedule_enabled` становится `false`. В `EngineConfig`
+включён `#[serde(default)]`, поэтому старые настройки
 Tauri без новых полей читаются без миграции.
 
 Поведение:
@@ -561,10 +614,13 @@ files)` меняет выбор на лету:
 **Лимиты.** `set_limits(id, down_kib, up_kib)` задаёт лимит торрента, `0` — без
 своего потолка. Действующая скорость = `min(глобальный лимит, лимит торрента)`
 (`selection::effective_limit`), это же значение отдаётся в
-`snapshot.down_limit_kib`/`up_limit_kib`. На сессию существует один общий
-лимитер (`SharedLimiters` в `Inner`), поэтому N торрентов при глобальных
-1 МиБ/с вместе дают не больше 1 МиБ/с, а не N × 1 МиБ/с. Изменения настроек
-подхватываются на следующем запросе без перезапуска.
+`snapshot.down_limit_kib`/`up_limit_kib`. «Глобальный» здесь — **эффективный**
+лимит сессии (1.7): вне окна расписания это `download_limit_kib`/`upload_limit_kib`
+из настроек, внутри окна — `schedule_download_limit_kib`/`schedule_upload_limit_kib`;
+пересчёт идёт на каждом тике (500 мс), подробности в разделе 1.7. На сессию
+существует один общий лимитер (`SharedLimiters` в `Inner`), поэтому N торрентов
+при глобальных 1 МиБ/с вместе дают не больше 1 МиБ/с, а не N × 1 МиБ/с.
+Изменения настроек подхватываются на следующем запросе без перезапуска.
 
 **Предпросмотр.** `preview_file(&[u8])` разбирает `.torrent` без добавления;
 `preview_magnet(link, timeout)` идёт за метаданными по BEP 9 с ограничением по
@@ -695,3 +751,233 @@ DHT не пробрасывается: входящие соединения п�
 ручного `resume`, который обнуляет счётчик (`SeedMeter::reset`) и начинает отрезок
 заново. `0` в любой из настроек — без ограничения; проверка идёт по статистике и
 докачке не мешает.
+
+## Последовательная загрузка, расписание, трекеры и диагностика (1.7)
+
+**Порядок кусков.** За порядок выдачи кусков отвечает `picker::PickOrder`,
+публичный (реэкспортируется из корня крейта вместе с `PiecePicker`):
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PickOrder {
+    #[default] Rarest,
+    Sequential,
+}
+impl PiecePicker {
+    pub fn order(&self) -> PickOrder;
+    pub fn set_order(&self, order: PickOrder);
+}
+```
+
+* `Rarest` (по умолчанию) — уровни приоритета от старшего к младшему, внутри
+  уровня rarest-first, а на старте (пока нет кусков в работе) — уклон к началу
+  файлов, чтобы скачанное было полезно сразу;
+* `Sequential` — уровни приоритета **не учитываются вовсе**: берётся кусок с
+  наименьшим индексом среди нужных, имеющихся у пира и ещё не запрошенных.
+  Выбор файлов при этом действует: куски пропущенных файлов в `wanted` не
+  попадают и в поиске не участвуют — режим меняет только очерёдность внутри
+  нужного.
+
+Включается двумя независимыми путями:
+
+* `EngineConfig.sequential` — значение по умолчанию для **новых** торрентов: при
+  создании ручки оно копируется в её собственный флаг `sequential`. Уже
+  добавленные торренты `set_config` не трогает — их флаг живёт отдельно, поэтому
+  глобальную настройку можно менять, не переключая существующие загрузки;
+* `TorrentManager::set_sequential(id, on)` — точечно для одного торрента.
+  Неизвестный id — `EngineError::NotFound(id)`. Флаг пишется сразу, а если
+  рантайм уже создан, порядок меняется в тот же вызов; для magnet без
+  метаданных флаг только запоминается и применяется в `install()` уже после
+  разбора метаинформации. Текущее состояние отдаётся в
+  `TorrentSnapshot.sequential`.
+
+Переключение меняет только **следующие** решения планировщика: уже выданные
+запросам куски докачиваются, ничего не отменяется и не удаляется; при
+`Sequential` приоритеты файлов перестают влиять на порядок и остаются полезны
+только как `Skip`/не `Skip`, а лимиты скорости и очередь не меняются.
+
+**Расписание ограничений.** Шесть полей `EngineConfig`:
+
+| Поле | Тип | Смысл |
+|---|---|---|
+| `schedule_enabled` | `bool` | расписание включено; по умолчанию `false` |
+| `schedule_from_min` | `u32` | начало окна, минуты от полуночи (`0..=1439`; больше — приводится `% 1440`) |
+| `schedule_to_min` | `u32` | конец окна, **не включается**; `from > to` — окно через полночь |
+| `schedule_download_limit_kib` | `u32` | лимит загрузки внутри окна, КиБ/с; `0` — без ограничения |
+| `schedule_upload_limit_kib` | `u32` | лимит отдачи внутри окна, КиБ/с; `0` — без ограничения |
+
+Правила:
+
+* окно — полуинтервал `[from, to)`: `23:00 → 07:00` это `1380`/`420`, внутри
+  активны минуты `1380..=1439` и `0..=419`, а `420` — уже нет; при `from == to`
+  окно пустое, и `sanitized()` выключает расписание;
+* внутри окна действующие **глобальные** лимиты берутся из `schedule_*`
+  целиком, а не «не больше базовых»: ночью потолок можно и поднять. Вне окна —
+  `download_limit_kib`/`upload_limit_kib` из настроек;
+* лимит торрента действует поверх: `snapshot.down_limit_kib` =
+  `selection::effective_limit(действующий глобальный, лимит торрента)`, где `0`
+  с любой стороны значит «без потолка с этой стороны»;
+* значения пересчитываются на каждом тике статистики (`STATS_TICK = 500 мс`) и
+  сразу при `set_config` — смена настроек видна без перезапуска, а граница окна
+  подхватывается с точностью до одного тика. Запись в общие атомики идёт только
+  при реальном изменении (`EffectiveLimits::set`), лишних записей нет;
+* время суток берётся локальное, но по-разному: на Windows — через
+  `GetLocalTime` (FFI, без новых зависимостей), на остальных платформах
+  часового пояса нет (`chrono`/`time` в зависимостях отсутствуют), поэтому там
+  окно считается по **UTC**. На практике ядро сейчас используется на Windows,
+  но факт надо держать в голове при портировании.
+
+```rust
+// Ночью без ограничения, днём — 256/64 КиБ/с.
+manager.set_config(EngineConfig {
+    schedule_enabled: true,
+    schedule_from_min: 23 * 60,
+    schedule_to_min: 7 * 60,
+    schedule_download_limit_kib: 0,
+    schedule_upload_limit_kib: 0,
+    download_limit_kib: 256,
+    upload_limit_kib: 64,
+    ..manager.config()
+});
+```
+
+**Трекеры.** `trackers(id)` отдаёт копию сохранённого списка: сначала адреса из
+метаинформации, затем добавленные вручную. На чтении список не
+нормализуется и не дедуплицируется — возвращается то, что лежит в состоянии.
+Неизвестный id — `NotFound`; фоновые задачи ручка не поднимает (в отличие от
+большинства методов менеджера).
+
+`set_trackers(id, urls)` **полностью заменяет** список. Каждый адрес проходит
+`normalize_trackers`:
+
+* пробелы по краям обрезаются, пустые строки пропускаются;
+* не разбирается как URL → `EngineError::InvalidInput("некорректный адрес трекера: {url}")`;
+* схема не `http`/`https`/`udp` → `InvalidInput("неподдерживаемая схема трекера: {url}")`;
+* нет хоста → `InvalidInput("в адресе трекера нет хоста: {url}")`;
+* дубликаты отбрасываются без учёта регистра (сравнивается весь URL), поэтому
+  `HTTP://Tracker.Example/announce` и `http://tracker.example/announce` — один
+  адрес;
+* после 100 принятых адресов (`MAX_TRACKERS`) цикл прерывается: остаток списка
+  молча теряется и уже не проверяется. Пустой итоговый список допустим — пиры
+  ищутся через DHT и PEX.
+
+После замены вызывается `Runtime::refresh_trackers`: для новых адресов
+поднимаются циклы объявлений, и трекеры опрашиваются немедленно
+(`wake_announcer`), а цикл, чей адрес убрали из списка, выходит сам. У одного
+торрента не больше 16 одновременных циклов объявления (`MAX_TRACKER_LOOPS`):
+адреса сверх этого хранятся и видны в `trackers()`, но опрашиваться не
+начинают, пока не завершится чужой цикл, а завершается он при остановке
+торрента. Практически это значит: опрашиваются первые 16 адресов.
+Для magnet до метаданных замена списка меняет только хранимое значение: задача
+получения метаданных читает список один раз на старте, а когда метаданные
+придут, `Runtime::start` поставит трекеры из метаинформации вперёд и добавит
+недостающие ручные — «окончательным» список на этой стадии считать нельзя.
+
+`reannounce(id)` — побудка немедленного объявления, не дожидаясь интервала
+(трекер сам ограничивает частоту ответом `interval`, 30–1800 с). Пустой список
+— `Err(EngineError::InvalidInput("нет трекеров"))`; на паузе цикл объявления не
+отправляет (он спит и раз в 700 мс проверяет флаг), так что объявление уйдёт
+после `resume`; у magnet без метаданных объявлять ещё нечего — вернётся
+`Ok(())` без сетевого действия. Как и `set_trackers`, ручка ничего не ждёт:
+ответа трекера она не возвращает.
+
+```rust
+let current = manager.trackers(id)?;                 // что сейчас в списке
+manager.set_trackers(id, vec![
+    "http://tracker.example/announce".to_string(),
+    "udp://tracker.example:1337".to_string(),
+])?;                                                 // замена + немедленное объявление
+manager.reannounce(id)?;                             // только объявление
+manager.set_sequential(id, true)?;                   // этот торрент — по порядку кусков
+```
+
+**Диагностика.** `TorrentManager::diagnostics()` — синхронный снимок состояния
+движка (никаких `.await`), его можно звать прямо из Tauri-команды. Поля:
+
+| Поле | Тип | Смысл |
+|---|---|---|
+| `listen_port` | `u16` | фактический порт входящих (`0` — входящие не слушаются) |
+| `dht` | `bool` | DHT включён в настройках, а не «узел поднялся» |
+| `dht_port` | `u16` | **настроенный** UDP-порт DHT (`0` — автоматически); фактически занятый порт наружу не выводится |
+| `dht_nodes` | `usize` | узлов в таблице DHT сейчас; `0`, если DHT выключен или узел не поднялся |
+| `pex` | `bool` | обмен пирами (BEP 11) включён |
+| `web_seeds` | `bool` | веб-сиды (BEP 19) включены |
+| `proxy` | `Option<String>` | строка прокси как в настройках, `None` — напрямую; пароль не скрывается |
+| `port_mapping` | `bool` | проброс порта включён в настройках |
+| `mapped_external` | `Option<String>` | `"шлюз:внешний порт"` первого правила (`192.168.1.1:5678`); `None` — правила нет, либо его прямо сейчас обновляют, либо данных нет. Это не внешний IP: локально его узнать неоткуда |
+| `schedule_enabled` | `bool` | расписание включено в настройках |
+| `schedule_from_min` | `u32` | начало окна (минуты, уже нормализованные) |
+| `schedule_to_min` | `u32` | конец окна |
+| `schedule_active` | `bool` | окно активно **сейчас** (действующее значение, не пересчёт на месте) |
+| `download_limit_kib` | `u32` | действующий глобальный лимит загрузки уже с учётом окна (`0` — без ограничения) |
+| `upload_limit_kib` | `u32` | то же для отдачи |
+| `sequential` | `bool` | `EngineConfig.sequential` — значение для **новых** торрентов; сколько торрентов реально качается по порядку, видно по `TorrentSnapshot.sequential` |
+| `torrents` | `usize` | всего торрентов в менеджере |
+| `active` | `usize` | в состоянии `Downloading`, `Seeding` или `Metadata` |
+| `peers` | `usize` | сумма `peers_connected` по всем торрентам |
+| `download_bps` | `u64` | сглаженная скорость загрузки, как в `totals()`, байт/с |
+| `upload_bps` | `u64` | то же для отдачи |
+| `uptime_secs` | `u64` | секунд с создания менеджера |
+
+`Diagnostics` — `Serialize`/`Deserialize` без переименования, поля в JSON
+остаются `snake_case`, как и у остальных DTO. Внутри `diagnostics()` вызывает
+`totals()`, а тот поднимает фоновые задачи через `ensure_background()`, поэтому
+самый первый вызов может их запустить. Замок проброса берётся через `try_lock`:
+если проброс как раз обновляется, `mapped_external` окажется `None` — лучше
+показать «нет данных», чем заблокировать поток интерфейса. `dht_nodes` читается
+только у живого узла, поэтому при занятом UDP-порте (`dht: true`) там будет `0`.
+
+**`EngineError::InvalidInput`.** Новый вариант (`#[error("{0}")]` — сообщение
+уходит как есть, без префикса) для значений, которые нельзя принять. Возвращается
+из `set_trackers` (три вида проверки адреса выше) и `reannounce` (пустой список);
+неизвестный id по-прежнему `NotFound`. Бэкенду при обновлении важно, что
+перечисление выросло: исчерпывающие `match` по `EngineError` и маппинг в
+Tauri-ошибки нужно дополнить веткой, а текст показывать пользователю без
+изменений.
+
+**Ограничения 1.7.**
+
+* расписание на не-Windows считается по UTC: часового пояса в зависимостях нет;
+* граница окна применяется на ближайшем тике, поэтому `schedule_active` и
+  действующие лимиты могут отставать от календаря до 500 мс; смена настроек
+  через `set_config` — сразу;
+* расписание задаёт только глобальные лимиты сессии; лимит торрента
+  по-прежнему действует поверх (`min`), и «поднять» торрент выше торрентного
+  потолка окно не может;
+* `EngineConfig.sequential` влияет только на новые торренты — для существующих
+  нужен `set_sequential`;
+* `Sequential` игнорирует уровни приоритетов: `Low`/`Normal`/`High` перестают
+  влиять на порядок (полезен остаётся только `Skip`); уже запрошенные куски при
+  переключении не отменяются;
+* список `set_trackers` обрезается до 100 адресов молча, а объявления идут
+  только по первым 16 (`MAX_TRACKER_LOOPS`); лишние адреса видны в UI, но не
+  опрашиваются;
+* `set_trackers` на magnet до метаданных не окончателен: после появления
+  метаинформации её трекеры встают в начало списка, а сравнение идёт по точному
+  совпадению строки, поэтому адрес, отличающийся регистром, может остаться
+  дважды;
+* `reannounce` — только побудка: ответа не ждёт, на паузе объявление уйдёт после
+  `resume`, для magnet без метаданных это `Ok(())` без сетевого действия;
+* `dht_port` — настроенное значение; фактически занятый порт не выводится, а
+  если UDP-порт занят и узел не поднялся, `dht: true` останется, а `dht_nodes`
+  будет `0`;
+* `mapped_external` — шлюз, а не внешний IP; при обновлении проброса поле
+  временно `None`, а UDP-порт DHT не пробрасывается (остаётся TCP-only);
+* `Diagnostics.sequential` — настройка, а не количество торрентов в
+  последовательном режиме; `diagnostics()` может поднять фоновые задачи при
+  первом вызове;
+* `InvalidInput` — новый вариант ошибки, а `EngineError` не помечен
+  `#[non_exhaustive]`, так что исчерпывающие `match` по нему в бэкенде придётся
+  обновить.
+
+**Проверки.** `cargo test --workspace` — 266 тестов пройдено, 0 провалов, 1
+пропущен (`port_map::tests::map_port_on_real_gateway` — нужен живой роутер).
+По 1.7 добавлено: `engine::tests::config_sanitizes_schedule` (нормализация минут
+и лимитов окна, выключение окна нулевой длины), `engine::tests::schedule_window_bounds_and_crossing_midnight`
+(полуинтервал, полночь, значения вне суток), `engine::tests::tracker_list_is_normalized`
+(обрезка пробелов, дубли, схемы, отсутствие хоста, предел 100),
+`engine::tests::diagnostics_of_empty_manager`, `engine::tests::torrent_controls_report_missing_torrent`
+(`NotFound` у всех новых ручек), `picker::tests::sequential_order_takes_smallest_index`,
+`sequential_order_skips_missing_and_excluded`, `sequential_order_ignores_piece_levels`
+(порядок, выбор файлов и игнор уровней). Гейты: `cargo clippy --workspace
+--all-targets -- -D warnings` и `cargo fmt --all -- --check` — чисто.

@@ -105,19 +105,42 @@
   position: relative;
   display: flex;
   align-items: center;
+  max-width: 320px;
+}
+
+.sort__button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   height: 32px;
-  padding-left: 10px;
+  max-width: 100%;
+  padding: 0 9px 0 10px;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
   background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12.5px;
   cursor: pointer;
 }
 
-.sort:hover {
+.sort__button:hover {
   border-color: var(--color-text-faint);
 }
 
+.sort__button[aria-expanded="true"],
+.sort__button:active {
+  border-color: var(--color-focus);
+  background: var(--color-surface-2);
+}
+
+.sort__button:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -1px;
+}
+
 .sort__label {
+  flex: none;
   color: var(--color-text-faint);
   font-size: 11px;
   letter-spacing: 0.03em;
@@ -125,30 +148,207 @@
   pointer-events: none;
 }
 
-.sort__control {
+.sort__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.sort__button > svg {
+  flex: none;
+  color: var(--color-text-faint);
+}
+
+/* --- Панель сортировки (1.7) ------------------------------------------ */
+
+.sort-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 324px;
+  max-width: calc(100vw - 24px);
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-floating);
+}
+
+.sort-panel[hidden] {
+  display: none;
+}
+
+.sort-panel__title {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sort-panel__keys {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sort-panel__key {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+}
+
+.sort-panel__rank {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--color-accent-soft);
+  color: var(--color-accent-soft-ink);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sort-panel__name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sort-panel__controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sort-panel__dir,
+.sort-panel__move,
+.sort-panel__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.sort-panel__dir {
+  padding: 0 6px;
+  border-color: var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-text);
+}
+
+.sort-panel__dir > svg {
+  color: var(--color-text-muted);
+}
+
+.sort-panel__dir:hover,
+.sort-panel__move:hover {
+  background: var(--color-surface-3);
+  color: var(--color-text);
+}
+
+.sort-panel__remove:hover {
+  background: var(--color-danger-soft);
+  color: var(--color-danger-ink);
+}
+
+.sort-panel__move:disabled,
+.sort-panel__remove:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.sort-panel__move:disabled:hover,
+.sort-panel__remove:disabled:hover {
+  background: none;
+  color: var(--color-text-muted);
+}
+
+.sort-panel__dir:focus-visible,
+.sort-panel__move:focus-visible,
+.sort-panel__remove:focus-visible,
+.sort-panel__reset:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+.sort-panel__add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sort-panel__add-row[hidden] {
+  display: none;
+}
+
+.sort-panel__add-label {
+  flex: none;
+  color: var(--color-text-faint);
+  font-size: 11.5px;
+}
+
+.sort-panel__select {
+  flex: 1;
   min-width: 0;
 }
 
-.sort__control .select__button {
-  height: 30px;
-  padding: 0 4px 0 6px;
-  border: 0;
-  background: none;
-  font-size: 12.5px;
+.sort-panel__select .select__button {
+  width: 100%;
+  height: 28px;
+  padding: 0 6px 0 8px;
+  border-color: var(--color-border);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-size: 12px;
 }
 
-.sort__control .select__button:hover {
-  border: 0;
+.sort-panel__footer,
+.sort-panel__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
-.sort__control .select__button:focus-visible {
-  outline: 2px solid var(--color-focus);
-  outline-offset: 0;
+.sort-panel__hint {
+  margin: 0;
+  color: var(--color-text-faint);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
-.sort:focus-within {
-  border-color: var(--color-focus);
-  outline: 1px solid var(--color-focus);
+.sort-panel__reset {
+  flex: none;
 }
 
 /* --- Список ------------------------------------------------------------ */
@@ -476,6 +676,11 @@
 
   .sort {
     order: 3;
+  }
+
+  .sort-panel {
+    right: auto;
+    left: 0;
   }
 
   .torrent {

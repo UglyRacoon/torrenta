@@ -160,23 +160,30 @@ pub struct AppEngine {
     pub manager: Arc<TorrentManager>,
     /// Текущие настройки (источник истины для `get_settings`).
     settings: RwLock<SettingsDto>,
-    /// Каталог конфигурации приложения.
+    /// Каталог данных приложения: `%APPDATA%` или `TorrentaData` рядом с exe
+    /// (выбирается один раз при старте, см. [`settings::resolve_data_dir`]).
     app_dir: PathBuf,
     /// Путь к `settings.json`.
     settings_path: PathBuf,
     /// Каталог загрузки по умолчанию (системный «Загрузки»).
     fallback_dir: PathBuf,
+    /// `true`, если данные лежат рядом с исполняемым файлом (портативный режим).
+    portable: bool,
     /// Обратный отсчёт автовыключения (делится с наблюдателем).
     auto_shutdown: Arc<AutoShutdown>,
 }
 
 impl AppEngine {
     /// Создаёт состояние приложения.
+    ///
+    /// `app_dir` — уже разрешённый каталог данных (см.
+    /// [`settings::resolve_data_dir`]), `portable` — признак портативного режима.
     pub fn new(
         manager: Arc<TorrentManager>,
         settings: SettingsDto,
         app_dir: PathBuf,
         fallback_dir: PathBuf,
+        portable: bool,
     ) -> Self {
         let settings_path = settings::settings_path(&app_dir);
         Self {
@@ -185,13 +192,28 @@ impl AppEngine {
             app_dir,
             settings_path,
             fallback_dir,
+            portable,
             auto_shutdown: Arc::new(AutoShutdown::new()),
         }
     }
 
-    /// Каталог конфигурации приложения.
+    /// Каталог данных приложения.
     pub fn app_dir(&self) -> &Path {
         &self.app_dir
+    }
+
+    /// `true`, если приложение работает в портативном режиме.
+    pub fn portable(&self) -> bool {
+        self.portable
+    }
+
+    /// Путь к текущему исполняемому файлу (цель привязки `.torrent`-файлов).
+    ///
+    /// Читается при каждом вызове, а не кэшируется: в портативном режиме exe
+    /// лежит рядом с данными, и привязка должна вести именно на работающую
+    /// копию, а не на путь, запомненный при старте.
+    pub fn exe_path(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok()
     }
 
     /// Путь к файлу настроек.
@@ -397,6 +419,8 @@ mod tests {
             files: Vec::new(),
             trackers: Vec::new(),
             peers: Vec::new(),
+            // P3: у нового торрента порядок скачивания обычный.
+            sequential: false,
         }
     }
 

@@ -2,6 +2,10 @@
 //!
 //! Модуль собирает всё вместе:
 //! * регистрирует плагины диалогов и открытия ссылок;
+//! * регистрирует плагин обновлений (`tauri-plugin-updater`) и отвечает на
+//!   `check_update`: без ключа подписи обновления честно считаются ненастроенными;
+//! * выбирает каталог данных: `%APPDATA%` или портативный `TorrentaData` рядом с
+//!   `torrenta.exe` ([`settings::resolve_data_dir`]);
 //! * поднимает движок `torrent-core` с настройками из `settings.json`;
 //! * кладёт [`AppEngine`] в managed-состояние Tauri (его и видят команды);
 //! * применяет тему к главному окну при старте;
@@ -11,6 +15,8 @@
 //! * запускает наблюдатель автовыключения (`engine://auto-shutdown`);
 //! * создаёт иконку в трее ([`tray`]) и показывает окно, если не выбран запуск «в трее»;
 //! * синхронизирует автозапуск в реестре ([`autostart`]) с настройкой;
+//! * проверяет и при необходимости чинит привязку `.torrent`-файлов в реестре
+//!   ([`association`]): после обновления она могла остаться от старой сборки;
 //! * перехватывает закрытие окна, когда включено «закрывать в трей»;
 //! * держит один экземпляр приложения и открывает `.torrent`/magnet из
 //!   проводника ([`single_instance`]);
@@ -18,8 +24,9 @@
 //! * следит за папкой наблюдения и добавляет из неё `.torrent`-файлы ([`watch`]);
 //! * показывает уведомление Windows о завершённой загрузке;
 //! * обновляет подсказку иконки в трее текущими скоростями ([`tray`]);
-//! * регистрирует 25 команд из [`commands`] и [`single_instance`].
+//! * регистрирует 34 команды из [`commands`] и [`single_instance`].
 
+pub mod association;
 pub mod auto_shutdown;
 pub mod autostart;
 pub mod commands;
@@ -90,6 +97,10 @@ pub fn run() {
         // Уведомления Windows о завершённых загрузках. Разрешение
         // `notification:default` выдано в `capabilities/default.json`.
         .plugin(tauri_plugin_notification::init())
+        // Плагин обновлений. В конфигурации он выключен (`active: false`) и без
+        // эндпоинтов: команда `check_update` сообщает, что обновления не настроены,
+        // пока в `tauri.conf.json` не появится ключ подписи.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             setup(app).map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             Ok(())
@@ -102,6 +113,11 @@ pub fn run() {
             commands::recheck_torrent,
             commands::set_file_priorities,
             commands::set_torrent_limits,
+            commands::set_torrent_sequential,
+            commands::torrent_trackers,
+            commands::set_torrent_trackers,
+            commands::reannounce_torrent,
+            commands::engine_diagnostics,
             commands::pick_torrent_files,
             commands::pick_download_dir,
             commands::pick_watch_dir,
@@ -118,6 +134,10 @@ pub fn run() {
             commands::reveal_torrent,
             commands::open_download_dir,
             commands::open_external,
+            commands::association_status,
+            commands::repair_association,
+            commands::portable_info,
+            commands::check_update,
             commands::quit_app,
             single_instance::take_open_request,
         ])
@@ -134,10 +154,23 @@ pub fn run() {
 /// Ошибка означает, что приложение не может работать: каталог настроек не
 /// определяется, поэтому `run` печатает текст и завершает процесс.
 fn setup(app: &mut tauri::App) -> Result<(), String> {
-    let app_dir = app
+    let config_dir = app
         .path()
         .app_config_dir()
         .map_err(|err| format!("не удалось определить каталог настроек: {err}"))?;
+
+    // Каталог данных выбирается ровно один раз и дальше используется всеми
+    // модулями: настройками, сессией и состоянием. Портативный режим включается
+    // маркером рядом с exe, отсутствие прав на запись откатывает его на `%APPDATA%`.
+    let data = settings::resolve_data_dir(exe_dir().as_deref(), &config_dir);
+    let app_dir = data.dir;
+    let portable = data.portable;
+    if portable {
+        eprintln!(
+            "[torrenta] портативный режим: данные в «{}»",
+            app_dir.display()
+        );
+    }
 
     let fallback_dir = app
         .path()
@@ -166,7 +199,8 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     let theme = loaded.theme.clone();
     let start_minimized = loaded.start_minimized;
     let autostart_enabled = loaded.autostart;
-    let engine = AppEngine::new(manager, loaded, app_dir.clone(), fallback_dir);
+    let associate_files = loaded.associate_files;
+    let engine = AppEngine::new(manager, loaded, app_dir.clone(), fallback_dir, portable);
     let handle = app.handle().clone();
     let _ = app.manage(engine);
     // Реестр сессии: помнит, откуда добавлен каждый торрент, и умеет читать
@@ -194,6 +228,27 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     if let Err(err) = autostart::apply(autostart_enabled) {
         eprintln!("[torrenta] не удалось настроить автозапуск: {err}");
     }
+
+    // Привязка `.torrent`-файлов: после обновления в реестре мог остаться путь к
+    // старой сборке, а ключ `UserChoiceLatest` с пустым `ProgId` вообще гасит
+    // двойной клик. `ensure` идемпотентен и никогда не отбирает файлы у живой
+    // чужой программы; ошибки реестра не мешают старту приложения.
+    let association_state = match association::current_exe() {
+        Some(exe) if associate_files => association::ensure(&exe),
+        // Флаг выключен: только смотрим, кто открывает файлы, ничего не пишем.
+        Some(exe) => association::status(&exe),
+        None => association::AssociationState::unavailable(
+            "не удалось определить путь к приложению".to_string(),
+        ),
+    };
+    if !association_state.is_owner {
+        if let Some(message) = association_state.message.as_deref() {
+            eprintln!("[torrenta] привязка .torrent: {message}");
+        }
+    }
+    // Состояние нужно командам `association_status`/`repair_association`: они
+    // обновляют его после явного действия пользователя.
+    let _ = app.manage(association::AssociationSlot::new(association_state));
 
     // Главное окно из конфигурации создаётся скрытым. Показываем его, если это не
     // запуск в трее; без иконки в трее показываем всегда, иначе окно не найти.
@@ -223,6 +278,16 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     watch::spawn(handle);
 
     Ok(())
+}
+
+/// Каталог исполняемого файла — в нём ищется маркер портативного режима.
+///
+/// `None` означает, что путь exe определить нельзя: тогда портативный режим
+/// просто не включается, и приложение работает на каталоге `%APPDATA%`.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 /// Применяет тему к главному окну: системное оформление заголовка и фон.

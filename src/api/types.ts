@@ -66,6 +66,8 @@ export interface TorrentSnapshot {
   seed_ratio: number;
   /** Сработал лимит раздачи (1.6): торрент остановлен и ждёт ручного возобновления. */
   seed_limit_reached: boolean;
+  /** Последовательная загрузка (1.7): куски качаются по порядку, а не вразброс. */
+  sequential: boolean;
   save_path: string;
   added_at: number;
   files: FileView[];
@@ -122,7 +124,91 @@ export interface SettingsDto {
   seed_ratio_limit: number;
   /** Останавливать раздачу через N минут (1.6); 0 — без ограничения. */
   seed_time_limit_min: number;
+  /** Связывать файлы .torrent с Torrenta и чинить привязку при старте (1.7, §4.5). */
+  associate_files: boolean;
+  /** Новые торренты качать последовательно — куски по порядку (1.7). */
+  sequential: boolean;
+  /** Расписание скорости включено (1.7). */
+  schedule_enabled: boolean;
+  /** Начало окна расписания, минуты от полуночи 0..1439 (1.7). */
+  schedule_from_min: number;
+  /** Конец окна расписания, минуты от полуночи 0..1439 (1.7); меньше начала — окно через полночь. */
+  schedule_to_min: number;
+  /** Лимит приёма внутри окна, КиБ/с (1.7); 0 — без ограничения. */
+  schedule_download_limit_kib: number;
+  /** Лимит отдачи внутри окна, КиБ/с (1.7); 0 — без ограничения. */
+  schedule_upload_limit_kib: number;
   theme: ThemeName;
+}
+
+/**
+ * Срез состояния движка для окна «Диагностика» (1.7).
+ * Поля идут в порядке контракта §1.5; все значения — как их отдаёт движок.
+ */
+export interface DiagnosticsDto {
+  listen_port: number;
+  dht: boolean;
+  dht_port: number;
+  dht_nodes: number;
+  pex: boolean;
+  web_seeds: boolean;
+  /** Включённый прокси в виде socks5://host:port; null — выключен. */
+  proxy: string | null;
+  port_mapping: boolean;
+  /** Внешний адрес, полученный пробросом; null — проброс не удался. */
+  mapped_external: string | null;
+  schedule_enabled: boolean;
+  schedule_from_min: number;
+  schedule_to_min: number;
+  /** Действует ли окно расписания прямо сейчас. */
+  schedule_active: boolean;
+  download_limit_kib: number;
+  upload_limit_kib: number;
+  sequential: boolean;
+  torrents: number;
+  active: number;
+  peers: number;
+  download_bps: number;
+  upload_bps: number;
+  uptime_secs: number;
+}
+
+/**
+ * Состояние привязки файлов `.torrent` к Torrenta (1.7, §4.5).
+ * Внимание: ключи этого DTO — camelCase (`isOwner`), так договорились с
+ * бэкендом; у остальных DTO snake_case.
+ */
+export interface AssociationDto {
+  /** ProgId текущего обработчика `.torrent` (null — привязки нет). */
+  handler: string | null;
+  /** Команда открытия текущего обработчика. */
+  command: string | null;
+  /** Текущий exe Torrenta открывает `.torrent`. */
+  isOwner: boolean;
+  /** Привязка была (пере)записана в этом вызове. */
+  repaired: boolean;
+  /** Пояснение для интерфейса (чужая программа, вне Windows, что не удалось). */
+  message: string | null;
+  /** Платформа поддерживает ассоциации (Windows); иначе причина в `message`. */
+  available: boolean;
+}
+
+/** Портативный режим (1.7): данные рядом с исполняемым файлом. */
+export interface PortableInfoDto {
+  portable: boolean;
+  data_dir: string;
+}
+
+/**
+ * Состояние проверки обновлений (1.7).
+ * `configured = false` — сборка без ключа подписи, проверять нечего.
+ */
+export interface UpdateStateDto {
+  configured: boolean;
+  current_version: string;
+  /** Версия, которая доступна для скачивания; null — обновлений нет. */
+  available: string | null;
+  message: string | null;
 }
 
 export interface AppInfoDto {

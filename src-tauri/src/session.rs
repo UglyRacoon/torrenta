@@ -4,7 +4,10 @@
 //! как до закрытия: те же magnet-ссылки, те же выбранные файлы, те же паузы,
 //! лимиты и приоритеты.
 //!
-//! Где лежит сессия (каталог `app_config_dir` + [`SESSION_DIR_NAME`]):
+//! Где лежит сессия (каталог данных приложения + [`SESSION_DIR_NAME`]).
+//! Каталог данных выбирает [`crate::settings::resolve_data_dir`]: обычно это
+//! `%APPDATA%\Torrenta`, в портативном режиме — `<каталог exe>\TorrentaData`.
+//! Внутри:
 //! * `session/session.json` — список [`SessionEntry`];
 //! * `session/session-data/<info_hash>.torrent` — копия содержимого `.torrent`
 //!   для торрентов, добавленных файлом: при восстановлении метаданные берутся
@@ -890,6 +893,8 @@ mod tests {
             ],
             trackers: Vec::new(),
             peers: Vec::<PeerView>::new(),
+            // P3: порядок скачивания к тесту сессии отношения не имеет.
+            sequential: false,
         }
     }
 

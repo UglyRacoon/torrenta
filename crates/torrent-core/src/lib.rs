@@ -12,7 +12,7 @@
 //! * [`tracker`] — announce по HTTP(S) и UDP (BEP 3, BEP 23, BEP 15);
 //! * [`wire`] — сообщения peer wire protocol (BEP 3, BEP 10);
 //! * [`bitfield`] — битовая карта кусков;
-//! * [`picker`] — выбор кусков (rarest-first + приоритеты);
+//! * [`picker`] — выбор кусков (rarest-first или по порядку, с учётом приоритетов);
 //! * [`storage`] — запись/чтение кусков в файлы на диске;
 //! * [`engine`] — менеджер торрентов, сессии с пирами, статистика.
 
@@ -36,12 +36,13 @@ pub mod wire;
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};
 pub use bitfield::Bitfield;
 pub use engine::{
-    AddOptions, AddSource, EngineConfig, EngineError, EngineEvent, FilePriority, FileView,
-    GlobalTotals, PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot, TorrentState,
+    AddOptions, AddSource, Diagnostics, EngineConfig, EngineError, EngineEvent, FilePriority,
+    FileView, GlobalTotals, PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot,
+    TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};
 pub use metainfo::{FileEntry, InfoHash, Metainfo, MetainfoError};
-pub use picker::PiecePicker;
+pub use picker::{PickOrder, PiecePicker};
 pub use storage::Storage;
 pub use tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, PeerAddr, TrackerError};
 pub use wire::{Handshake, Message, WireError};

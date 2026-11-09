@@ -24,6 +24,15 @@ desktop.ini
 .vscode/*
 !.vscode/extensions.json
 
+# E2E (Playwright)
+/playwright-report
+/test-results
+/blob-report
+/.playwright
+
+# Ключи подписи обновлений — только через секреты CI
+/.tauri-keys
+
 # Артефакты и данные
 *.torrent.rejected
 /downloads

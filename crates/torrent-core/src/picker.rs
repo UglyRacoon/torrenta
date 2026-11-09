@@ -24,6 +24,23 @@ pub enum PieceStatus {
     InProgress,
 }
 
+/// Порядок выбора кусков.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PickOrder {
+    /// Rarest-first: сначала то, что есть у меньшего числа пиров.
+    ///
+    /// Поведение по умолчанию: так куски дольше живут в сети, а на старте
+    /// загрузки порядок ближе к началу файлов.
+    #[default]
+    Rarest,
+    /// По порядку: сначала кусок с наименьшим индексом.
+    ///
+    /// Нужно для просмотра/запуска по мере загрузки: пользователь получает
+    /// данные с начала файла, а не случайные куски. Учитываются только нужные
+    /// куски (выбранные файлы), приоритеты кусков не действуют.
+    Sequential,
+}
+
 /// Планировщик кусков для одного торрента.
 pub struct PiecePicker {
     piece_count: usize,
@@ -39,6 +56,8 @@ pub struct PiecePicker {
     wanted: Bitfield,
     /// Уровень приоритета каждого куска: 0 — низкий, 1 — обычный, 2 — высокий.
     levels: Vec<u8>,
+    /// Какой кусок брать следующим: rarest-first или по порядку.
+    order: PickOrder,
 }
 
 impl PiecePicker {
@@ -53,6 +72,7 @@ impl PiecePicker {
             max_in_progress: (piece_count / 40).clamp(4, 64),
             wanted: Bitfield::all_set(piece_count),
             levels: vec![LEVEL_NORMAL; piece_count],
+            order: PickOrder::default(),
         }
     }
 
@@ -68,6 +88,16 @@ impl PiecePicker {
 
     pub fn piece_count(&self) -> usize {
         self.piece_count
+    }
+
+    /// Текущий порядок выбора кусков.
+    pub fn order(&self) -> PickOrder {
+        self.order
+    }
+
+    /// Меняет порядок выбора кусков; уже выданные куски не пересматриваются.
+    pub fn set_order(&mut self, order: PickOrder) {
+        self.order = order;
     }
 
     /// Битовая карта имеющихся кусков.
@@ -254,18 +284,36 @@ impl PiecePicker {
 
     /// Лучший кандидат: сначала высокий приоритет, затем обычный, затем низкий;
     /// внутри уровня — rarest-first, на старте — последовательно с начала.
+    ///
+    /// В режиме [`PickOrder::Sequential`] приоритеты уровней не действуют:
+    /// берётся просто наименьший индекс среди доступных нужных кусков.
     fn best(
         &self,
         peer_have: &Bitfield,
         exclude: &HashSet<usize>,
         wanted: &Bitfield,
     ) -> Option<usize> {
+        if self.order == PickOrder::Sequential {
+            return self.first_available(peer_have, exclude, wanted);
+        }
         for level in (0..=LEVEL_HIGH).rev() {
             if let Some(index) = self.best_level(peer_have, exclude, wanted, level) {
                 return Some(index);
             }
         }
         None
+    }
+
+    /// Наименьший индекс среди кусков, которые можно взять прямо сейчас.
+    fn first_available(
+        &self,
+        peer_have: &Bitfield,
+        exclude: &HashSet<usize>,
+        wanted: &Bitfield,
+    ) -> Option<usize> {
+        (0..self.piece_count).find(|&i| {
+            wanted.get(i) && self.peer_has(i) && !exclude.contains(&i) && peer_have.get(i)
+        })
     }
 
     /// Лучший кандидат среди кусков одного уровня приоритета.
@@ -468,5 +516,71 @@ mod tests {
             full.mark_have(index);
         }
         assert!(full.is_complete());
+    }
+
+    #[test]
+    fn sequential_order_takes_smallest_index() {
+        let mut picker = PiecePicker::new(6);
+        picker.set_order(PickOrder::Sequential);
+        let mut peer = Bitfield::new(6);
+        for i in 0..6 {
+            peer.set(i);
+        }
+        // Первые два куска уже есть — их пропускаем.
+        picker.mark_have(0);
+        picker.mark_have(1);
+        let mut picked = Vec::new();
+        while let Some(index) = picker.pick(&peer, &HashSet::new()) {
+            picked.push(index);
+        }
+        assert_eq!(picked, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sequential_order_skips_missing_and_excluded() {
+        let mut picker = PiecePicker::new(5);
+        picker.set_order(PickOrder::Sequential);
+        // Нужны только куски 1, 3 и 4.
+        let mut wanted = Bitfield::new(5);
+        wanted.set(1);
+        wanted.set(3);
+        wanted.set(4);
+        picker.set_wanted(&wanted);
+        // У пира нет куска 1 — начинаем с 3.
+        let mut peer = Bitfield::new(5);
+        peer.set(0);
+        peer.set(2);
+        peer.set(3);
+        peer.set(4);
+        let mut exclude = HashSet::new();
+        exclude.insert(3);
+        assert_eq!(picker.pick(&peer, &exclude), Some(4));
+        assert_eq!(picker.pick(&peer, &exclude), None);
+    }
+
+    #[test]
+    fn sequential_order_ignores_piece_levels() {
+        let mut picker = PiecePicker::new(3);
+        picker.set_order(PickOrder::Sequential);
+        // Куски 0 и 2 — низкий, 1 — высокий.
+        picker.set_levels(&[0, 2, 0]);
+        let mut peer = Bitfield::new(3);
+        for i in 0..3 {
+            peer.set(i);
+        }
+        // В последовательном режиме приоритеты не действуют: первым идёт 0.
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(0));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(1));
+        assert_eq!(picker.pick(&peer, &HashSet::new()), Some(2));
+    }
+
+    #[test]
+    fn pick_order_defaults_to_rarest() {
+        let mut picker = PiecePicker::new(3);
+        assert_eq!(picker.order(), PickOrder::Rarest);
+        picker.set_order(PickOrder::Sequential);
+        assert_eq!(picker.order(), PickOrder::Sequential);
+        picker.set_order(PickOrder::Rarest);
+        assert_eq!(picker.order(), PickOrder::Rarest);
     }
 }

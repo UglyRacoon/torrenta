@@ -2,12 +2,16 @@ import type {
   AddOptions,
   AddResult,
   AppPayload,
+  AssociationDto,
   AutoShutdownState,
+  DiagnosticsDto,
   EngineMode,
   FilePriority,
+  PortableInfoDto,
   SettingsDto,
   TorrentPreview,
   TorrentSource,
+  UpdateStateDto,
 } from "./types";
 
 /** Что делать при перетаскивании файлов в окно. */
@@ -35,6 +39,24 @@ export interface EngineApi {
   recheckTorrent(id: number): Promise<void>;
   /** 0 — без ограничения; действует как минимум с глобальным лимитом. */
   setTorrentLimits(id: number, downKib: number, upKib: number): Promise<void>;
+  /** Последовательная загрузка торрента (1.7): куски качаются по порядку. */
+  setTorrentSequential(id: number, on: boolean): Promise<void>;
+  /** Трекеры торрента в порядке добавления (1.7); может быть пустым списком. */
+  torrentTrackers(id: number): Promise<string[]>;
+  /** Замена списка трекеров (1.7); пустой список допустим — останутся DHT и PEX. */
+  setTorrentTrackers(id: number, urls: string[]): Promise<void>;
+  /** Принудительный анонс на трекерах (1.7). */
+  reannounceTorrent(id: number): Promise<void>;
+  /** Срез состояния движка для окна «Диагностика» (1.7). */
+  engineDiagnostics(): Promise<DiagnosticsDto>;
+  /** Портативный режим и каталог данных (1.7). */
+  portableInfo(): Promise<PortableInfoDto>;
+  /** Проверка обновлений (1.7); без ключа подписи — configured = false. */
+  checkUpdate(): Promise<UpdateStateDto>;
+  /** Кто сейчас открывает `.torrent` (1.7, §4.5). */
+  associationStatus(): Promise<AssociationDto>;
+  /** Перезаписать привязку `.torrent` на текущий exe и вернуть новое состояние. */
+  repairAssociation(): Promise<AssociationDto>;
   pickTorrentFiles(): Promise<TorrentSource[]>;
   pickDownloadDir(): Promise<string | null>;
   /** Диалог выбора папки наблюдения (1.5); null — пользователь отменил. */
@@ -67,11 +89,35 @@ export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/**
+ * Клиент, созданный приложением при старте (1.7).
+ *
+ * Вспомогательные окна — диагностика и редактор трекеров — создаются вне
+ * `app.ts`, но им нужен тот же движок: в демо-режиме второй клиент означал бы
+ * второй набор торрентов, и правки трекеров не дошли бы до списка.
+ */
+let active: EngineApi | null = null;
+
+/** Уже созданный клиент или null, если приложение ещё не стартовало. */
+export function currentEngineApi(): EngineApi | null {
+  return active;
+}
+
+/** Тот же клиент, что у приложения; если его ещё нет — создаём и запоминаем. */
+export async function requireEngineApi(): Promise<EngineApi> {
+  if (!active) {
+    active = await createEngineApi();
+  }
+  return active;
+}
+
 export async function createEngineApi(): Promise<EngineApi> {
   if (isTauriRuntime()) {
     const { createTauriApi } = await import("./tauri");
-    return createTauriApi();
+    active = await createTauriApi();
+    return active;
   }
   const { createMockApi } = await import("./mock");
-  return createMockApi();
+  active = await createMockApi();
+  return active;
 }

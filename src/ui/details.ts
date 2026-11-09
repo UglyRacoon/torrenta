@@ -9,7 +9,7 @@ import {
   fmtRate,
   truncateMiddle,
 } from "../lib/format";
-import { h, setAttr, setScaleX, setText } from "../lib/dom";
+import { h, messageOf, setAttr, setScaleX, setText } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { createSelect, type SelectControl, type SelectOption } from "./select";
 
@@ -52,6 +52,12 @@ export interface DetailsOptions {
   onOpenExternal(url: string): void;
   /** Изменение приоритетов файлов; отклонение промиса означает ошибку движка. */
   onFilePriorities(id: number, priorities: FilePriority[]): Promise<void>;
+  /** Открыть редактор трекеров (модалка из `modals.ts`, 1.7). */
+  onEditTrackers(id: number): void;
+  /** Принудительное обновление трекеров (reannounce, 1.7); reject — ошибка движка. */
+  onReannounce(id: number): Promise<void>;
+  /** Последовательная загрузка (1.7); reject — ошибка движка. */
+  onSequentialChange(id: number, enabled: boolean): Promise<void>;
 }
 
 export interface DetailsPanel {
@@ -210,6 +216,47 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     left.card,
   );
 
+  // --- Опции торрента (1.7) ----------------------------------------------
+  const sequentialKnob = h("span", { class: "switch__knob" });
+  const sequentialTrack = h(
+    "span",
+    { class: "switch__track", attrs: { "aria-hidden": "true" } },
+    sequentialKnob,
+  );
+  const sequentialSwitch = h(
+    "button",
+    {
+      class: "switch details__switch",
+      attrs: {
+        type: "button",
+        role: "switch",
+        "aria-checked": "false",
+        "aria-label": "Последовательная загрузка",
+        title: "Последовательная загрузка",
+      },
+    },
+    sequentialTrack,
+  );
+  const sequentialNote = h("p", {
+    class: "details__option-note",
+    attrs: { role: "status", "aria-live": "polite", hidden: true },
+  });
+  const sequentialRow = h(
+    "div",
+    { class: "details__option" },
+    h(
+      "div",
+      { class: "details__option-text" },
+      h("span", { class: "details__option-label", text: "Последовательная загрузка" }),
+      h("span", {
+        class: "details__option-hint",
+        text: "Куски качаются по порядку — можно смотреть по ходу загрузки.",
+      }),
+    ),
+    sequentialSwitch,
+  );
+  const optionsBlock = h("div", { class: "details__options" }, sequentialRow, sequentialNote);
+
   const tabButtons = new Map<TabKey, HTMLButtonElement>();
   const tabCounts = new Map<TabKey, HTMLElement>();
   const tablist = h("div", {
@@ -276,10 +323,31 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   filesPanel.append(filesHead, filesList, filesEmpty);
 
   // --- Трекеры -----------------------------------------------------------
-  const trackersEmpty = h("p", { class: "tabpanel__empty", text: "Трекеры не указаны", hidden: true });
+  // 1.7: список URL из движка + «Изменить» (редактор) и «Обновить трекеры»
+  // (reannounce). Пустой список — это норма: работают DHT и PEX.
+  const trackersEmpty = h("p", {
+    class: "tabpanel__empty",
+    text: "Трекеров нет: DHT и PEX",
+    hidden: true,
+  });
+  const trackersEdit = h("button", {
+    class: "btn btn--xs btn--ghost",
+    attrs: { type: "button", title: "Изменить список трекеров" },
+    text: "Изменить",
+  });
+  const trackersRefresh = h("button", {
+    class: "btn btn--xs btn--ghost",
+    attrs: { type: "button", title: "Запросить трекеры заново" },
+  });
+  trackersRefresh.append(icon("refresh", 13), h("span", { text: "Обновить трекеры" }));
+  const trackersHead = h("div", { class: "trackers__head" }, trackersEdit, trackersRefresh);
   const trackersList = h("div", { class: "trackers", attrs: { role: "list" } });
+  const trackersNote = h("p", {
+    class: "trackers__note",
+    attrs: { role: "status", "aria-live": "polite", hidden: true },
+  });
   const trackersPanel = panel("trackers", "Трекеры");
-  trackersPanel.append(trackersList, trackersEmpty);
+  trackersPanel.append(trackersHead, trackersList, trackersEmpty, trackersNote);
 
   // --- Пиры --------------------------------------------------------------
   const peersEmpty = h("p", { class: "tabpanel__empty", text: "Подключённых пиров нет", hidden: true });
@@ -309,6 +377,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     actions,
     progress,
     stats,
+    optionsBlock,
     tablist,
     filesPanel,
     trackersPanel,
@@ -322,6 +391,12 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   let badgeState: TorrentState | null = null;
   let toggleState: TorrentState | null = null;
   const scale = { value: -1 };
+  // 1.7: состояние опций и трекеров помним отдельно от снимка — движок отвечает
+  // на команды не мгновенно, а мигать интерфейсом на каждом тике нельзя.
+  let currentTrackers: string[] = [];
+  let trackersBusy = false;
+  let sequentialShown: boolean | null = null;
+  let sequentialBusy = false;
 
   function selectTab(key: TabKey, focus = false): void {
     activeTab = key;
@@ -386,6 +461,98 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     if (currentId !== null) {
       options.onRemove(currentId);
     }
+  });
+
+  // --- Трекеры: пояснение и обновление (1.7) ------------------------------
+  function setTrackersNote(text: string, isError: boolean): void {
+    setText(trackersNote, text);
+    trackersNote.classList.toggle("is-error", isError);
+    trackersNote.hidden = text === "";
+  }
+
+  function syncTrackersTools(): void {
+    // Пустой список обновлять нечем: движок ответит ошибкой «нет трекеров».
+    trackersRefresh.disabled = trackersBusy || currentTrackers.length === 0;
+    trackersEdit.disabled = currentId === null;
+  }
+
+  trackersEdit.addEventListener("click", () => {
+    if (currentId === null) {
+      return;
+    }
+    options.onEditTrackers(currentId);
+  });
+
+  trackersRefresh.addEventListener("click", () => {
+    const id = currentId;
+    if (id === null || trackersBusy || currentTrackers.length === 0) {
+      return;
+    }
+    trackersBusy = true;
+    syncTrackersTools();
+    setTrackersNote("Обновляем трекеры…", false);
+    options
+      .onReannounce(id)
+      .then(() => {
+        // Пока ждали ответа, могли выбрать другой торрент — не врём чужой карточке.
+        if (currentId !== id) {
+          return;
+        }
+        trackersBusy = false;
+        syncTrackersTools();
+        setTrackersNote("Трекеры обновлены", false);
+      })
+      .catch((reason: unknown) => {
+        if (currentId !== id) {
+          return;
+        }
+        trackersBusy = false;
+        syncTrackersTools();
+        setTrackersNote(messageOf(reason), true);
+      });
+  });
+
+  // --- Последовательная загрузка (1.7) ------------------------------------
+  function applySequential(value: boolean): void {
+    sequentialShown = value;
+    setAttr(sequentialSwitch, "aria-checked", value ? "true" : "false");
+  }
+
+  function setSequentialNote(text: string, isError: boolean): void {
+    setText(sequentialNote, text);
+    sequentialNote.classList.toggle("is-error", isError);
+    sequentialNote.hidden = text === "";
+  }
+
+  sequentialSwitch.addEventListener("click", () => {
+    const id = currentId;
+    if (id === null || sequentialBusy) {
+      return;
+    }
+    const enabled = sequentialShown !== true;
+    // Оптимистично: переключатель отзывается сразу, а снимок движка догонит.
+    applySequential(enabled);
+    sequentialBusy = true;
+    sequentialSwitch.disabled = true;
+    setSequentialNote("", false);
+    options
+      .onSequentialChange(id, enabled)
+      .then(() => {
+        if (currentId !== id) {
+          return;
+        }
+        sequentialBusy = false;
+        sequentialSwitch.disabled = false;
+      })
+      .catch((reason: unknown) => {
+        if (currentId !== id) {
+          return;
+        }
+        sequentialBusy = false;
+        sequentialSwitch.disabled = false;
+        applySequential(!enabled);
+        setSequentialNote(messageOf(reason), true);
+      });
   });
 
   // --- Ключевые строки ---------------------------------------------------
@@ -551,6 +718,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   selectNoneButton.addEventListener("click", () => applyPriority("skip"));
 
   function renderTrackers(trackers: string[]): void {
+    currentTrackers = trackers;
     const seen = new Set<string>();
     let previous: HTMLElement | null = null;
     for (const url of trackers) {
@@ -586,6 +754,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
       }
     }
     trackersEmpty.hidden = trackers.length > 0;
+    syncTrackersTools();
   }
 
   function renderPeers(torrent: TorrentSnapshot): void {
@@ -760,6 +929,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     mount.hidden = torrent === null || !state.detailsOpen;
     if (!torrent) {
       currentId = null;
+      sequentialShown = null;
       return;
     }
 
@@ -769,6 +939,19 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
       clearPieces();
       badgeState = null;
       toggleState = null;
+      // Ответы на команды прошлого торрента больше не наши (1.7).
+      trackersBusy = false;
+      setTrackersNote("", false);
+      sequentialBusy = false;
+      sequentialSwitch.disabled = false;
+      setSequentialNote("", false);
+    }
+
+    // Переключатель опирается на снимок, пока пользователь его не тронул (1.7).
+    // `=== true` — на случай старого движка без поля sequential.
+    const sequentialSnapshot = torrent.sequential === true;
+    if (sequentialShown === null || sequentialShown === sequentialSnapshot) {
+      applySequential(sequentialSnapshot);
     }
 
     setText(name, torrent.name);

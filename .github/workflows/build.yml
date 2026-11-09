@@ -23,6 +23,60 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Быстрые проверки для ревью: форматирование, clippy и тесты. Запускаются
+  # на пулл-реквестах и вручную, чтобы ошибки стиля и линтера были видны без
+  # ожидания релизной сборки. Интерфейс собирается до Rust: dist нужен как
+  # frontendDist на этапе компиляции.
+  checks:
+    name: Проверки (fmt, clippy, тесты)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Получение исходников
+        uses: actions/checkout@v4
+
+      - name: Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Rust (стабильный, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Кэш Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Версии инструментов
+        shell: pwsh
+        run: |
+          rustc -V
+          cargo -V
+          node -v
+          npm -v
+
+      - name: Зависимости фронтенда
+        run: npm ci
+
+      - name: Сборка интерфейса
+        run: npm run build
+
+      - name: Форматирование Rust
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Тесты
+        run: cargo test --workspace
+
   build:
     name: Сборка (Windows x64)
     runs-on: windows-latest

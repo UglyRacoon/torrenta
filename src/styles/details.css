@@ -184,6 +184,71 @@
   text-overflow: ellipsis;
 }
 
+/* --- Опции торрента (1.7) ---------------------------------------------- */
+
+.details__options {
+  margin: 10px 14px 0;
+}
+
+.details__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.details__option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.details__option-label {
+  color: var(--color-text);
+  font-size: 12px;
+}
+
+.details__option-hint {
+  color: var(--color-text-faint);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.details__switch {
+  flex: none;
+  height: 22px;
+  margin-left: auto;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.details__switch:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.details__switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.details__option-note {
+  margin: 6px 2px 0;
+  color: var(--color-text-faint);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.details__option-note.is-error,
+.trackers__note.is-error {
+  color: var(--color-danger-ink);
+}
+
 /* --- Вкладки ----------------------------------------------------------- */
 
 .tabs {
@@ -361,6 +426,21 @@
 .trackers {
   display: flex;
   flex-direction: column;
+}
+
+.trackers__head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-bottom: 4px;
+}
+
+.trackers__note {
+  margin: 6px 2px 0;
+  color: var(--color-text-faint);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .tracker-row {

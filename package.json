@@ -1,7 +1,7 @@
 {
   "name": "torrenta",
   "private": true,
-  "version": "1.6.0",
+  "version": "1.7.0",
   "type": "module",
   "description": "Torrenta — лёгкий торрент-клиент на Rust + Tauri 2",
   "scripts": {
@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --port 4173",
     "check:contrast": "node scripts/check-contrast.mjs",
+    "test:e2e": "playwright test",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
@@ -17,6 +18,7 @@
     "@tauri-apps/api": "^2.12.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@tauri-apps/cli": "^2.12.4",
     "typescript": "^5.9.3",
     "vite": "^7.2.2"

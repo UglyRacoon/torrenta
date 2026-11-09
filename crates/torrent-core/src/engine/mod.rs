@@ -78,6 +78,139 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Расписание ограничений скорости
+// ---------------------------------------------------------------------------
+
+/// Действующие глобальные лимиты скорости с учётом расписания.
+///
+/// Пересчитывается на каждом тике, но записывается только при реальном
+/// изменении: торренты читают лимит при каждом запросе полосы, и лишние записи
+/// им не нужны.
+#[derive(Debug, Default)]
+pub(crate) struct EffectiveLimits {
+    down_kib: AtomicU32,
+    up_kib: AtomicU32,
+    schedule_active: AtomicBool,
+}
+
+impl EffectiveLimits {
+    /// Действующий лимит загрузки, КиБ/с (0 — без ограничения).
+    pub(crate) fn down_kib(&self) -> u32 {
+        self.down_kib.load(Ordering::Relaxed)
+    }
+
+    /// Действующий лимит отдачи, КиБ/с (0 — без ограничения).
+    pub(crate) fn up_kib(&self) -> u32 {
+        self.up_kib.load(Ordering::Relaxed)
+    }
+
+    /// Активно ли окно расписания прямо сейчас.
+    pub(crate) fn schedule_active(&self) -> bool {
+        self.schedule_active.load(Ordering::Relaxed)
+    }
+
+    /// Записывает значения, только если они изменились.
+    fn set(&self, down_kib: u32, up_kib: u32, schedule_active: bool) {
+        if self.down_kib.load(Ordering::Relaxed) != down_kib {
+            self.down_kib.store(down_kib, Ordering::Relaxed);
+        }
+        if self.up_kib.load(Ordering::Relaxed) != up_kib {
+            self.up_kib.store(up_kib, Ordering::Relaxed);
+        }
+        if self.schedule_active.load(Ordering::Relaxed) != schedule_active {
+            self.schedule_active
+                .store(schedule_active, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Активно ли окно расписания в минуту `minute_of_day`.
+///
+/// Окно может пересекать полночь: при `from > to` оно тянется через 00:00
+/// (например, 23:00 → 07:00 активно с 23:00 до 06:59). Окно нулевой длины
+/// (`from == to`) неактивно всегда.
+fn schedule_window_active(from: u32, to: u32, minute_of_day: u32) -> bool {
+    let from = from % 1440;
+    let to = to % 1440;
+    let minute = minute_of_day % 1440;
+    if from == to {
+        return false;
+    }
+    if from < to {
+        from <= minute && minute < to
+    } else {
+        from <= minute || minute < to
+    }
+}
+
+/// Текущие минуты от полуночи по локальному времени.
+#[cfg(windows)]
+fn local_minute_of_day() -> u32 {
+    /// `SYSTEMTIME` из `minwinbase.h`: восемь полей `u16`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    extern "system" {
+        /// Заполняет структуру текущим локальным временем.
+        fn GetLocalTime(lp_system_time: *mut SystemTime);
+    }
+
+    let mut time = SystemTime::default();
+    // SAFETY: `GetLocalTime` пишет в переданную структуру `SYSTEMTIME`, которая
+    // по layout совпадает с объявленной выше (8 полей `u16`); указатель валиден,
+    // структура живёт до конца функции, других обращений к ней нет.
+    unsafe { GetLocalTime(&mut time) };
+    u32::from(time.hour) * 60 + u32::from(time.minute)
+}
+
+/// Текущие минуты от полуночи по UTC — запасной вариант для не-Windows.
+///
+/// В стандартной библиотеке нет локального времени, а тянуть `chrono`/`time`
+/// ради одного числа не хочется. На этих платформах расписание идёт по UTC;
+/// ограничение известно и затрагивает только не-Windows сборки.
+#[cfg(not(windows))]
+fn local_minute_of_day() -> u32 {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ((secs / 60) % 1440) as u32
+}
+
+/// Пересчитывает действующие лимиты под текущее расписание.
+///
+/// Вызывается на каждом тике и сразу после смены настроек.
+fn update_schedule_limits(inner: &Inner) {
+    let config = rd(&inner.config);
+    let active = config.schedule_enabled
+        && schedule_window_active(
+            config.schedule_from_min,
+            config.schedule_to_min,
+            local_minute_of_day(),
+        );
+    let (down, up) = if active {
+        (
+            config.schedule_download_limit_kib,
+            config.schedule_upload_limit_kib,
+        )
+    } else {
+        (config.download_limit_kib, config.upload_limit_kib)
+    };
+    drop(config);
+    inner.limits_now.set(down, up, active);
+}
+
 /// HTTP-клиент сессии, который можно пересобрать на лету.
 ///
 /// Клиентом пользуются трекеры, magnet-запросы и web seeds. Торренты держат
@@ -185,10 +318,28 @@ pub struct EngineConfig {
     pub seed_ratio_limit: f64,
     /// Остановить раздачу через столько минут раздачи (0 — без ограничения).
     pub seed_time_limit_min: u32,
+    /// Новые торренты качаются в порядке кусков (последовательная загрузка).
+    pub sequential: bool,
+    /// Расписание ограничений скорости включено.
+    pub schedule_enabled: bool,
+    /// Начало окна расписания, минуты от полуночи (0..=1439).
+    pub schedule_from_min: u32,
+    /// Конец окна расписания, минуты от полуночи (0..=1439).
+    pub schedule_to_min: u32,
+    /// Лимит загрузки внутри окна, КиБ/с (0 — без ограничения).
+    pub schedule_download_limit_kib: u32,
+    /// Лимит отдачи внутри окна, КиБ/с (0 — без ограничения).
+    pub schedule_upload_limit_kib: u32,
 }
 
 /// Предел лимитов активных торрентов: больше всё равно не имеет смысла.
 const MAX_ACTIVE_LIMIT: usize = 500;
+
+/// Предел лимитов скорости из расписания, КиБ/с (1 ГиБ/с — уже «без лимита»).
+const MAX_SCHEDULE_LIMIT_KIB: u32 = 1_048_576;
+
+/// Сколько трекеров можно задать торренту вручную.
+const MAX_TRACKERS: usize = 100;
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -209,6 +360,12 @@ impl Default for EngineConfig {
             port_mapping: true,
             seed_ratio_limit: 0.0,
             seed_time_limit_min: 0,
+            sequential: false,
+            schedule_enabled: false,
+            schedule_from_min: 0,
+            schedule_to_min: 0,
+            schedule_download_limit_kib: 0,
+            schedule_upload_limit_kib: 0,
         }
     }
 }
@@ -234,6 +391,16 @@ impl EngineConfig {
         // Отрицательный, бесконечный или NaN лимит раздачи — то же, что «без лимита».
         if !self.seed_ratio_limit.is_finite() || self.seed_ratio_limit < 0.0 {
             self.seed_ratio_limit = 0.0;
+        }
+        // Расписание: минуты считаются от полуночи, поэтому лишние сутки
+        // отбрасываются, а окно нулевой длины равносильно выключенному.
+        self.schedule_from_min %= 1440;
+        self.schedule_to_min %= 1440;
+        self.schedule_download_limit_kib =
+            self.schedule_download_limit_kib.min(MAX_SCHEDULE_LIMIT_KIB);
+        self.schedule_upload_limit_kib = self.schedule_upload_limit_kib.min(MAX_SCHEDULE_LIMIT_KIB);
+        if self.schedule_from_min == self.schedule_to_min {
+            self.schedule_enabled = false;
         }
         self
     }
@@ -337,6 +504,8 @@ pub struct TorrentSnapshot {
     pub seed_ratio: f64,
     /// Сработал лимит раздачи: торрент ждёт ручного возобновления.
     pub seed_limit_reached: bool,
+    /// Последовательная загрузка включена для этого торрента.
+    pub sequential: bool,
     pub save_path: String,
     pub added_at: i64,
     pub files: Vec<FileView>,
@@ -353,6 +522,58 @@ pub struct GlobalTotals {
     pub up_rate: f64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
+}
+
+/// Сводка состояния движка для окна диагностики.
+///
+/// Все значения — снимок «сейчас»: лимиты уже с учётом расписания, счётчики
+/// берутся из тикера статистики, DHT и проброс портов — из текущего состояния.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Diagnostics {
+    /// Порт входящих подключений (0 — не слушаем).
+    pub listen_port: u16,
+    /// DHT включён в настройках.
+    pub dht: bool,
+    /// Настроенный UDP-порт DHT (0 — автоматически).
+    pub dht_port: u16,
+    /// Сколько узлов сейчас в таблице DHT.
+    pub dht_nodes: usize,
+    /// Обмен пирами через PEX включён.
+    pub pex: bool,
+    /// Загрузка с HTTP-источников (web seeds) включена.
+    pub web_seeds: bool,
+    /// Прокси из настроек (`None` — напрямую).
+    pub proxy: Option<String>,
+    /// Проброс портов включён в настройках.
+    pub port_mapping: bool,
+    /// Внешний адрес проброшенного порта, `"1.2.3.4:5678"` (если проброс удался).
+    pub mapped_external: Option<String>,
+    /// Расписание ограничений включено.
+    pub schedule_enabled: bool,
+    /// Начало окна расписания, минуты от полуночи.
+    pub schedule_from_min: u32,
+    /// Конец окна расписания, минуты от полуночи.
+    pub schedule_to_min: u32,
+    /// Окно расписания активно прямо сейчас.
+    pub schedule_active: bool,
+    /// Действующий лимит загрузки, КиБ/с (0 — без ограничения).
+    pub download_limit_kib: u32,
+    /// Действующий лимит отдачи, КиБ/с (0 — без ограничения).
+    pub upload_limit_kib: u32,
+    /// Новые торренты качаются последовательно.
+    pub sequential: bool,
+    /// Всего торрентов в списке.
+    pub torrents: usize,
+    /// Торрентов в активной работе (загрузка, раздача, метаданные).
+    pub active: usize,
+    /// Подключённых пиров по всем торрентам.
+    pub peers: usize,
+    /// Суммарная скорость загрузки, байт/с.
+    pub download_bps: u64,
+    /// Суммарная скорость отдачи, байт/с.
+    pub upload_bps: u64,
+    /// Сколько секунд живёт менеджер с момента создания.
+    pub uptime_secs: u64,
 }
 
 /// Источник добавления торрента.
@@ -435,6 +656,9 @@ pub enum EngineError {
     Selection,
     #[error("торрент ещё не готов к перепроверке")]
     NotReady,
+    /// Пользователь передал значение, которое нельзя принять (список трекеров).
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 /// События движка (транслируются подписчикам).
@@ -838,6 +1062,9 @@ pub(crate) struct TorrentHandle {
     pub(crate) pending_priorities: Mutex<Option<Vec<FilePriority>>>,
     /// Учёт лимитов раздачи по соотношению и времени.
     pub(crate) seed_meter: SeedMeter,
+    /// Последовательная загрузка кусков: переживает отсутствие рантайма
+    /// (magnet без метаданных) и применяется при его создании.
+    pub(crate) sequential: AtomicBool,
 }
 
 impl TorrentHandle {
@@ -1087,7 +1314,6 @@ impl TorrentHandle {
             None
         };
         let limits = *rd(&self.limits);
-        let config = rd(&self.env.config).clone();
         let downloaded = self.stats.downloaded.load(Ordering::Relaxed);
         let uploaded = self.stats.uploaded.load(Ordering::Relaxed);
         TorrentSnapshot {
@@ -1112,11 +1338,12 @@ impl TorrentHandle {
             peers_known: self.stats.peers_known.load(Ordering::Relaxed),
             down_rate,
             up_rate,
-            down_limit_kib: effective_limit(config.download_limit_kib, limits.down_kib),
-            up_limit_kib: effective_limit(config.upload_limit_kib, limits.up_kib),
+            down_limit_kib: effective_limit(self.env.now.down_kib(), limits.down_kib),
+            up_limit_kib: effective_limit(self.env.now.up_kib(), limits.up_kib),
             eta_seconds: eta,
             seed_ratio: seed_ratio(uploaded, downloaded),
             seed_limit_reached: self.seed_meter.limit_reached(),
+            sequential: self.sequential.load(Ordering::Relaxed),
             save_path: self.save_dir.to_string_lossy().into_owned(),
             added_at: self.added_at,
             files,
@@ -1129,6 +1356,42 @@ impl TorrentHandle {
 // ---------------------------------------------------------------------------
 // Менеджер торрентов
 // ---------------------------------------------------------------------------
+
+/// Приводит список трекеров к виду, который принимает движок.
+///
+/// Обрезает пробелы, выбрасывает пустые строки и повторы без учёта регистра,
+/// проверяет схему (`http`, `https`, `udp`) и наличие хоста. Адреса сверх
+/// [`MAX_TRACKERS`] отбрасываются: движок всё равно не станет опрашивать их
+/// все, а список не должен расти без предела.
+fn normalize_trackers(urls: Vec<String>) -> Result<Vec<String>, EngineError> {
+    let mut out: Vec<String> = Vec::new();
+    for url in urls {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let parsed = url::Url::parse(url)
+            .map_err(|_| EngineError::InvalidInput(format!("некорректный адрес трекера: {url}")))?;
+        if !matches!(parsed.scheme(), "http" | "https" | "udp") {
+            return Err(EngineError::InvalidInput(format!(
+                "неподдерживаемая схема трекера: {url}"
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(EngineError::InvalidInput(format!(
+                "в адресе трекера нет хоста: {url}"
+            )));
+        }
+        if out.iter().any(|seen| seen.eq_ignore_ascii_case(url)) {
+            continue;
+        }
+        if out.len() == MAX_TRACKERS {
+            break;
+        }
+        out.push(url.to_string());
+    }
+    Ok(out)
+}
 
 struct Inner {
     config: Arc<RwLock<EngineConfig>>,
@@ -1149,6 +1412,10 @@ struct Inner {
     mapping: tokio::sync::Mutex<Vec<PortMapping>>,
     /// Узел DHT сессии; поднимается и гасится вместе с настройкой `dht`.
     dht: Arc<RwLock<Option<Arc<crate::dht::Dht>>>>,
+    /// Действующие глобальные лимиты с учётом расписания (общие для торрентов).
+    limits_now: Arc<EffectiveLimits>,
+    /// Момент создания менеджера: от него считается `uptime_secs`.
+    started: Instant,
 }
 
 /// Менеджер торрентов — единственная точка входа движка для Tauri-бэкенда.
@@ -1182,8 +1449,13 @@ impl TorrentManager {
                 limiters: Arc::new(SharedLimiters::new()),
                 mapping: tokio::sync::Mutex::new(Vec::new()),
                 dht: Arc::new(RwLock::new(None)),
+                limits_now: Arc::new(EffectiveLimits::default()),
+                started: Instant::now(),
             }),
         });
+        // Расписание может быть активным уже на старте: считаем лимиты сразу,
+        // не дожидаясь первого тика.
+        update_schedule_limits(&manager.inner);
         manager.ensure_background();
         manager
     }
@@ -1208,6 +1480,9 @@ impl TorrentManager {
             self.inner.http.replace(build_http(&config));
         }
         *wr(&self.inner.config) = config;
+        // Расписание могло включиться/выключиться или сменить окно: лимиты
+        // пересчитываем сразу, не дожидаясь тика.
+        update_schedule_limits(&self.inner);
         // Лимиты активных торрентов могли поменяться — сразу пересобираем очередь.
         self.schedule();
         // Проброс порта мог быть включён или выключен: применяем в фоне.
@@ -1393,6 +1668,98 @@ impl TorrentManager {
         let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
         *wr(&handle.limits) = Limits { down_kib, up_kib };
         Ok(())
+    }
+
+    /// Включает или выключает последовательную загрузку торрента.
+    ///
+    /// Работает и для magnet-ссылки без метаданных: настройка применится, как
+    /// только появится рантайм.
+    pub fn set_sequential(&self, id: u64, on: bool) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        handle.sequential.store(on, Ordering::Relaxed);
+        if let Some(runtime) = handle.runtime_clone() {
+            runtime.set_sequential(on);
+        }
+        Ok(())
+    }
+
+    /// Трекеры торрента в порядке метаданных с добавленными вручную в конце.
+    pub fn trackers(&self, id: u64) -> Result<Vec<String>, EngineError> {
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        let trackers = rd(&handle.stats.trackers).clone();
+        Ok(trackers)
+    }
+
+    /// Заменяет список трекеров торрента и сразу объявляется им.
+    ///
+    /// Пустой список разрешён: тогда пиры ищутся через DHT и PEX.
+    pub fn set_trackers(&self, id: u64, urls: Vec<String>) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        let trackers = normalize_trackers(urls)?;
+        *wr(&handle.stats.trackers) = trackers;
+        if let Some(runtime) = handle.runtime_clone() {
+            runtime.refresh_trackers();
+        }
+        Ok(())
+    }
+
+    /// Немедленно объявляется всем трекерам торрента.
+    pub fn reannounce(&self, id: u64) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        if rd(&handle.stats.trackers).is_empty() {
+            return Err(EngineError::InvalidInput("нет трекеров".to_string()));
+        }
+        if let Some(runtime) = handle.runtime_clone() {
+            runtime.wake_announcer();
+        }
+        Ok(())
+    }
+
+    /// Сводка состояния движка для окна диагностики.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let config = self.config();
+        let dht = rd(&self.inner.dht).clone();
+        let dht_nodes = dht.as_ref().map_or(0, |dht| dht.stats().nodes);
+        // Замок могут держать обновление проброса: лучше показать «нет данных»,
+        // чем заблокировать поток интерфейса.
+        let mapped_external = match self.inner.mapping.try_lock() {
+            Ok(mappings) => mappings
+                .first()
+                .map(|mapping| format!("{}:{}", mapping.gateway, mapping.external_port)),
+            Err(_) => None,
+        };
+        let totals = self.totals();
+        let mut diagnostics = Diagnostics {
+            listen_port: self.inner.listen_port,
+            dht: config.dht,
+            dht_port: config.dht_port,
+            dht_nodes,
+            pex: config.pex,
+            web_seeds: config.web_seeds,
+            proxy: config.proxy.clone(),
+            port_mapping: config.port_mapping,
+            mapped_external,
+            schedule_enabled: config.schedule_enabled,
+            schedule_from_min: config.schedule_from_min,
+            schedule_to_min: config.schedule_to_min,
+            schedule_active: self.inner.limits_now.schedule_active(),
+            download_limit_kib: self.inner.limits_now.down_kib(),
+            upload_limit_kib: self.inner.limits_now.up_kib(),
+            sequential: config.sequential,
+            torrents: totals.torrents as usize,
+            active: totals.active as usize,
+            peers: 0,
+            download_bps: totals.down_rate.max(0.0) as u64,
+            upload_bps: totals.up_rate.max(0.0) as u64,
+            uptime_secs: self.inner.started.elapsed().as_secs(),
+        };
+        for handle in self.handles() {
+            diagnostics.peers += handle.stats.peers_connected.load(Ordering::Relaxed) as usize;
+        }
+        diagnostics
     }
 
     /// Разбирает `.torrent` и отдаёт метаданные для окна добавления.
@@ -1716,6 +2083,7 @@ impl TorrentManager {
                 limits: limits.clone(),
                 shared: self.inner.limiters.clone(),
                 dht: self.inner.dht.clone(),
+                now: self.inner.limits_now.clone(),
             },
             added_at: now_unix(),
             save_dir,
@@ -1726,6 +2094,7 @@ impl TorrentManager {
             pending_files: Mutex::new(None),
             pending_priorities: Mutex::new(None),
             seed_meter: SeedMeter::default(),
+            sequential: AtomicBool::new(rd(&self.inner.config).sequential),
         })
     }
 
@@ -1850,6 +2219,9 @@ async fn ticker_loop(inner: Arc<Inner>) {
         if inner.shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // Расписание ограничений: лимиты пересчитываются каждый тик, но
+        // записываются только при изменении — счётчики полос не сбрасываются.
+        update_schedule_limits(&inner);
         let handles: Vec<Arc<TorrentHandle>> = rd(&inner.handles).clone();
         for handle in handles {
             handle.tick();
@@ -2142,5 +2514,140 @@ mod tests {
         meter.reset();
         assert!(!meter.limit_reached());
         assert_eq!(meter.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn schedule_window_bounds_and_crossing_midnight() {
+        // Обычное окно: полуинтервал [from, to).
+        assert!(schedule_window_active(600, 900, 600));
+        assert!(schedule_window_active(600, 900, 899));
+        assert!(!schedule_window_active(600, 900, 900));
+        assert!(!schedule_window_active(600, 900, 599));
+        // Окно через полночь: вечер и раннее утро.
+        assert!(schedule_window_active(1380, 360, 1380));
+        assert!(schedule_window_active(1380, 360, 1439));
+        assert!(schedule_window_active(1380, 360, 0));
+        assert!(schedule_window_active(1380, 360, 359));
+        assert!(!schedule_window_active(1380, 360, 360));
+        assert!(!schedule_window_active(1380, 360, 720));
+        // Окно нулевой длины — расписание выключено.
+        assert!(!schedule_window_active(0, 0, 0));
+        assert!(!schedule_window_active(720, 720, 720));
+        // Значения вне диапазона суток приводятся к нему.
+        assert!(schedule_window_active(1440 + 60, 120, 61));
+    }
+
+    #[test]
+    fn config_sanitizes_schedule() {
+        let config = EngineConfig {
+            sequential: true,
+            schedule_enabled: true,
+            schedule_from_min: 1440 + 90,
+            schedule_to_min: 2000,
+            schedule_download_limit_kib: 5_000_000,
+            schedule_upload_limit_kib: 7,
+            ..EngineConfig::default()
+        }
+        .sanitized();
+        assert!(config.sequential);
+        // Минуты приводятся к суткам, лимиты — к пределу.
+        assert_eq!(config.schedule_from_min, 90);
+        assert_eq!(config.schedule_to_min, 2000 % 1440);
+        assert!(config.schedule_enabled);
+        assert_eq!(config.schedule_download_limit_kib, MAX_SCHEDULE_LIMIT_KIB);
+        assert_eq!(config.schedule_upload_limit_kib, 7);
+        // Окно нулевой длины — расписание не работает и выключается.
+        let zero = EngineConfig {
+            schedule_enabled: true,
+            schedule_from_min: 600,
+            schedule_to_min: 600,
+            ..EngineConfig::default()
+        }
+        .sanitized();
+        assert!(!zero.schedule_enabled);
+    }
+
+    #[test]
+    fn tracker_list_is_normalized() {
+        let urls = vec![
+            "  http://tracker.example/announce  ".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "HTTP://Tracker.Example/announce".to_string(),
+            "udp://tracker.example:1337".to_string(),
+        ];
+        assert_eq!(
+            normalize_trackers(urls).unwrap(),
+            vec![
+                "http://tracker.example/announce".to_string(),
+                "udp://tracker.example:1337".to_string(),
+            ]
+        );
+        // Пустой список разрешён: пиры ищутся через DHT и PEX.
+        assert!(normalize_trackers(Vec::new()).unwrap().is_empty());
+        // Неподдерживаемая схема и адрес без хоста — ошибка ввода.
+        for bad in ["ftp://tracker.example/announce", "http://", "не-url"] {
+            let err = normalize_trackers(vec![bad.to_string()]).unwrap_err();
+            assert!(
+                matches!(err, EngineError::InvalidInput(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+        // Список подрезается до предела, дубли при этом не появляются.
+        let many: Vec<String> = (0..150)
+            .map(|index| format!("http://t{index}.example/announce"))
+            .collect();
+        assert_eq!(normalize_trackers(many).unwrap().len(), MAX_TRACKERS);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_of_empty_manager() {
+        let manager = TorrentManager::new(EngineConfig {
+            dht: false,
+            port_mapping: false,
+            ..EngineConfig::default()
+        });
+        let diagnostics = manager.diagnostics();
+        assert_eq!(diagnostics.torrents, 0);
+        assert_eq!(diagnostics.active, 0);
+        assert_eq!(diagnostics.peers, 0);
+        assert_eq!(diagnostics.download_bps, 0);
+        assert_eq!(diagnostics.upload_bps, 0);
+        assert!(!diagnostics.dht);
+        assert_eq!(diagnostics.dht_nodes, 0);
+        assert!(!diagnostics.port_mapping);
+        assert_eq!(diagnostics.mapped_external, None);
+        assert!(!diagnostics.schedule_enabled);
+        assert!(!diagnostics.schedule_active);
+        assert_eq!(diagnostics.download_limit_kib, 0);
+        assert_eq!(diagnostics.upload_limit_kib, 0);
+        assert!(!diagnostics.sequential);
+        // Менеджер только что создан — счётчик времени должен быть мал.
+        assert!(diagnostics.uptime_secs < 60);
+    }
+
+    #[tokio::test]
+    async fn torrent_controls_report_missing_torrent() {
+        let manager = TorrentManager::new(EngineConfig {
+            dht: false,
+            port_mapping: false,
+            ..EngineConfig::default()
+        });
+        assert!(matches!(
+            manager.set_sequential(42, true),
+            Err(EngineError::NotFound(42))
+        ));
+        assert!(matches!(
+            manager.trackers(42),
+            Err(EngineError::NotFound(42))
+        ));
+        assert!(matches!(
+            manager.set_trackers(42, Vec::new()),
+            Err(EngineError::NotFound(42))
+        ));
+        assert!(matches!(
+            manager.reannounce(42),
+            Err(EngineError::NotFound(42))
+        ));
     }
 }

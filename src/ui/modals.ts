@@ -1,7 +1,8 @@
-import type { AddOptions, SettingsDto, TorrentPreview, TorrentSource } from "../api/types";
+import { requireEngineApi } from "../api/engine";
+import type { AddOptions, AssociationDto, SettingsDto, TorrentPreview, TorrentSource } from "../api/types";
 import { SPEED_STEPS } from "../api/types";
 import { fmtBytes, basename } from "../lib/format";
-import { h, messageOf, setAttr, setText } from "../lib/dom";
+import { h, messageOf, setAttr, setText, toggleClass } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { createSelect, type SelectOption } from "./select";
 
@@ -35,6 +36,8 @@ export interface ModalHost {
   closeAll(): void;
   openAdd(request: AddRequest, handlers: AddHandlers): void;
   openSettings(settings: SettingsDto, handlers: SettingsHandlers): void;
+  /** Редактор трекеров торрента (1.7): список URL, добавление, удаление, сохранение. */
+  openTrackerEditor(id: number): void;
   confirmRemove(name: string, onConfirm: (deleteFiles: boolean) => Promise<void>): void;
 }
 
@@ -111,6 +114,40 @@ function limitOptions(current: number): SelectOption[] {
 }
 
 /**
+ * Минуты от полуночи → значение для `input type="time"`, всегда «ЧЧ:ММ» (1.7).
+ * Лишние сутки отбрасываем — как ядро.
+ */
+function minutesToTime(minutes: number): string {
+  const total = ((Math.round(Number(minutes) || 0) % 1440) + 1440) % 1440;
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+/** Значение `input type="time"` → минуты от полуночи; пусто или мусор → NaN (1.7). */
+function timeToMinutes(value: string): number {
+  const match = /^(\d{1,2}):(\d{2})/.exec(value.trim());
+  if (!match) {
+    return Number.NaN;
+  }
+  const hours = Number(match[1]);
+  const mins = Number(match[2]);
+  if (hours < 0 || hours > 23 || mins < 0 || mins > 59) {
+    return Number.NaN;
+  }
+  return hours * 60 + mins;
+}
+
+/** Максимум лимита скорости из настроек: 1 ГиБ/с — столько же принимает ядро (1.7). */
+const MAX_LIMIT_KIB = 1_048_576;
+
+/** Схемы адресов трекеров, которые принимает ядро (1.7). */
+const TRACKER_PREFIXES = ["http://", "https://", "udp://"];
+
+/** Больше 100 трекеров ядро не принимает (1.7). */
+const MAX_TRACKERS = 100;
+
+/**
  * Проверка строки прокси (1.6): пусто — прокси выключен, иначе нужен
  * адрес вида socks5://host:port или http(s)://host:port. `null` — значение корректно.
  */
@@ -150,6 +187,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
+      // (1.7) Соседние обработчики на том же узле `document` не гасятся
+      // `stopPropagation`, из-за чего Escape закрывал ещё и панель деталей.
+      event.stopImmediatePropagation();
       if (!top.busy) {
         top.handle.close();
       }
@@ -847,6 +887,67 @@ export function createModalHost(root: HTMLElement): ModalHost {
     const port = numberInput(settings.listen_port, { min: "0", max: "65535", step: "1" });
     const maxPeers = numberInput(settings.max_peers, { min: "1", max: "200", step: "1" });
 
+    // 1.7: расписание скорости — своё окно «с»–«до» и свои лимиты внутри него.
+    const scheduleToggle = checkboxRow(
+      "Расписание скорости",
+      "В заданное окно действуют отдельные лимиты приёма и отдачи.",
+      settings.schedule_enabled ?? false,
+    );
+    const scheduleFromInput = h("input", {
+      class: "input",
+      attrs: { type: "time", value: minutesToTime(settings.schedule_from_min ?? 0), step: "60" },
+    });
+    const scheduleToInput = h("input", {
+      class: "input",
+      attrs: { type: "time", value: minutesToTime(settings.schedule_to_min ?? 0), step: "60" },
+    });
+    const scheduleDown = numberInput(settings.schedule_download_limit_kib ?? 0, {
+      min: "0",
+      max: String(MAX_LIMIT_KIB),
+      step: "1",
+    });
+    const scheduleUp = numberInput(settings.schedule_upload_limit_kib ?? 0, {
+      min: "0",
+      max: String(MAX_LIMIT_KIB),
+      step: "1",
+    });
+    const scheduleControls: HTMLInputElement[] = [
+      scheduleFromInput,
+      scheduleToInput,
+      scheduleDown,
+      scheduleUp,
+    ];
+    const scheduleGroup = h(
+      "div",
+      { class: "field" },
+      scheduleToggle.row,
+      h("div", { class: "field-row" }, field("С", scheduleFromInput), field("До", scheduleToInput)),
+      h(
+        "div",
+        { class: "field-row" },
+        field("Приём в окне, КиБ/с", scheduleDown),
+        field("Отдача в окне, КиБ/с", scheduleUp),
+      ),
+      h("p", {
+        class: "field__hint",
+        text: "Вне окна действуют основные лимиты. «С» позже «До» — окно через полночь, одинаковое время выключает расписание. 0 — без ограничения.",
+      }),
+    );
+    const applyScheduleState = (): void => {
+      const on = scheduleToggle.input.checked;
+      for (const control of scheduleControls) {
+        control.disabled = !on;
+      }
+    };
+    scheduleToggle.input.addEventListener("change", () => {
+      applyScheduleState();
+      showError(errorEl, null);
+    });
+    for (const control of scheduleControls) {
+      control.addEventListener("input", () => showError(errorEl, null));
+    }
+    applyScheduleState();
+
     const seed = checkboxRow(
       "Раздавать после завершения",
       "Торрент продолжит отдавать данные после загрузки.",
@@ -858,13 +959,144 @@ export function createModalHost(root: HTMLElement): ModalHost {
       "Когда торрент скачан полностью, появляется уведомление.",
       settings.notify_on_complete ?? true,
     );
+    // 1.7: последовательная загрузка по умолчанию для новых торрентов.
+    const sequential = checkboxRow(
+      "Последовательная загрузка по умолчанию",
+      "Куски качаются по порядку: файл можно открывать, не дожидаясь конца загрузки.",
+      settings.sequential ?? false,
+    );
     const behaviorGroup = h(
       "div",
       { class: "field" },
       h("span", { class: "field__label", text: "Поведение" }),
       seed.row,
       notify.row,
+      sequential.row,
     );
+
+    // 1.7 (баг-репорт): ассоциация .torrent — переключатель, живая строка состояния
+    // и «Починить ассоциацию». Состояние читается асинхронно при открытии окна.
+    const associate = checkboxRow(
+      "Связывать файлы .torrent с Torrenta",
+      "Двойной клик по .torrent открывает Torrenta и добавляет загрузку; сломанная привязка чинится при старте.",
+      settings.associate_files ?? true,
+    );
+    const assocStatus = h("p", { class: "assoc__status", attrs: { role: "status" } });
+    const assocRepair = button("Починить ассоциацию", "btn--ghost assoc__repair");
+    const assocHint = h("p", { class: "assoc__hint" });
+    const assocGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Ассоциация файлов" }),
+      associate.row,
+      assocStatus,
+      h("div", { class: "assoc__row" }, assocRepair, assocHint),
+    );
+
+    /** Строка состояния: тон как у заметок в карточке торрента (1.7). */
+    const setAssocStatus = (text: string, tone: "ok" | "warn" | "error" | "muted"): void => {
+      setText(assocStatus, text);
+      toggleClass(assocStatus, "is-ok", tone === "ok");
+      toggleClass(assocStatus, "is-warn", tone === "warn");
+      toggleClass(assocStatus, "is-error", tone === "error");
+      toggleClass(assocStatus, "is-muted", tone === "muted");
+    };
+
+    /** Итог вызова бэкенда: наша привязка, чужая (с пояснением) или платформа без ассоциаций. */
+    const describeAssoc = (state: AssociationDto): { text: string; tone: "ok" | "warn" | "muted" } => {
+      if (state.isOwner) {
+        return { text: "Torrenta открывает файлы .torrent", tone: "ok" };
+      }
+      if (!state.available) {
+        // Вне Windows бэкенд сам объясняет причину в message — показываем её.
+        return {
+          text: state.message?.trim() || "Ассоциация файлов поддерживается только в Windows",
+          tone: "muted",
+        };
+      }
+      const fallback = state.handler
+        ? `Файлы .torrent открывает другая программа: ${state.handler}`
+        : "Файлы .torrent не открываются: привязки нет";
+      return { text: state.message?.trim() || fallback, tone: "warn" };
+    };
+
+    let assocBusy = false;
+    const applyAssocButtons = (): void => {
+      const off = !associate.input.checked;
+      assocRepair.disabled = off || assocBusy;
+      setAttr(
+        assocRepair,
+        "title",
+        off ? "Включите переключатель «Связывать файлы .torrent с Torrenta»" : null,
+      );
+      setText(
+        assocHint,
+        off
+          ? "Включите переключатель — без него привязка не восстанавливается."
+          : "Привязка к текущей сборке: если .torrent открывает другая программа, нажмите кнопку.",
+      );
+    };
+
+    const loadAssocStatus = async (): Promise<void> => {
+      try {
+        const engine = await requireEngineApi();
+        const state = await engine.associationStatus();
+        if (!modal.dialog.isConnected) {
+          return;
+        }
+        const view = describeAssoc(state);
+        setAssocStatus(view.text, view.tone);
+      } catch (reason: unknown) {
+        if (modal.dialog.isConnected) {
+          setAssocStatus(messageOf(reason), "error");
+        }
+      }
+    };
+
+    associate.input.addEventListener("change", () => {
+      applyAssocButtons();
+      showError(errorEl, null);
+    });
+    applyAssocButtons();
+    void loadAssocStatus();
+
+    assocRepair.addEventListener("click", () => {
+      if (assocRepair.disabled) {
+        return;
+      }
+      assocBusy = true;
+      setText(assocRepair, "Проверяем…");
+      applyAssocButtons();
+      void (async () => {
+        try {
+          const engine = await requireEngineApi();
+          const state = await engine.repairAssociation();
+          if (!modal.dialog.isConnected) {
+            return;
+          }
+          if (state.isOwner) {
+            // Вызов вернул новое состояние: отдельный опрос статуса не нужен.
+            setAssocStatus(
+              state.repaired ? "Ассоциация восстановлена" : "Torrenta уже открывает файлы .torrent",
+              "ok",
+            );
+          } else {
+            const view = describeAssoc(state);
+            setAssocStatus(view.text, view.tone);
+          }
+        } catch (reason: unknown) {
+          if (modal.dialog.isConnected) {
+            setAssocStatus(messageOf(reason), "error");
+          }
+        } finally {
+          assocBusy = false;
+          if (modal.dialog.isConnected) {
+            setText(assocRepair, "Починить ассоциацию");
+            applyAssocButtons();
+          }
+        }
+      })();
+    });
 
     // 1.3: очередь — сколько торрентов качать и раздавать одновременно.
     const maxActiveDowns = numberInput(settings.max_active_downloads, { min: "0", max: "100", step: "1" });
@@ -1017,8 +1249,10 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Порт прослушивания", port),
         field("Пиров на торрент", maxPeers),
       ),
+      scheduleGroup,
       networkGroup,
       behaviorGroup,
+      assocGroup,
       seedGoalGroup,
       queueGroup,
       trayGroup,
@@ -1034,6 +1268,17 @@ export function createModalHost(root: HTMLElement): ModalHost {
     const readNumber = (input: HTMLInputElement): number => {
       const raw = input.value.trim();
       return raw === "" ? Number.NaN : Number(raw);
+    };
+
+    // 1.7: значения расписания. Даже при выключенном окне отправляем то, что видно,
+    // чтобы движок сохранил цифры — пригодятся, когда окно включат снова.
+    const scheduleFromValue = (): number => {
+      const parsed = timeToMinutes(scheduleFromInput.value);
+      return Number.isFinite(parsed) ? parsed : (settings.schedule_from_min ?? 0);
+    };
+    const scheduleToValue = (): number => {
+      const parsed = timeToMinutes(scheduleToInput.value);
+      return Number.isFinite(parsed) ? parsed : (settings.schedule_to_min ?? 0);
     };
 
     function validate(): string | null {
@@ -1082,6 +1327,25 @@ export function createModalHost(root: HTMLElement): ModalHost {
         minutesValue > 4_294_967_295
       ) {
         return "Ограничение по времени раздачи — целое число минут, не меньше 0";
+      }
+      // 1.7: окно расписания скорости.
+      if (scheduleToggle.input.checked) {
+        const fromValue = timeToMinutes(scheduleFromInput.value);
+        const toValue = timeToMinutes(scheduleToInput.value);
+        if (!Number.isFinite(fromValue) || !Number.isFinite(toValue)) {
+          return "Расписание: укажите время «с» и «до» в формате ЧЧ:ММ";
+        }
+        if (fromValue === toValue) {
+          return "Расписание: время «с» и «до» не должно совпадать — иначе окно пустое";
+        }
+        const windowDown = readNumber(scheduleDown);
+        const windowUp = readNumber(scheduleUp);
+        if (!Number.isFinite(windowDown) || !Number.isInteger(windowDown) || windowDown < 0 || windowDown > MAX_LIMIT_KIB) {
+          return `Расписание: приём — целое число от 0 до ${MAX_LIMIT_KIB} КиБ/с`;
+        }
+        if (!Number.isFinite(windowUp) || !Number.isInteger(windowUp) || windowUp < 0 || windowUp > MAX_LIMIT_KIB) {
+          return `Расписание: отдача — целое число от 0 до ${MAX_LIMIT_KIB} КиБ/с`;
+        }
       }
       return null;
     }
@@ -1162,6 +1426,14 @@ export function createModalHost(root: HTMLElement): ModalHost {
         web_seeds: webSeeds.input.checked,
         seed_ratio_limit: Math.round(readNumber(seedRatio) * 100) / 100,
         seed_time_limit_min: Math.round(readNumber(seedTime)),
+        // 1.7: последовательная загрузка по умолчанию и окно расписания.
+        associate_files: associate.input.checked,
+        sequential: sequential.input.checked,
+        schedule_enabled: scheduleToggle.input.checked,
+        schedule_from_min: scheduleFromValue(),
+        schedule_to_min: scheduleToValue(),
+        schedule_download_limit_kib: Math.max(0, Math.round(readNumber(scheduleDown) || 0)),
+        schedule_upload_limit_kib: Math.max(0, Math.round(readNumber(scheduleUp) || 0)),
         theme,
         auto_shutdown: settings.auto_shutdown,
       };
@@ -1176,6 +1448,160 @@ export function createModalHost(root: HTMLElement): ModalHost {
     modal.onClose(destroySelects);
 
     focusFirst(modal, "input[type=text]");
+  }
+
+  /**
+   * Редактор трекеров торрента (1.7): строки адресов, «Добавить», удаление и
+   * «Сохранить». Пустой список разрешён — торрент просто будет искать пиров
+   * через DHT и PEX. После записи движок сразу анонсируется на новых трекерах.
+   */
+  function openTrackerEditor(id: number): void {
+    closeAll();
+    const modal = openRoot({ title: "Редактор трекеров", className: "modal--trackers" });
+
+    const rowsHost = h("div", { class: "tracker-list" });
+    const emptyHint = h("p", {
+      class: "field__hint",
+      text: "Пустой список разрешён: торрент будет искать пиров через DHT и PEX.",
+    });
+    const addButton = h(
+      "button",
+      { class: "btn btn--ghost tracker-add", attrs: { type: "button" } },
+      icon("plus", 15),
+      h("span", { text: "Добавить" }),
+    );
+    const errorEl = formError();
+    const tip = h("p", {
+      class: "modal__hint",
+      text: "Адрес начинается с http://, https:// или udp://. Повторы и пустые строки отбрасываются, не больше 100 трекеров.",
+    });
+    modal.body.append(rowsHost, emptyHint, addButton, errorEl, tip);
+
+    const inputs: HTMLInputElement[] = [];
+
+    const syncEmpty = (): void => {
+      emptyHint.hidden = inputs.length !== 0;
+      addButton.disabled = inputs.length >= MAX_TRACKERS;
+    };
+
+    const addRow = (value: string, focus: boolean): void => {
+      const input = h("input", {
+        class: "input tracker-row__input",
+        attrs: {
+          type: "text",
+          value,
+          placeholder: "udp://tracker.example.org:1337/announce",
+          spellcheck: "false",
+          autocomplete: "off",
+        },
+      });
+      input.addEventListener("input", () => {
+        input.classList.remove("is-invalid");
+        showError(errorEl, null);
+      });
+      const remove = h("button", {
+        class: "icon-btn icon-btn--sm icon-btn--danger tracker-row__remove",
+        attrs: { type: "button", "aria-label": "Удалить трекер", title: "Удалить трекер" },
+      });
+      remove.append(icon("trash", 15));
+      const row = h("div", { class: "tracker-row" }, input, remove);
+      remove.addEventListener("click", () => {
+        const index = inputs.indexOf(input);
+        if (index >= 0) {
+          inputs.splice(index, 1);
+        }
+        row.remove();
+        showError(errorEl, null);
+        syncEmpty();
+        addButton.focus();
+      });
+      inputs.push(input);
+      rowsHost.append(row);
+      syncEmpty();
+      if (focus) {
+        input.focus();
+      }
+    };
+
+    /**
+     * Список из строк: пустые и повторы (без учёта регистра) отбрасываем,
+     * неверную схему подсвечиваем и дальше не пускаем.
+     */
+    const readRows = (): { urls: string[]; problem: string | null } => {
+      const urls: string[] = [];
+      const seen = new Set<string>();
+      let problem: string | null = null;
+      for (const input of inputs) {
+        input.classList.remove("is-invalid");
+        const value = input.value.trim();
+        if (value === "") {
+          continue;
+        }
+        const lower = value.toLowerCase();
+        if (!TRACKER_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+          input.classList.add("is-invalid");
+          problem ??= `Неверный адрес трекера: ${value} — нужен http://, https:// или udp://`;
+          continue;
+        }
+        if (seen.has(lower)) {
+          continue;
+        }
+        seen.add(lower);
+        urls.push(value);
+      }
+      if (problem === null && urls.length > MAX_TRACKERS) {
+        problem = `Слишком много трекеров: не больше ${MAX_TRACKERS}`;
+      }
+      return { urls, problem };
+    };
+
+    const cancel = button("Отмена", "btn--ghost");
+    const save = button("Сохранить", "btn--primary");
+    modal.footer.append(cancel, save);
+
+    cancel.addEventListener("click", () => {
+      if (!modal.dialog.classList.contains("is-busy")) {
+        modal.close();
+      }
+    });
+    addButton.addEventListener("click", () => {
+      if (inputs.length >= MAX_TRACKERS) {
+        showError(errorEl, `Слишком много трекеров: не больше ${MAX_TRACKERS}`);
+        return;
+      }
+      addRow("", true);
+      showError(errorEl, null);
+    });
+    save.addEventListener("click", () => {
+      const { urls, problem } = readRows();
+      if (problem !== null) {
+        showError(errorEl, problem);
+        return;
+      }
+      // Пустой список — тоже валидное состояние: чистим трекеры и полагаемся на DHT.
+      run(modal, save, errorEl, async () => {
+        const api = await requireEngineApi();
+        await api.setTorrentTrackers(id, urls);
+      });
+    });
+
+    addButton.disabled = true;
+    modal.setBusy(true);
+    void requireEngineApi()
+      .then((api) => api.torrentTrackers(id))
+      .then((urls) => {
+        for (const url of urls) {
+          addRow(url, false);
+        }
+      })
+      .catch((reason: unknown) => showError(errorEl, messageOf(reason)))
+      .finally(() => {
+        modal.setBusy(false);
+        syncEmpty();
+        if (modal.dialog.isConnected) {
+          focusFirst(modal, ".tracker-row__input");
+        }
+      });
   }
 
   function confirmRemove(name: string, onConfirm: (deleteFiles: boolean) => Promise<void>): void {
@@ -1227,6 +1653,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
     closeAll,
     openAdd,
     openSettings,
+    openTrackerEditor,
     confirmRemove,
   };
 }

@@ -246,6 +246,8 @@ mod tests {
             }],
             trackers: Vec::new(),
             peers: Vec::new(),
+            // P3: порядок скачивания к тесту отношения не имеет.
+            sequential: false,
         }
     }
 

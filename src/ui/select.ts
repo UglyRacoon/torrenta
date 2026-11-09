@@ -234,13 +234,13 @@ export function createSelect(options: SelectOptions): SelectControl {
     if (!option) {
       return;
     }
-    const changed = option.value !== current;
     current = option.value;
     syncButton();
     close();
-    if (changed) {
-      options.onChange(option.value);
-    }
+    // (1.7) Сообщаем о выборе даже совпадающего с текущим пункта: панель
+    // сортировки и списки с подстановкой первого доступного значения иначе
+    // теряли клик — смены значения нет, значит и `onChange` не придёт.
+    options.onChange(option.value);
   }
 
   function close(): void {

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::bitfield::Bitfield;
 use crate::metainfo::{InfoHash, Metainfo};
-use crate::picker::{PiecePicker, PieceStatus};
+use crate::picker::{PickOrder, PiecePicker, PieceStatus};
 use crate::storage::Storage;
 use crate::tracker::{self, AnnounceEvent, AnnounceRequest, PeerAddr};
 
@@ -36,6 +36,11 @@ const WEB_SEED_RETRY: Duration = Duration::from_secs(5);
 const WEB_SEED_DEADLINE: Duration = Duration::from_secs(90);
 /// Сколько новых соединений открываем за один такт кондуктора.
 const CONNECT_BURST: usize = 8;
+/// Сколько циклов объявлений держим на один торрент.
+///
+/// Трекеров в метаинфо бывает десятки, а объявляться всем сразу — это шквал
+/// запросов на старте. Остальные адреса подхватываются, если список изменится.
+const MAX_TRACKER_LOOPS: usize = 16;
 
 /// Окружение, общее для всех сессий одного торрента (без ссылки на менеджер,
 /// чтобы не образовывать цикл `Arc`).
@@ -53,6 +58,8 @@ pub(crate) struct Env {
     pub(crate) shared: Arc<SharedLimiters>,
     /// Узел DHT сессии: общий слот на все торренты, `None` — DHT выключен.
     pub(crate) dht: Arc<std::sync::RwLock<Option<Arc<crate::dht::Dht>>>>,
+    /// Действующие глобальные лимиты с учётом расписания (общие на сессию).
+    pub(crate) now: Arc<super::EffectiveLimits>,
 }
 
 /// Запрос блока у пира.
@@ -306,6 +313,8 @@ pub(crate) struct Runtime {
     /// файлов). Флаг, а не `Notify`, чтобы побудка не терялась, пока цикл
     /// занят запросом к трекеру.
     announce_pending: AtomicBool,
+    /// Адреса, для которых уже запущен цикл объявлений.
+    announcing: Mutex<HashSet<String>>,
 }
 
 impl Runtime {
@@ -343,18 +352,22 @@ impl Runtime {
             up_limiter: Mutex::new(RateLimiter::new()),
             completed_announced: AtomicBool::new(false),
             announce_pending: AtomicBool::new(false),
+            announcing: Mutex::new(HashSet::new()),
         })
     }
 
     /// Запускает фоновые задачи торрента (трекеры + кондуктор).
     pub(crate) fn start(self: &Arc<Self>) {
-        let trackers = self.meta.trackers();
-        *wr(&self.stats.trackers) = trackers.clone();
-        for url in trackers.iter().take(6) {
-            let runtime = self.clone();
-            let url = url.clone();
-            tokio::spawn(async move { runtime.tracker_loop(url).await });
+        // Трекеры из метаинфо — в своём порядке; добавленные вручную (например,
+        // для magnet) идут следом и не теряются при появлении метаданных.
+        let mut trackers = self.meta.trackers();
+        for url in rd(&self.stats.trackers).clone() {
+            if !trackers.contains(&url) {
+                trackers.push(url);
+            }
         }
+        *wr(&self.stats.trackers) = trackers;
+        self.spawn_tracker_loops();
         let runtime = self.clone();
         tokio::spawn(async move { runtime.drive_loop().await });
         // DHT — отдельный цикл: опрос найденных пиров и анонс раздаваемого порта.
@@ -501,6 +514,41 @@ impl Runtime {
     /// переживает такую гонку.
     pub(crate) fn wake_announcer(&self) {
         self.announce_pending.store(true, Ordering::Relaxed);
+    }
+
+    /// Запускает циклы объявлений для адресов, у которых их ещё нет.
+    ///
+    /// Цикл на каждый адрес: у трекеров свои интервалы, и один медленный трекер
+    /// не должен задерживать остальные. Сверх [`MAX_TRACKER_LOOPS`] адреса не
+    /// запускаются.
+    pub(crate) fn spawn_tracker_loops(self: &Arc<Self>) {
+        let trackers = rd(&self.stats.trackers).clone();
+        let mut announcing = lk(&self.announcing);
+        for url in trackers {
+            if announcing.len() >= MAX_TRACKER_LOOPS {
+                break;
+            }
+            if !announcing.insert(url.clone()) {
+                continue;
+            }
+            let runtime = self.clone();
+            tokio::spawn(async move { runtime.tracker_loop(url).await });
+        }
+    }
+
+    /// Применяет новый список трекеров: добирает циклы и объявляется сразу.
+    pub(crate) fn refresh_trackers(self: &Arc<Self>) {
+        self.spawn_tracker_loops();
+        self.wake_announcer();
+    }
+
+    /// Переключает порядок выбора кусков.
+    pub(crate) fn set_sequential(&self, on: bool) {
+        lk(&self.state).picker.set_order(if on {
+            PickOrder::Sequential
+        } else {
+            PickOrder::Rarest
+        });
     }
 
     pub(crate) fn max_peers(&self) -> usize {
@@ -720,8 +768,9 @@ impl Runtime {
     /// Сколько блоков можно запросить сейчас (с учётом лимита скорости).
     pub(crate) fn download_budget(&self, want: usize) -> usize {
         // Действует более строгий из двух лимитов: глобального и своего,
-        // при этом глобальное ведро общее для всей сессии.
-        let global = rd(&self.env.config).download_limit_kib;
+        // при этом глобальное ведро общее для всей сессии. Глобальный лимит
+        // берём действующий — его уже учло расписание.
+        let global = self.env.now.down_kib();
         let local = rd(&self.env.limits).down_kib;
         grant_download(
             &self.down_limiter,
@@ -1093,7 +1142,7 @@ impl Runtime {
     }
 
     fn allow_upload(&self, length: usize) -> bool {
-        let global = rd(&self.env.config).upload_limit_kib;
+        let global = self.env.now.up_kib();
         let local = rd(&self.env.limits).up_kib;
         grant_upload(&self.up_limiter, &self.env.shared.up, global, local, length)
     }
@@ -1380,10 +1429,8 @@ impl Runtime {
     /// Списывает из лимитов загрузки бюджет одного куска (в блоках по
     /// [`BLOCK_SIZE`]); `0` означает «ведро пустое, надо подождать».
     fn seed_download_budget(&self, blocks: usize) -> usize {
-        let (global, local) = {
-            let config = rd(&self.env.config);
-            (config.download_limit_kib, rd(&self.env.limits).down_kib)
-        };
+        let global = self.env.now.down_kib();
+        let local = rd(&self.env.limits).down_kib;
         grant_download(
             &self.down_limiter,
             &self.env.shared.down,
@@ -1422,6 +1469,10 @@ impl Runtime {
         let mut failures: u32 = 0;
         loop {
             if self.stopping() {
+                break;
+            }
+            // Адрес могли убрать из списка вручную — цикл больше не нужен.
+            if !rd(&self.stats.trackers).contains(&url) {
                 break;
             }
             if self.flags.paused() {
@@ -1477,6 +1528,8 @@ impl Runtime {
                 }
             }
         }
+        // Освобождаем слот: если адрес вернут в список, цикл запустится снова.
+        lk(&self.announcing).remove(&url);
     }
 }
 
@@ -1550,6 +1603,8 @@ pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(),
         handle.env.clone(),
     );
     runtime.set_wanted(&selection);
+    // Порядок кусков мог включить пользователь, пока метаданных ещё не было.
+    runtime.set_sequential(handle.sequential.load(Ordering::Relaxed));
     *wr(&handle.meta) = Some(runtime.meta.clone());
     *lk(&handle.runtime) = Some(runtime.clone());
     runtime.start();
@@ -1565,11 +1620,9 @@ pub(crate) fn start_metadata_fetch(handle: &Arc<TorrentHandle>) {
 
 async fn metadata_task(handle: Arc<TorrentHandle>) {
     let info_hash: InfoHash = handle.info_hash;
-    let trackers = handle
-        .magnet
-        .as_ref()
-        .map(|magnet| magnet.trackers.clone())
-        .unwrap_or_default();
+    // Список трекеров мог быть переписан вручную после добавления magnet-ссылки;
+    // начальный набор в него уже переписан при создании торрента.
+    let trackers = rd(&handle.stats.trackers).clone();
     let display_name = handle
         .magnet
         .as_ref()

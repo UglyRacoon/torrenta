@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, State};
 use tauri_plugin_dialog::{DialogExt as _, FilePath};
 use tauri_plugin_opener as opener;
+use tauri_plugin_updater::UpdaterExt as _;
 use torrent_core::engine::{AddOptions, TorrentManager, TorrentPreview};
 
+use crate::association::{self, AssociationSlot, AssociationState, UNSUPPORTED_PLATFORM};
 use crate::auto_shutdown::{AutoShutdownDto, AutoShutdownEvent, AUTO_SHUTDOWN_EVENT};
 use crate::session::SessionRegistry;
 use crate::settings::{self, SettingsDto};
@@ -476,6 +478,7 @@ pub async fn get_settings(state: State<'_, AppEngine>) -> Result<SettingsDto, St
 pub async fn set_settings(
     app: AppHandle,
     state: State<'_, AppEngine>,
+    slot: State<'_, AssociationSlot>,
     settings: SettingsDto,
 ) -> Result<SettingsDto, String> {
     let previous = state.settings();
@@ -487,6 +490,17 @@ pub async fn set_settings(
         // Автовыключение выключили через общие настройки: снимаем таймер.
         state.cancel_auto_shutdown();
         emit_auto_shutdown_cancelled(&app);
+    }
+
+    if applied.associate_files && !previous.associate_files {
+        // Привязку `.torrent` включили только что — чиним реестр сразу, не
+        // дожидаясь перезапуска. Настройки уже сохранены, поэтому сбой реестра
+        // не превращаем в ошибку команды: показываем его в состоянии привязки.
+        if let Ok(exe) = association_exe(&state) {
+            if let Ok(next) = association_ensure(exe).await {
+                store_association(&slot, next);
+            }
+        }
     }
 
     Ok(applied)
@@ -618,6 +632,360 @@ fn allowed_external(url: &str) -> bool {
         || lowered.starts_with("mailto:")
 }
 
+/// Текст для интерфейса, когда обновления не настроены.
+///
+/// Формулировка честная: ключа подписи нет, поэтому проверять обновления нечем.
+const UPDATE_NOT_CONFIGURED: &str = "обновления не настроены: нет ключа подписи";
+
+/// Диагностика движка (команда `engine_diagnostics`).
+///
+/// Поля один в один повторяют `torrent_core::Diagnostics` и остаются
+/// `snake_case`, как у остальных команд проекта.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticsDto {
+    /// Порт входящих подключений (`0` — ещё не выбран).
+    pub listen_port: u16,
+    /// Включён ли DHT.
+    pub dht: bool,
+    /// Порт DHT.
+    pub dht_port: u16,
+    /// Сколько узлов DHT известно движку.
+    pub dht_nodes: usize,
+    /// Включён ли PEX.
+    pub pex: bool,
+    /// Включены ли web seeds.
+    pub web_seeds: bool,
+    /// Прокси (`None` — движок работает напрямую).
+    pub proxy: Option<String>,
+    /// Удался ли проброс порта.
+    pub port_mapping: bool,
+    /// Внешний адрес проброса `адрес:порт`, если он удался.
+    pub mapped_external: Option<String>,
+    /// Включено ли расписание скорости.
+    pub schedule_enabled: bool,
+    /// Начало окна расписания, минуты от полуночи.
+    pub schedule_from_min: u32,
+    /// Конец окна расписания, минуты от полуночи.
+    pub schedule_to_min: u32,
+    /// Действует ли окно расписания прямо сейчас.
+    pub schedule_active: bool,
+    /// Действующий лимит загрузки (КиБ/с, `0` — без лимита).
+    pub download_limit_kib: u32,
+    /// Действующий лимит отдачи (КиБ/с, `0` — без лимита).
+    pub upload_limit_kib: u32,
+    /// Последовательная загрузка по умолчанию.
+    pub sequential: bool,
+    /// Сколько всего торрентов.
+    pub torrents: usize,
+    /// Сколько торрентов активно качается или раздаётся.
+    pub active: usize,
+    /// Сколько пиров подключено всего.
+    pub peers: usize,
+    /// Скорость загрузки, байт/с.
+    pub download_bps: u64,
+    /// Скорость отдачи, байт/с.
+    pub upload_bps: u64,
+    /// Сколько секунд работает движок.
+    pub uptime_secs: u64,
+}
+
+impl From<torrent_core::Diagnostics> for DiagnosticsDto {
+    fn from(diagnostics: torrent_core::Diagnostics) -> Self {
+        Self {
+            listen_port: diagnostics.listen_port,
+            dht: diagnostics.dht,
+            dht_port: diagnostics.dht_port,
+            dht_nodes: diagnostics.dht_nodes,
+            pex: diagnostics.pex,
+            web_seeds: diagnostics.web_seeds,
+            proxy: diagnostics.proxy,
+            port_mapping: diagnostics.port_mapping,
+            mapped_external: diagnostics.mapped_external,
+            schedule_enabled: diagnostics.schedule_enabled,
+            schedule_from_min: diagnostics.schedule_from_min,
+            schedule_to_min: diagnostics.schedule_to_min,
+            schedule_active: diagnostics.schedule_active,
+            download_limit_kib: diagnostics.download_limit_kib,
+            upload_limit_kib: diagnostics.upload_limit_kib,
+            sequential: diagnostics.sequential,
+            torrents: diagnostics.torrents,
+            active: diagnostics.active,
+            peers: diagnostics.peers,
+            download_bps: diagnostics.download_bps,
+            upload_bps: diagnostics.upload_bps,
+            uptime_secs: diagnostics.uptime_secs,
+        }
+    }
+}
+
+/// Информация о каталоге данных (команда `portable_info`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PortableInfoDto {
+    /// `true`, если данные лежат рядом с `torrenta.exe`.
+    pub portable: bool,
+    /// Фактический каталог данных: `settings.json` и `session\`.
+    pub data_dir: String,
+}
+
+/// Состояние обновлений (команда `check_update`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateStateDto {
+    /// Настроена ли проверка (задан ключ подписи).
+    pub configured: bool,
+    /// Текущая версия приложения.
+    pub current_version: String,
+    /// Версия доступного обновления.
+    pub available: Option<String>,
+    /// Пояснение для интерфейса.
+    pub message: Option<String>,
+}
+
+/// Состояние привязки `.torrent`-файлов (команды `association_status` и
+/// `repair_association`).
+///
+/// Имена полей в JSON — camelCase: так договорились с фронтендом в 1.7; у
+/// остальных DTO модуля ключи snake_case.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssociationDto {
+    /// ProgId текущего обработчика `.torrent` (`null` — привязки нет).
+    pub handler: Option<String>,
+    /// Команда открытия текущего обработчика.
+    pub command: Option<String>,
+    /// Открывает ли `.torrent` текущий exe Torrenta.
+    pub is_owner: bool,
+    /// Привязка была (пере)записана в этом вызове.
+    pub repaired: bool,
+    /// Пояснение для интерфейса.
+    pub message: Option<String>,
+    /// Платформа поддерживает ассоциации (Windows); иначе `false` и причина
+    /// в `message`.
+    pub available: bool,
+}
+
+impl AssociationDto {
+    /// DTO из состояния [`association`] с учётом платформы.
+    fn from_state(state: &AssociationState) -> Self {
+        let available = cfg!(windows);
+        Self {
+            handler: state.handler.clone(),
+            command: state.command.clone(),
+            is_owner: available && state.is_owner,
+            repaired: available && state.repaired,
+            // Вне Windows реестра ассоциаций нет: показываем причину, а не
+            // состояние, которое там всё равно не прочитать.
+            message: if available {
+                state.message.clone()
+            } else {
+                Some(UNSUPPORTED_PLATFORM.to_string())
+            },
+            available,
+        }
+    }
+}
+
+/// Включает или выключает последовательную загрузку торрента.
+///
+/// Порядок выбора кусков меняет движок: `Sequential` вместо `Rarest` — так
+/// фильм можно смотреть, не дожидаясь конца загрузки.
+#[tauri::command]
+pub async fn set_torrent_sequential(
+    state: State<'_, AppEngine>,
+    id: u64,
+    on: bool,
+) -> Result<(), String> {
+    state
+        .manager
+        .set_sequential(id, on)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Список трекеров торрента: из метаинфо плюс добавленные вручную.
+#[tauri::command]
+pub async fn torrent_trackers(state: State<'_, AppEngine>, id: u64) -> Result<Vec<String>, String> {
+    state
+        .manager
+        .trackers(id)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Заменяет список трекеров торрента.
+///
+/// Схемы, дубликаты и лимит в 100 проверяет движок: слой Tauri не повторяет
+/// эту логику, иначе правила разъедутся. Пустой список разрешён (DHT и PEX
+/// работают и без трекеров).
+#[tauri::command]
+pub async fn set_torrent_trackers(
+    state: State<'_, AppEngine>,
+    id: u64,
+    urls: Vec<String>,
+) -> Result<(), String> {
+    state
+        .manager
+        .set_trackers(id, urls)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Объявляет трекеры торрента заново (кнопка «Обновить трекеры»).
+#[tauri::command]
+pub async fn reannounce_torrent(state: State<'_, AppEngine>, id: u64) -> Result<(), String> {
+    state
+        .manager
+        .reannounce(id)
+        .map_err(|err| engine_error_text(&err))
+}
+
+/// Диагностика движка для окна «Диагностика».
+#[tauri::command]
+pub async fn engine_diagnostics(state: State<'_, AppEngine>) -> Result<DiagnosticsDto, String> {
+    Ok(state.manager.diagnostics().into())
+}
+
+/// Сообщает, работает ли приложение в портативном режиме, и где лежат данные.
+#[tauri::command]
+pub async fn portable_info(state: State<'_, AppEngine>) -> Result<PortableInfoDto, String> {
+    Ok(PortableInfoDto {
+        portable: state.portable(),
+        data_dir: state.app_dir().to_string_lossy().into_owned(),
+    })
+}
+
+/// Сообщает, какая программа сейчас открывает `.torrent`-файлы.
+///
+/// Реестр читается заново, а не берётся из состояния `setup`: пользователь мог
+/// поменять обработчик через «Параметры Windows» уже после запуска. Чтение идёт
+/// в блокирующем пуле — реестр не мгновенный, а поток команд занят нельзя.
+#[tauri::command]
+pub async fn association_status(
+    state: State<'_, AppEngine>,
+    slot: State<'_, AssociationSlot>,
+) -> Result<AssociationDto, String> {
+    let exe = association_exe(&state)?;
+    let next = association_snapshot(exe).await?;
+    store_association(&slot, next.clone());
+    Ok(AssociationDto::from_state(&next))
+}
+
+/// Заново регистрирует Torrenta обработчиком `.torrent`-файлов.
+///
+/// Живой чужой обработчик не перехватывается: ключи Torrenta перезаписываются,
+/// но `UserChoice*` с чужим `ProgId` остаётся нетронутым, поэтому фактическим
+/// обработчиком всё равно остаётся он (`isOwner: false` в ответе).
+#[tauri::command]
+pub async fn repair_association(
+    state: State<'_, AppEngine>,
+    slot: State<'_, AssociationSlot>,
+) -> Result<AssociationDto, String> {
+    let exe = association_exe(&state)?;
+    let next = association_repair(exe).await?;
+    store_association(&slot, next.clone());
+    Ok(AssociationDto::from_state(&next))
+}
+
+/// Путь к текущему exe — цель привязки `.torrent`-файлов.
+///
+/// Не `app_dir`: в портативном режиме привязка должна вести на работающую копию.
+fn association_exe(state: &AppEngine) -> Result<PathBuf, String> {
+    state
+        .exe_path()
+        .ok_or_else(|| "не удалось определить путь к приложению".to_string())
+}
+
+/// Читает текущую привязку в блокирующем пуле.
+async fn association_snapshot(exe: PathBuf) -> Result<AssociationState, String> {
+    tauri::async_runtime::spawn_blocking(move || association::status(&exe))
+        .await
+        .map_err(|err| format!("не удалось проверить привязку .torrent: {err}"))
+}
+
+/// Перерегистрирует привязку в блокирующем пуле.
+async fn association_repair(exe: PathBuf) -> Result<AssociationState, String> {
+    tauri::async_runtime::spawn_blocking(move || association::repair(&exe))
+        .await
+        .map_err(|err| format!("не удалось изменить привязку .torrent: {err}"))
+}
+
+/// Проверяет привязку и чинит её, если она сломана (живого чужого не трогает).
+async fn association_ensure(exe: PathBuf) -> Result<AssociationState, String> {
+    tauri::async_runtime::spawn_blocking(move || association::ensure(&exe))
+        .await
+        .map_err(|err| format!("не удалось проверить привязку .torrent: {err}"))
+}
+
+/// Кладёт новое состояние в managed-слот, переживая «отравленную» блокировку.
+fn store_association(slot: &AssociationSlot, next: AssociationState) {
+    match slot.lock() {
+        Ok(mut current) => *current = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+/// Проверяет наличие обновления.
+///
+/// Пока в `tauri.conf.json` нет ключа подписи, обновления считаются
+/// ненастроенными: плагин выключен (`active: false`), и честный ответ —
+/// `configured: false` с пояснением, а не «обновлений нет».
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<UpdateStateDto, String> {
+    let current_version = app.package_info().version.to_string();
+    if !pubkey_configured(updater_pubkey(&app).as_deref()) {
+        return Ok(update_not_configured(&current_version));
+    }
+
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        // Ключ задан, но адреса обновлений — нет (`endpoints: []`). Это не
+        // ошибка сети: честнее вернуть состояние с пояснением, чем ронять команду.
+        Err(err) => {
+            return Ok(UpdateStateDto {
+                configured: true,
+                message: Some(format!("обновления настроены не полностью: {err}")),
+                current_version,
+                available: None,
+            });
+        }
+    };
+    let update = updater
+        .check()
+        .await
+        .map_err(|err| format!("не удалось проверить обновления: {err}"))?;
+
+    let available = update.as_ref().map(|update| update.version.clone());
+    Ok(UpdateStateDto {
+        configured: true,
+        current_version,
+        message: Some(match &available {
+            Some(version) => format!("доступно обновление {version}"),
+            None => "обновлений нет".to_string(),
+        }),
+        available,
+    })
+}
+
+/// Ключ подписи обновлений из конфигурации (`plugins.updater.pubkey`).
+fn updater_pubkey(app: &AppHandle) -> Option<String> {
+    let updater = app.config().plugins.0.get("updater")?;
+    Some(updater.get("pubkey")?.as_str()?.to_string())
+}
+
+/// Задан ли ключ подписи: пустая строка и пробелы ключом не считаются.
+fn pubkey_configured(pubkey: Option<&str>) -> bool {
+    pubkey.is_some_and(|key| !key.trim().is_empty())
+}
+
+/// Ответ `check_update`, когда обновления не настроены.
+///
+/// Вынесено из команды: `AppHandle` в тестах не создать, а текст сообщения
+/// фронтенд показывает как есть.
+fn update_not_configured(current_version: &str) -> UpdateStateDto {
+    UpdateStateDto {
+        configured: false,
+        current_version: current_version.to_string(),
+        available: None,
+        message: Some(UPDATE_NOT_CONFIGURED.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +1000,77 @@ mod tests {
             std::env::temp_dir().join(format!("torrenta-cmd-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("временный каталог должен создаваться");
         dir
+    }
+
+    #[test]
+    fn association_dto_reports_platform_support() {
+        let ours = AssociationState {
+            handler: Some("Torrenta.torrent".to_string()),
+            command: Some(r#""C:\Torrenta\torrenta.exe" "%1""#.to_string()),
+            is_owner: true,
+            repaired: true,
+            message: None,
+        };
+        let dto = AssociationDto::from_state(&ours);
+        assert_eq!(dto.handler.as_deref(), Some("Torrenta.torrent"));
+        assert_eq!(dto.available, cfg!(windows));
+        if cfg!(windows) {
+            assert!(dto.is_owner);
+            assert!(dto.repaired);
+            assert!(dto.message.is_none());
+        } else {
+            // Вне Windows состояние не прочитать: показываем причину, а не
+            // «наше» состояние, которого там быть не может.
+            assert!(!dto.is_owner);
+            assert!(!dto.repaired);
+            assert_eq!(dto.message.as_deref(), Some(UNSUPPORTED_PLATFORM));
+        }
+
+        // Недоступная привязка: обработчика нет, причина есть — интерфейс
+        // показывает её вместо галки «файлы связаны».
+        let broken = AssociationState::unavailable("нет доступа к реестру".to_string());
+        let dto = AssociationDto::from_state(&broken);
+        assert!(dto.handler.is_none());
+        assert!(!dto.is_owner);
+        assert!(dto.message.is_some());
+    }
+
+    #[test]
+    fn association_dto_serializes_to_camel_case_contract() {
+        // Контракт с фронтендом 1.7: ключи camelCase, значения — как есть.
+        let state = AssociationState {
+            handler: Some("Torrenta.torrent".to_string()),
+            command: None,
+            is_owner: true,
+            repaired: true,
+            message: Some("привязка восстановлена".to_string()),
+        };
+        let json = serde_json::to_value(AssociationDto::from_state(&state))
+            .expect("состояние привязки должно сериализоваться");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("DTO — объект")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "available",
+                "command",
+                "handler",
+                "isOwner",
+                "message",
+                "repaired"
+            ]
+        );
+        assert_eq!(json["handler"], "Torrenta.torrent");
+        assert!(json["command"].is_null());
+        assert_eq!(json["isOwner"], true);
+        assert_eq!(json["repaired"], true);
+        assert_eq!(json["message"], "привязка восстановлена");
+        assert_eq!(json["available"], cfg!(windows));
     }
 
     #[test]
@@ -846,5 +1285,101 @@ mod tests {
                 torrent_core::engine::FilePriority::High,
             ]
         );
+    }
+
+    #[test]
+    fn check_update_reports_missing_pubkey() {
+        // Ключа нет вовсе, он пуст или состоит из пробелов — обновления не настроены.
+        assert!(!pubkey_configured(None));
+        assert!(!pubkey_configured(Some("")));
+        assert!(!pubkey_configured(Some("   \t ")));
+        assert!(pubkey_configured(Some("MCowBQYDK2VwAyEA")));
+        assert!(pubkey_configured(Some("  MCowBQYDK2VwAyEA  ")));
+
+        let dto = update_not_configured("1.7.0");
+        assert!(!dto.configured);
+        assert_eq!(dto.current_version, "1.7.0");
+        assert_eq!(dto.available, None);
+        let message = dto.message.expect("пояснение для интерфейса");
+        assert!(
+            message.contains("нет ключа подписи"),
+            "неожиданный текст сообщения: {message}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_dto_uses_snake_case_json_names() {
+        let diagnostics = torrent_core::Diagnostics {
+            listen_port: 51_000,
+            dht: true,
+            dht_port: 51_001,
+            dht_nodes: 12,
+            pex: true,
+            web_seeds: true,
+            proxy: Some("socks5://127.0.0.1:1080".to_string()),
+            port_mapping: true,
+            mapped_external: Some("1.2.3.4:5678".to_string()),
+            schedule_enabled: true,
+            schedule_from_min: 60,
+            schedule_to_min: 90,
+            schedule_active: true,
+            download_limit_kib: 2048,
+            upload_limit_kib: 128,
+            sequential: true,
+            torrents: 3,
+            active: 1,
+            peers: 7,
+            download_bps: 1024,
+            upload_bps: 128,
+            uptime_secs: 600,
+        };
+        let value = serde_json::to_value(DiagnosticsDto::from(diagnostics))
+            .expect("диагностика должна сериализоваться");
+
+        for key in [
+            "listen_port",
+            "dht",
+            "dht_port",
+            "dht_nodes",
+            "pex",
+            "web_seeds",
+            "proxy",
+            "port_mapping",
+            "mapped_external",
+            "schedule_enabled",
+            "schedule_from_min",
+            "schedule_to_min",
+            "schedule_active",
+            "download_limit_kib",
+            "upload_limit_kib",
+            "sequential",
+            "torrents",
+            "active",
+            "peers",
+            "download_bps",
+            "upload_bps",
+            "uptime_secs",
+        ] {
+            assert!(value.get(key).is_some(), "в JSON нет поля «{key}»: {value}");
+        }
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(22),
+            "лишние или недостающие поля: {value}"
+        );
+        assert_eq!(value["mapped_external"], "1.2.3.4:5678");
+        assert_eq!(value["listen_port"], 51_000);
+    }
+
+    #[test]
+    fn portable_info_dto_uses_snake_case_json_names() {
+        let dto = PortableInfoDto {
+            portable: true,
+            data_dir: "C:\\Torrenta\\TorrentaData".to_string(),
+        };
+        let value = serde_json::to_value(&dto).expect("информация о портативности");
+        assert_eq!(value["portable"], true);
+        assert_eq!(value["data_dir"], "C:\\Torrenta\\TorrentaData");
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(2));
     }
 }

@@ -3,16 +3,20 @@ import type {
   AddResult,
   AppInfoDto,
   AppPayload,
+  AssociationDto,
   AutoShutdownState,
+  DiagnosticsDto,
   FilePriority,
   FileView,
   GlobalTotals,
   PeerView,
+  PortableInfoDto,
   SettingsDto,
   TorrentPreview,
   TorrentSnapshot,
   TorrentSource,
   TorrentState,
+  UpdateStateDto,
 } from "./types";
 import type { EngineApi, FileDropHandlers } from "./engine";
 import { basename, clamp } from "../lib/format";
@@ -100,6 +104,49 @@ function setPriority(file: FileView, priority: FilePriority): void {
   file.selected = priority !== "skip";
 }
 
+/** Схемы трекеров, которые принимает движок (1.7). */
+const TRACKER_SCHEMES = ["http://", "https://", "udp://"];
+const MAX_TRACKERS = 100;
+
+/**
+ * Проверка и нормализация списка трекеров — те же правила, что в ядре (1.7):
+ * обрезаем пробелы, выбрасываем пустые строки и повторы (без учёта регистра),
+ * не больше 100 штук. Чужую схему не пропускаем молча — это ошибка.
+ */
+function normalizeTrackers(urls: string[]): string[] {
+  const cleaned = urls.map((raw) => String(raw ?? "").trim()).filter((url) => url.length > 0);
+  if (cleaned.length > MAX_TRACKERS) {
+    throw new Error(`Слишком много трекеров: не больше ${MAX_TRACKERS}`);
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const url of cleaned) {
+    if (!TRACKER_SCHEMES.some((scheme) => url.toLowerCase().startsWith(scheme))) {
+      throw new Error(`Неверный адрес трекера: ${url}`);
+    }
+    const key = url.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(url);
+  }
+  return result;
+}
+
+/** Минуты от полуночи в пределах суток: лишние сутки отбрасываем (1.1). */
+function dayMinute(minute: number): number {
+  return ((Math.round(minute) % 1440) + 1440) % 1440;
+}
+
+/** Действует ли окно расписания: from > to — окно через полночь, from == to — выключено. */
+function inWindow(from: number, to: number, minute: number): boolean {
+  if (from === to) {
+    return false;
+  }
+  return from < to ? minute >= from && minute < to : minute >= from || minute < to;
+}
+
 interface FixtureFile {
   path: string;
   length: number;
@@ -125,6 +172,8 @@ interface FixtureOptions {
   eta: number | null;
   /** Демо-состояние «лимит раздачи достигнут» (1.6): торрент ждёт ручного возобновления. */
   seedLimitReached?: boolean;
+  /** Последовательная загрузка (1.7): куски качаются по порядку. */
+  sequential?: boolean;
   minutesAgo: number;
   files: FixtureFile[];
   trackers: string[];
@@ -167,6 +216,7 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     eta_seconds: options.eta,
     seed_ratio: ratioOf(options.uploaded, options.downloaded),
     seed_limit_reached: options.seedLimitReached ?? false,
+    sequential: options.sequential ?? false,
     save_path: DOWNLOADS,
     added_at: Math.floor(now / 1000) - options.minutesAgo * 60,
     files,
@@ -193,6 +243,8 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         down: 11_300_000,
         up: 1_150_000,
         eta: 308,
+        // ISO удобно смотреть/монтировать по ходу загрузки — качаем по порядку (1.7).
+        sequential: true,
         minutesAgo: 8,
         files: [
           {
@@ -237,7 +289,7 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         files: [],
         trackers: [
           "udp://tracker.opentrackr.org:1337/announce",
-          "wss://tracker.openwebtorrent.com",
+          "https://tracker.openwebtorrent.com/announce",
         ],
         peers: [
           peer("93.184.216.34:6881", "qBittorrent 4.6.5", 0, 0, 0, false),
@@ -315,10 +367,8 @@ function buildFixtures(now: number): TorrentSnapshot[] {
             downloaded: 1_240_000_000,
           },
         ],
-        trackers: [
-          "udp://tracker.opentrackr.org:1337/announce",
-          "https://tracker.gbitt.info/announce",
-        ],
+        // Добавлен магнитом без tr= — трекеров нет, пиров ищем через DHT и PEX (1.7).
+        trackers: [],
         peers: [],
       },
       now,
@@ -515,16 +565,27 @@ export async function createMockApi(): Promise<EngineApi> {
     web_seeds: true,
     seed_ratio_limit: 0,
     seed_time_limit_min: 0,
+    associate_files: true,
+    sequential: false,
+    // Демо-расписание: ночью качаем на полной скорости, утром — потише (1.7).
+    schedule_enabled: true,
+    schedule_from_min: 60,
+    schedule_to_min: 480,
+    schedule_download_limit_kib: 4_096,
+    schedule_upload_limit_kib: 1_024,
     theme: "dark",
   };
 
   const app: AppInfoDto = {
     name: "Torrenta",
-    version: "1.6.0",
-    engine: "torrent-core 1.6.0",
+    version: "1.7.0",
+    engine: "torrent-core 1.7.0",
     listen_port: 51413,
     platform: "windows",
   };
+
+  /** Момент старта демо-движка: от него считаем аптайм в диагностике (1.7). */
+  const bootedAt = Date.now();
 
   const listeners = new Set<(payload: AppPayload) => void>();
   const autoListeners = new Set<(state: AutoShutdownState) => void>();
@@ -573,6 +634,84 @@ export async function createMockApi(): Promise<EngineApi> {
     for (const listener of [...listeners]) {
       listener(payload);
     }
+  }
+
+  /** Действует ли окно расписания прямо сейчас (1.1). */
+  function scheduleActive(now = Date.now()): boolean {
+    if (!settings.schedule_enabled) {
+      return false;
+    }
+    const date = new Date(now);
+    return inWindow(
+      dayMinute(settings.schedule_from_min),
+      dayMinute(settings.schedule_to_min),
+      date.getHours() * 60 + date.getMinutes(),
+    );
+  }
+
+  /** Глобальный лимит приёма: внутри окна — расписания, вне окна — основной (1.1). */
+  function activeDownLimit(): number {
+    return scheduleActive() ? settings.schedule_download_limit_kib : settings.download_limit_kib;
+  }
+
+  /** Глобальный лимит отдачи: внутри окна — расписания, вне окна — основной (1.1). */
+  function activeUpLimit(): number {
+    return scheduleActive() ? settings.schedule_upload_limit_kib : settings.upload_limit_kib;
+  }
+
+  /** Срез состояния движка для окна «Диагностика» (1.7). */
+  function diagnostics(): DiagnosticsDto {
+    const totals = deriveTotals();
+    let peers = 0;
+    for (const torrent of torrents) {
+      peers += torrent.peers_connected;
+    }
+    const uptime = Math.max(0, Math.floor((Date.now() - bootedAt) / 1000));
+    const dhtPort = settings.dht ? settings.dht_port || 6_881 : 0;
+    return {
+      listen_port: settings.listen_port > 0 ? settings.listen_port : app.listen_port,
+      dht: settings.dht,
+      dht_port: dhtPort,
+      dht_nodes: settings.dht ? Math.min(320, 96 + Math.floor(uptime / 20)) : 0,
+      pex: settings.pex,
+      web_seeds: settings.web_seeds,
+      proxy: settings.proxy.trim() ? settings.proxy.trim() : null,
+      port_mapping: settings.port_mapping,
+      mapped_external: settings.port_mapping ? `203.0.113.7:${app.listen_port}` : null,
+      schedule_enabled: settings.schedule_enabled,
+      schedule_from_min: dayMinute(settings.schedule_from_min),
+      schedule_to_min: dayMinute(settings.schedule_to_min),
+      schedule_active: scheduleActive(),
+      download_limit_kib: activeDownLimit(),
+      upload_limit_kib: activeUpLimit(),
+      sequential: settings.sequential,
+      torrents: totals.torrents,
+      active: totals.active,
+      peers,
+      download_bps: totals.down_rate,
+      upload_bps: totals.up_rate,
+      uptime_secs: uptime,
+    };
+  }
+
+  // 1.7 (баг-репорт): привязка .torrent. Реестр демо-режим не читает — состояние
+  // живёт в памяти: сначала наша привязка, «Починить» выставляет её принудительно.
+  let assocHandler: string | null = "Torrenta.torrent";
+  let assocCommand: string | null = String.raw`"C:\Users\Пользователь\AppData\Local\Programs\Torrenta\torrenta.exe" "%1"`;
+  let assocOwner = true;
+
+  /** Текущее состояние ассоциации; `repaired` — была ли привязка перезаписана. */
+  function association(repaired: boolean): AssociationDto {
+    return {
+      handler: assocHandler,
+      command: assocCommand,
+      isOwner: assocOwner,
+      repaired,
+      message: assocOwner
+        ? null
+        : "Файлы .torrent открывает другая программа: наш обработчик не назначен.",
+      available: true,
+    };
   }
 
   function find(id: number): TorrentSnapshot {
@@ -898,8 +1037,8 @@ export async function createMockApi(): Promise<EngineApi> {
         const wobble = 0.78 + 0.44 * (0.5 + 0.5 * Math.sin(stamp / 2600 + runtime.phase));
         const rawDown = runtime.downTarget * wobble;
         const rawUp = runtime.upTarget * (0.7 + 0.6 * (0.5 + 0.5 * Math.sin(stamp / 3900 + runtime.phase)));
-        const down = capRate(rawDown, torrent.down_limit_kib, settings.download_limit_kib);
-        const up = capRate(rawUp, torrent.up_limit_kib, settings.upload_limit_kib);
+        const down = capRate(rawDown, torrent.down_limit_kib, activeDownLimit());
+        const up = capRate(rawUp, torrent.up_limit_kib, activeUpLimit());
         torrent.down_rate = down;
         torrent.up_rate = up;
         torrent.downloaded_bytes = Math.min(
@@ -916,7 +1055,7 @@ export async function createMockApi(): Promise<EngineApi> {
       }
       if (state === "seeding") {
         const rawUp = runtime.upTarget * (0.72 + 0.55 * (0.5 + 0.5 * Math.sin(stamp / 3300 + runtime.phase)));
-        torrent.up_rate = capRate(rawUp, torrent.up_limit_kib, settings.upload_limit_kib);
+        torrent.up_rate = capRate(rawUp, torrent.up_limit_kib, activeUpLimit());
         torrent.down_rate = 0;
         torrent.uploaded_bytes += (torrent.up_rate * TICK_MS) / 1000;
       }
@@ -984,6 +1123,8 @@ export async function createMockApi(): Promise<EngineApi> {
       eta_seconds: null,
       seed_ratio: 0,
       seed_limit_reached: false,
+      // Новые торренты наследуют настройку «качать последовательно» (1.7).
+      sequential: settings.sequential,
       save_path: options.savePath ?? settings.download_dir,
       added_at: Math.floor(Date.now() / 1000),
       files,
@@ -1121,6 +1262,72 @@ export async function createMockApi(): Promise<EngineApi> {
       torrent.down_limit_kib = Math.max(0, Math.round(downKib));
       torrent.up_limit_kib = Math.max(0, Math.round(upKib));
       emit();
+    },
+
+    // 1.7: последовательная загрузка, трекеры и принудительный анонс.
+    setTorrentSequential: async (id, on) => {
+      const torrent = find(id);
+      await delay(90);
+      torrent.sequential = Boolean(on);
+      emit();
+    },
+
+    torrentTrackers: async (id) => {
+      const torrent = find(id);
+      await delay(120);
+      return torrent.trackers.slice();
+    },
+
+    setTorrentTrackers: async (id, urls) => {
+      const torrent = find(id);
+      await delay(220);
+      torrent.trackers = normalizeTrackers(urls);
+      // Как в движке: после смены списка сразу анонсируемся, чтобы новые
+      // трекеры отдали пиров, а старые перестали слать ошибки.
+      torrent.error = null;
+      emit();
+    },
+
+    reannounceTorrent: async (id) => {
+      find(id);
+      await delay(180);
+    },
+
+    // 1.7: срез состояния движка для окна «Диагностика».
+    engineDiagnostics: async () => {
+      await delay(80);
+      return diagnostics();
+    },
+
+    portableInfo: async (): Promise<PortableInfoDto> => {
+      await delay(60);
+      // Демо-сборка не портативная: данные лежат в профиле пользователя.
+      return { portable: false, data_dir: String.raw`C:\Users\Пользователь\AppData\Roaming\Torrenta` };
+    },
+
+    checkUpdate: async (): Promise<UpdateStateDto> => {
+      await delay(260);
+      // Демо-сборка без ключа подписи: проверять нечего, обновления не настроены (2.4).
+      return {
+        configured: false,
+        current_version: app.version,
+        available: null,
+        message: "обновления не настроены: нет ключа подписи",
+      };
+    },
+
+    // 1.7 (баг-репорт): .torrent открывает наша сборка — и «Починить» это подтверждает.
+    associationStatus: async (): Promise<AssociationDto> => {
+      await delay(90);
+      return association(false);
+    },
+
+    repairAssociation: async (): Promise<AssociationDto> => {
+      await delay(240);
+      assocHandler = "Torrenta.torrent";
+      assocCommand = String.raw`"C:\Users\Пользователь\AppData\Local\Programs\Torrenta\torrenta.exe" "%1"`;
+      assocOwner = true;
+      return association(true);
     },
 
     getAutoShutdown: async () => {
@@ -1381,6 +1588,24 @@ export async function createMockApi(): Promise<EngineApi> {
         4_294_967_295,
         Math.max(0, Math.round(Number(next.seed_time_limit_min) || 0)),
       );
+      // 1.7: последовательная загрузка и окно расписания. Минуты приводим к суткам,
+      // лимиты ограничиваем 1 ГиБ/с, одинаковые «с» и «до» выключают расписание — как ядро.
+      // 1.7 (баг-репорт): выключатель лишь запрещает самовосстановление привязки —
+      // уже записанную привязку, как и бэкенд, демо-режим не снимает.
+      settings.associate_files = next.associate_files !== false;
+      settings.sequential = Boolean(next.sequential);
+      settings.schedule_from_min = dayMinute(Number(next.schedule_from_min) || 0);
+      settings.schedule_to_min = dayMinute(Number(next.schedule_to_min) || 0);
+      settings.schedule_download_limit_kib = Math.min(
+        1_048_576,
+        Math.max(0, Math.round(Number(next.schedule_download_limit_kib) || 0)),
+      );
+      settings.schedule_upload_limit_kib = Math.min(
+        1_048_576,
+        Math.max(0, Math.round(Number(next.schedule_upload_limit_kib) || 0)),
+      );
+      settings.schedule_enabled =
+        Boolean(next.schedule_enabled) && settings.schedule_from_min !== settings.schedule_to_min;
       if (!settings.auto_shutdown) {
         autoPending = null;
       }

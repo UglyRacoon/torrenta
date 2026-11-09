@@ -4,6 +4,7 @@ import { activeCount, filterCounts } from "../state/view";
 import { clamp, fmtBytes, fmtCount, fmtRate } from "../lib/format";
 import { h, setAttr, setText } from "../lib/dom";
 import { brandMark, icon, type IconName } from "../lib/icons";
+import { bindDiagnosticsHotkey, openDiagnostics } from "./diagnostics";
 
 const NAV: { key: FilterKey; label: string; icon: IconName }[] = [
   { key: "all", label: "Все", icon: "layers" },
@@ -139,6 +140,16 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     h("span", { class: "side-action__label", text: "Настройки" }),
   );
 
+  // 1.7: окно диагностики — рядом с настройками, та же горячая клавиша Ctrl+D.
+  const diagnosticsButton = h("button", {
+    class: "side-action",
+    attrs: { type: "button", title: "Диагностика (Ctrl+D)" },
+  });
+  diagnosticsButton.append(
+    h("span", { class: "side-action__icon" }, icon("info", 16)),
+    h("span", { class: "side-action__label", text: "Диагностика" }),
+  );
+
   // 1.4: выход из приложения. Цвета — только существующие токены (см. layout.css),
   // чтобы не расходиться с проверкой контраста.
   const quitButton = h("button", {
@@ -150,7 +161,14 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     h("span", { class: "side-action__label", text: "Выход" }),
   );
 
-  const footer = h("div", { class: "sidebar__footer" }, themeButton, settingsButton, quitButton);
+  const footer = h(
+    "div",
+    { class: "sidebar__footer" },
+    themeButton,
+    settingsButton,
+    diagnosticsButton,
+    quitButton,
+  );
 
   const resize = h("div", {
     class: "sidebar__resize",
@@ -169,8 +187,10 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
 
   themeButton.addEventListener("click", () => options.onToggleTheme());
   settingsButton.addEventListener("click", () => options.onOpenSettings());
+  diagnosticsButton.addEventListener("click", () => openDiagnostics());
   quitButton.addEventListener("click", () => options.onQuit());
   allButton.addEventListener("click", () => options.onToggleAll());
+  bindDiagnosticsHotkey();
 
   let allMode: "pause" | "resume" | "idle" | null = null;
   let theme: string | null = null;
@@ -202,6 +222,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     }
     setAttr(themeButton, "aria-label", isCompact ? "Переключить тему" : null);
     setAttr(settingsButton, "aria-label", isCompact ? "Настройки" : null);
+    setAttr(diagnosticsButton, "aria-label", isCompact ? "Диагностика" : null);
     setAttr(quitButton, "aria-label", isCompact ? "Выход" : null);
     setAttr(allButton, "aria-label", allButton.dataset.label ?? "Пауза/возобновление");
   }

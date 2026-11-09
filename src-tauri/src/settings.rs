@@ -41,6 +41,14 @@ pub const PROXY_SCHEMES: [&str; 4] = ["socks5://", "socks5h://", "http://", "htt
 pub const THEMES: [&str; 2] = ["dark", "light"];
 /// Тема оформления по умолчанию.
 pub const DEFAULT_THEME: &str = "dark";
+/// Минут в сутках: границы окна расписания задаются временем внутри суток.
+pub const MINUTES_PER_DAY: u32 = 1440;
+/// Имя файла-маркера портативного режима рядом с `torrenta.exe`.
+pub const PORTABLE_MARKER: &str = "torrenta-portable.txt";
+/// Второе допустимое имя маркера (без расширения) — принимаются оба варианта.
+pub const PORTABLE_MARKER_ALT: &str = "portable";
+/// Каталог данных в портативном режиме (рядом с `torrenta.exe`).
+pub const PORTABLE_DATA_DIR_NAME: &str = "TorrentaData";
 
 /// Настройки в том виде, в котором их видит фронтенд.
 ///
@@ -99,6 +107,30 @@ pub struct SettingsDto {
     pub seed_ratio_limit: f64,
     /// Останавливать раздачу через N минут после завершения (`0` — без ограничения).
     pub seed_time_limit_min: u32,
+    /// Скачивать новые торренты последовательно (куски по порядку).
+    ///
+    /// Это значение по умолчанию для добавляемых торрентов: у отдельного торрента
+    /// порядок меняет команда `set_torrent_sequential`, и её выбор живёт в сессии,
+    /// а не здесь.
+    pub sequential: bool,
+    /// Включать расписание скорости.
+    ///
+    /// Когда флаг включён, внутри окна [`SettingsDto::schedule_from_min`] —
+    /// [`SettingsDto::schedule_to_min`] действуют лимиты `schedule_*_limit_kib`,
+    /// а вне окна — обычные [`SettingsDto::download_limit_kib`] и
+    /// [`SettingsDto::upload_limit_kib`]. Окно с равными границами считается
+    /// выключенным расписанием: нормализация снимает флаг.
+    pub schedule_enabled: bool,
+    /// Начало окна расписания: минуты от полуночи (`0..=1439`).
+    pub schedule_from_min: u32,
+    /// Конец окна расписания: минуты от полуночи (`0..=1439`).
+    ///
+    /// Если конец меньше начала, окно переходит через полночь (`22:00`–`06:00`).
+    pub schedule_to_min: u32,
+    /// Лимит загрузки внутри окна расписания, КиБ/с (`0` — без лимита).
+    pub schedule_download_limit_kib: u32,
+    /// Лимит отдачи внутри окна расписания, КиБ/с (`0` — без лимита).
+    pub schedule_upload_limit_kib: u32,
     /// Выключать компьютер, когда все загрузки завершены.
     ///
     /// Само выключение выполняет наблюдатель движка (см. `auto_shutdown`),
@@ -110,6 +142,13 @@ pub struct SettingsDto {
     /// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) выполняется
     /// модулем [`crate::autostart`] при старте и при сохранении настроек.
     pub autostart: bool,
+    /// Регистрировать Torrenta обработчиком `.torrent`-файлов.
+    ///
+    /// Когда флаг включён, при старте приложение проверяет привязку расширения в
+    /// реестре и исправляет её, если она ведёт на старый (уже удалённый) exe или
+    /// сломана пустым `ProgId` (см. [`crate::association`]). Живой чужой
+    /// обработчик — например, qBittorrent — при этом не перехватывается.
+    pub associate_files: bool,
     /// Запускать приложение сразу в трее, не показывая окно.
     ///
     /// Настройка действует только на старте: если окно не показано, его можно
@@ -164,8 +203,15 @@ impl std::hash::Hash for SettingsDto {
         self.seed_after_complete.hash(state);
         self.seed_ratio_limit.to_bits().hash(state);
         self.seed_time_limit_min.hash(state);
+        self.sequential.hash(state);
+        self.schedule_enabled.hash(state);
+        self.schedule_from_min.hash(state);
+        self.schedule_to_min.hash(state);
+        self.schedule_download_limit_kib.hash(state);
+        self.schedule_upload_limit_kib.hash(state);
         self.auto_shutdown.hash(state);
         self.autostart.hash(state);
+        self.associate_files.hash(state);
         self.start_minimized.hash(state);
         self.close_to_tray.hash(state);
         self.notify_on_complete.hash(state);
@@ -194,8 +240,19 @@ impl Default for SettingsDto {
             seed_after_complete: true,
             seed_ratio_limit: 0.0,
             seed_time_limit_min: 0,
+            // Новые торренты качаются в обычном (не последовательном) порядке,
+            // расписание скорости выключено: это поведение 1.6.
+            sequential: false,
+            schedule_enabled: false,
+            schedule_from_min: 0,
+            schedule_to_min: 0,
+            schedule_download_limit_kib: 0,
+            schedule_upload_limit_kib: 0,
             auto_shutdown: false,
             autostart: false,
+            // Привязка `.torrent` включается по умолчанию: иначе после обновления
+            // файлы открывались бы старым (несуществующим) exe.
+            associate_files: true,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -232,6 +289,15 @@ impl SettingsDto {
         // `dht_port` и `seed_time_limit_min` зажимать не нужно: их типы (`u16`
         // и `u32`) и есть допустимый диапазон, а `0` — законное «без значения».
         self.theme = normalize_theme(&self.theme);
+        // Расписание: границы окна — минуты внутри суток, лимиты — те же, что у
+        // обычных (1 ГиБ/с), а окно нулевой длины расписанием не считается.
+        self.schedule_from_min %= MINUTES_PER_DAY;
+        self.schedule_to_min %= MINUTES_PER_DAY;
+        self.schedule_download_limit_kib = clamp_rate(self.schedule_download_limit_kib);
+        self.schedule_upload_limit_kib = clamp_rate(self.schedule_upload_limit_kib);
+        if self.schedule_from_min == self.schedule_to_min {
+            self.schedule_enabled = false;
+        }
     }
 
     /// То же, что [`SettingsDto::normalize`], но по цепочке вызовов.
@@ -436,6 +502,12 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
         port_mapping: dto.port_mapping,
         seed_ratio_limit: dto.seed_ratio_limit,
         seed_time_limit_min: dto.seed_time_limit_min,
+        sequential: dto.sequential,
+        schedule_enabled: dto.schedule_enabled,
+        schedule_from_min: dto.schedule_from_min,
+        schedule_to_min: dto.schedule_to_min,
+        schedule_download_limit_kib: dto.schedule_download_limit_kib,
+        schedule_upload_limit_kib: dto.schedule_upload_limit_kib,
     }
 }
 
@@ -467,6 +539,14 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         seed_after_complete: config.seed_after_complete,
         seed_ratio_limit: normalize_seed_ratio(config.seed_ratio_limit),
         seed_time_limit_min: config.seed_time_limit_min,
+        sequential: config.sequential,
+        schedule_enabled: config.schedule_enabled,
+        // Границы окна движок уже держит внутри суток (`sanitized`), лимиты —
+        // в допустимом диапазоне; нормализация повторяет инвариант DTO.
+        schedule_from_min: config.schedule_from_min % MINUTES_PER_DAY,
+        schedule_to_min: config.schedule_to_min % MINUTES_PER_DAY,
+        schedule_download_limit_kib: clamp_rate(config.schedule_download_limit_kib),
+        schedule_upload_limit_kib: clamp_rate(config.schedule_upload_limit_kib),
         max_active_downloads: clamp_active(
             u32::try_from(config.max_active_downloads).unwrap_or(MAX_ACTIVE_LIMIT),
         ),
@@ -475,6 +555,9 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         ),
         auto_shutdown,
         autostart: false,
+        // Привязка `.torrent` не входит в `EngineConfig`: управляет ею реестр,
+        // поэтому обратное преобразование отдаёт значение по умолчанию.
+        associate_files: true,
         start_minimized: false,
         close_to_tray: false,
         // Настройки уведомлений, наблюдения за папкой и восстановления сессии
@@ -489,6 +572,85 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
 /// Путь к файлу настроек внутри каталога конфигурации приложения.
 pub fn settings_path(app_dir: &Path) -> PathBuf {
     app_dir.join(SETTINGS_FILE_NAME)
+}
+
+/// Итог разрешения каталога данных: сам путь и признак портативного режима.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDir {
+    /// Каталог, в котором живут `settings.json` и подкаталог `session/`.
+    pub dir: PathBuf,
+    /// `true`, если данные лежат рядом с исполняемым файлом (портативный режим).
+    pub portable: bool,
+}
+
+/// Определяет каталог данных приложения — единая точка выбора для всех модулей.
+///
+/// Результат получают настройки ([`settings_path`]), сессия
+/// ([`crate::session::SessionRegistry`]) и состояние ([`crate::state::AppEngine`]),
+/// поэтому все файлы приложения лежат в одном месте: либо в каталоге конфигурации
+/// Tauri (`app_dir`, обычно `%APPDATA%\Torrenta`), либо рядом с `torrenta.exe`.
+///
+/// Портативный режим включается файлом-маркером [`PORTABLE_MARKER`] рядом с
+/// исполняемым файлом (принимается и [`PORTABLE_MARKER_ALT`]). Данные при этом
+/// складываются в подкаталог [`PORTABLE_DATA_DIR_NAME`]: отдельный каталог можно
+/// целиком скопировать на флешку, и он не конфликтует с файлами, которые лежат
+/// рядом с exe.
+///
+/// Каталог создаётся при первом обращении. Если рядом с exe нет прав на запись,
+/// паники не будет: причина уходит в stderr, приложение остаётся на `app_dir`
+/// с `portable: false` — запуск важнее портативности.
+pub fn resolve_data_dir(exe_dir: Option<&Path>, app_dir: &Path) -> DataDir {
+    let fallback = DataDir {
+        dir: app_dir.to_path_buf(),
+        portable: false,
+    };
+
+    let Some(exe_dir) = exe_dir else {
+        return fallback;
+    };
+    if !has_portable_marker(exe_dir) {
+        return fallback;
+    }
+
+    let dir = exe_dir.join(PORTABLE_DATA_DIR_NAME);
+    match ensure_writable_dir(&dir) {
+        Ok(()) => DataDir {
+            dir,
+            portable: true,
+        },
+        Err(err) => {
+            eprintln!(
+                "[torrenta] портативный режим недоступен: каталог «{}» использовать нельзя ({err}); данные останутся в «{}»",
+                dir.display(),
+                app_dir.display()
+            );
+            fallback
+        }
+    }
+}
+
+/// Проверяет, что рядом с исполняемым файлом лежит маркер портативного режима.
+pub fn has_portable_marker(exe_dir: &Path) -> bool {
+    [PORTABLE_MARKER, PORTABLE_MARKER_ALT]
+        .iter()
+        .any(|name| exe_dir.join(name).is_file())
+}
+
+/// Создаёт каталог данных и убеждается, что в него действительно можно писать.
+///
+/// Проверка записью нужна потому, что `create_dir_all` умеет «успешно» вернуть
+/// `Ok`, даже когда каталог уже есть, а прав на запись в него нет: без пробного
+/// файла первый же `save` упал бы уже во время работы приложения.
+fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|err| format!("не удалось создать каталог: {err}"))?;
+    if !dir.is_dir() {
+        return Err("путь занят файлом".to_string());
+    }
+
+    let probe = dir.join(".torrenta-write-test");
+    fs::write(&probe, b"ok").map_err(|err| format!("нет прав на запись: {err}"))?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Читает настройки с диска, никогда не падая.
@@ -611,9 +773,16 @@ mod tests {
             web_seeds: true,
             seed_ratio_limit: 0.0,
             seed_time_limit_min: 0,
+            sequential: true,
+            schedule_enabled: true,
+            schedule_from_min: 60,
+            schedule_to_min: 90,
+            schedule_download_limit_kib: 2048,
+            schedule_upload_limit_kib: 128,
             seed_after_complete: false,
             auto_shutdown: true,
             autostart: true,
+            associate_files: true,
             start_minimized: true,
             close_to_tray: true,
             notify_on_complete: false,
@@ -642,6 +811,15 @@ mod tests {
         assert!(dto.watch_dir.is_empty());
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert!(dto.download_dir.is_empty());
+        assert!(
+            !dto.sequential,
+            "обычный порядок загрузки — поведение по умолчанию"
+        );
+        assert!(!dto.schedule_enabled, "расписание скорости выключено");
+        assert_eq!(dto.schedule_from_min, 0);
+        assert_eq!(dto.schedule_to_min, 0);
+        assert_eq!(dto.schedule_download_limit_kib, 0);
+        assert_eq!(dto.schedule_upload_limit_kib, 0);
         assert_eq!(dto, dto.clone().normalized());
     }
 
@@ -663,9 +841,17 @@ mod tests {
             web_seeds: false,
             seed_ratio_limit: 3.0,
             seed_time_limit_min: 120,
+            sequential: true,
+            schedule_enabled: true,
+            // 5000 минут — это 3 суток и 680 минут: границы заворачиваются в сутки.
+            schedule_from_min: 5_000,
+            schedule_to_min: 0,
+            schedule_download_limit_kib: u32::MAX,
+            schedule_upload_limit_kib: MAX_RATE_LIMIT_KIB + 1,
             seed_after_complete: true,
             auto_shutdown: true,
             autostart: false,
+            associate_files: true,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -693,6 +879,17 @@ mod tests {
             "порт DHT — любой u16, зажимать нечего"
         );
         assert_eq!(dto.seed_time_limit_min, 120);
+        assert_eq!(
+            dto.schedule_from_min, 680,
+            "границы окна — это минуты внутри суток"
+        );
+        assert_eq!(dto.schedule_to_min, 0);
+        assert_eq!(dto.schedule_download_limit_kib, MAX_RATE_LIMIT_KIB);
+        assert_eq!(dto.schedule_upload_limit_kib, MAX_RATE_LIMIT_KIB);
+        assert!(
+            dto.schedule_enabled,
+            "окно ненулевой длины остаётся включённым"
+        );
 
         let mut dto = SettingsDto {
             max_peers: MAX_PEERS_LIMIT + 100,
@@ -702,6 +899,32 @@ mod tests {
         dto.normalize();
         assert_eq!(dto.max_peers, MAX_PEERS_LIMIT);
         assert_eq!(dto.theme, DEFAULT_THEME);
+    }
+
+    #[test]
+    fn empty_schedule_window_disables_schedule() {
+        // Окно нулевой длины — не «круглосуточно», а «расписания нет»: иначе
+        // включённый флаг молча оставлял бы пользователя без лимитов.
+        let dto = SettingsDto {
+            schedule_enabled: true,
+            schedule_from_min: 600,
+            schedule_to_min: 600,
+            ..SettingsDto::default()
+        }
+        .normalized();
+        assert!(!dto.schedule_enabled);
+        assert_eq!(dto.schedule_from_min, 600);
+        assert_eq!(dto.schedule_to_min, 600);
+
+        // Асимметричное окно через полночь (22:00–06:00) остаётся включённым.
+        let overnight = SettingsDto {
+            schedule_enabled: true,
+            schedule_from_min: 22 * 60,
+            schedule_to_min: 6 * 60,
+            ..SettingsDto::default()
+        }
+        .normalized();
+        assert!(overnight.schedule_enabled);
     }
 
     #[test]
@@ -791,6 +1014,12 @@ mod tests {
         assert!(!config.seed_after_complete);
         assert_eq!(config.max_active_downloads, 4);
         assert_eq!(config.max_active_seeds, 2);
+        assert!(config.sequential, "последовательная загрузка не доехала");
+        assert!(config.schedule_enabled);
+        assert_eq!(config.schedule_from_min, 60);
+        assert_eq!(config.schedule_to_min, 90);
+        assert_eq!(config.schedule_download_limit_kib, 2048);
+        assert_eq!(config.schedule_upload_limit_kib, 128);
 
         let back = from_engine_config(&config, &dto.theme, dto.auto_shutdown);
         // «Оконные» флаги не входят в `EngineConfig`: обратное преобразование
@@ -904,6 +1133,172 @@ mod tests {
         assert!(from_engine_config(&disabled, DEFAULT_THEME, false)
             .proxy
             .is_empty());
+    }
+
+    #[test]
+    fn p3_settings_reach_engine_config() {
+        // Последовательная загрузка и расписание скорости должны доезжать до
+        // движка: иначе настройка «сохраняется», но ни на что не влияет.
+        let dto = SettingsDto {
+            sequential: true,
+            schedule_enabled: true,
+            schedule_from_min: 22 * 60,
+            schedule_to_min: 6 * 60,
+            schedule_download_limit_kib: 100,
+            schedule_upload_limit_kib: 25,
+            ..SettingsDto::default()
+        }
+        .normalized();
+
+        let config = to_engine_config(&dto);
+        assert!(config.sequential, "последовательность не доехала до движка");
+        assert!(config.schedule_enabled, "расписание не доехало до движка");
+        assert_eq!(config.schedule_from_min, 1320);
+        assert_eq!(config.schedule_to_min, 360);
+        assert_eq!(config.schedule_download_limit_kib, 100);
+        assert_eq!(config.schedule_upload_limit_kib, 25);
+
+        // Обратное преобразование возвращает те же значения, а не заглушки.
+        let back = from_engine_config(&config, DEFAULT_THEME, false);
+        assert!(back.sequential);
+        assert!(back.schedule_enabled);
+        assert_eq!(back.schedule_from_min, 1320);
+        assert_eq!(back.schedule_to_min, 360);
+        assert_eq!(back.schedule_download_limit_kib, 100);
+        assert_eq!(back.schedule_upload_limit_kib, 25);
+
+        // Окно нулевой длины гасит флаг ещё в настройках, поэтому до движка
+        // пустое расписание не доезжает вовсе.
+        let empty_window = SettingsDto {
+            schedule_enabled: true,
+            schedule_from_min: 100,
+            schedule_to_min: 100,
+            ..SettingsDto::default()
+        }
+        .normalized();
+        assert!(!to_engine_config(&empty_window).schedule_enabled);
+    }
+
+    #[test]
+    fn p3_settings_use_snake_case_keys() {
+        let dir = test_dir("p3-keys");
+        let path = settings_path(&dir);
+        save(&path, &sample()).expect("настройки должны сохраняться");
+        let text = fs::read_to_string(&path).expect("файл настроек должен читаться");
+        for key in [
+            "\"sequential\": true",
+            "\"schedule_enabled\": true",
+            "\"schedule_from_min\": 60",
+            "\"schedule_to_min\": 90",
+            "\"schedule_download_limit_kib\": 2048",
+            "\"schedule_upload_limit_kib\": 128",
+        ] {
+            assert!(text.contains(key), "нет ключа {key}: {text}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_settings_without_p3_keys_normalize_to_defaults() {
+        // Файл от 1.6: полей P3 в нём нет, и это не ошибка — берутся значения
+        // по умолчанию (`serde(default)`), а расписание выключено.
+        let dir = test_dir("legacy-p3");
+        let path = settings_path(&dir);
+        let legacy = r#"{
+  "download_dir": "C:\\Torrents",
+  "max_peers": 60,
+  "theme": "dark"
+}"#;
+        fs::write(&path, legacy).expect("старый settings.json должен записываться");
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert!(!loaded.sequential);
+        assert!(!loaded.schedule_enabled);
+        assert_eq!(loaded.schedule_from_min, 0);
+        assert_eq!(loaded.schedule_to_min, 0);
+        assert_eq!(loaded.schedule_download_limit_kib, 0);
+        assert_eq!(loaded.schedule_upload_limit_kib, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_marker_switches_data_dir_to_exe_dir() {
+        let exe_dir = test_dir("portable");
+        let app_dir = test_dir("portable-appdata");
+        fs::write(exe_dir.join(PORTABLE_MARKER), b"").expect("маркер должен создаваться");
+
+        let resolved = resolve_data_dir(Some(&exe_dir), &app_dir);
+        assert!(resolved.portable, "маркер включает портативный режим");
+        assert_eq!(resolved.dir, exe_dir.join(PORTABLE_DATA_DIR_NAME));
+        assert!(resolved.dir.is_dir(), "каталог данных создаётся сразу");
+        let _ = fs::remove_dir_all(&exe_dir);
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn portable_accepts_short_marker_name() {
+        let exe_dir = test_dir("portable-short");
+        let app_dir = test_dir("portable-short-appdata");
+        fs::write(exe_dir.join(PORTABLE_MARKER_ALT), b"").expect("маркер должен создаваться");
+
+        let resolved = resolve_data_dir(Some(&exe_dir), &app_dir);
+        assert!(resolved.portable);
+        assert_eq!(resolved.dir, exe_dir.join(PORTABLE_DATA_DIR_NAME));
+        let _ = fs::remove_dir_all(&exe_dir);
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn no_marker_keeps_app_data_dir() {
+        let exe_dir = test_dir("portable-none");
+        let app_dir = test_dir("portable-none-appdata");
+
+        let resolved = resolve_data_dir(Some(&exe_dir), &app_dir);
+        assert!(!resolved.portable);
+        assert_eq!(resolved.dir, app_dir);
+        // Без exe (теоретически невозможно на Windows) тоже не паникуем.
+        assert_eq!(resolve_data_dir(None, &app_dir).dir, app_dir);
+        let _ = fs::remove_dir_all(&exe_dir);
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn broken_portable_dir_falls_back_to_app_data_dir() {
+        // «Каталог данных» занят файлом: создать каталог нельзя, поэтому
+        // приложение остаётся на `%APPDATA%` и не падает.
+        let exe_dir = test_dir("portable-broken");
+        let app_dir = test_dir("portable-broken-appdata");
+        fs::write(exe_dir.join(PORTABLE_MARKER), b"").expect("маркер должен создаваться");
+        fs::write(exe_dir.join(PORTABLE_DATA_DIR_NAME), b"not a dir")
+            .expect("файл-помеха должен создаваться");
+
+        let resolved = resolve_data_dir(Some(&exe_dir), &app_dir);
+        assert!(
+            !resolved.portable,
+            "нерабочий каталог — не портативный режим"
+        );
+        assert_eq!(resolved.dir, app_dir);
+        let _ = fs::remove_dir_all(&exe_dir);
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn settings_and_session_live_in_resolved_data_dir() {
+        // Одна и та же функция даёт каталог и настройкам, и сессии.
+        let exe_dir = test_dir("portable-shared");
+        let app_dir = test_dir("portable-shared-appdata");
+        fs::write(exe_dir.join(PORTABLE_MARKER), b"").expect("маркер должен создаваться");
+        let resolved = resolve_data_dir(Some(&exe_dir), &app_dir);
+
+        assert_eq!(
+            settings_path(&resolved.dir),
+            resolved.dir.join(SETTINGS_FILE_NAME)
+        );
+        assert_eq!(
+            crate::session::SessionStore::new(&resolved.dir).dir(),
+            resolved.dir.join("session")
+        );
+        let _ = fs::remove_dir_all(&exe_dir);
+        let _ = fs::remove_dir_all(&app_dir);
     }
 
     #[test]
@@ -1209,6 +1604,7 @@ mod tests {
         let mut expected = vec![
             "auto_shutdown",
             "autostart",
+            "associate_files",
             "close_to_tray",
             "dht",
             "dht_port",
@@ -1223,9 +1619,15 @@ mod tests {
             "port_mapping",
             "proxy",
             "restore_session",
+            "schedule_download_limit_kib",
+            "schedule_enabled",
+            "schedule_from_min",
+            "schedule_to_min",
+            "schedule_upload_limit_kib",
             "seed_after_complete",
             "seed_ratio_limit",
             "seed_time_limit_min",
+            "sequential",
             "start_minimized",
             "theme",
             "upload_limit_kib",
@@ -1266,6 +1668,12 @@ mod tests {
         assert!(loaded.proxy.is_empty(), "прокси выключен");
         assert!(loaded.port_mapping, "проброс порта включён по умолчанию");
         assert!(loaded.web_seeds, "web seeds включены по умолчанию");
+        // Новое поле 1.7: старый `settings.json` его не содержит, а привязка
+        // `.torrent` должна включиться сама — иначе баг с ассоциацией не уйдёт.
+        assert!(
+            loaded.associate_files,
+            "привязка .torrent включена по умолчанию"
+        );
         assert_eq!(loaded.seed_ratio_limit, 0.0);
         assert_eq!(loaded.seed_time_limit_min, 0);
         // Остальные поля читаются как раньше.

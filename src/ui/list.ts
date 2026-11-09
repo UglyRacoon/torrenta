@@ -1,6 +1,6 @@
-import type { SortKey, TorrentSnapshot, TorrentState } from "../api/types";
+import type { TorrentSnapshot, TorrentState } from "../api/types";
 import type { AppState } from "../state/store";
-import { FILTER_LABELS, activeCount, visibleTorrents } from "../state/view";
+import { FILTER_LABELS, activeCount, matchesFilter } from "../state/view";
 import {
   fmtBytes,
   fmtCount,
@@ -13,7 +13,7 @@ import {
 } from "../lib/format";
 import { h, setAttr, setScaleX, setText } from "../lib/dom";
 import { icon } from "../lib/icons";
-import { createSelect } from "./select";
+import { createSelect, type SelectControl, type SelectOption } from "./select";
 
 const BADGES: Record<TorrentState, { label: string; cls: string }> = {
   queued: { label: "В очереди", cls: "queued" },
@@ -26,13 +26,211 @@ const BADGES: Record<TorrentState, { label: string; cls: string }> = {
   error: { label: "Ошибка", cls: "error" },
 };
 
-const SORT_OPTIONS: { value: SortKey; label: string }[] = [
-  { value: "added", label: "Сначала новые" },
-  { value: "name", label: "По имени" },
-  { value: "progress", label: "По прогрессу" },
-  { value: "speed", label: "По скорости" },
-  { value: "size", label: "По размеру" },
-];
+// --- Мультисортировка (1.7) ---------------------------------------------
+// До трёх ключей: порядок в массиве — приоритет (первый решает, второй
+// разбивает равенства и т.д.). Спецификация живёт в localStorage, поэтому
+// сохраняется между запусками; значения санитизируем при чтении.
+
+export type SortField = "added" | "name" | "size" | "progress" | "speed" | "ratio" | "state";
+export type SortDirection = "asc" | "desc";
+
+export interface SortSpec {
+  key: SortField;
+  dir: SortDirection;
+}
+
+export const MAX_SORT_KEYS = 3;
+
+const SORT_STORAGE_KEY = "torrenta.sort";
+
+const SORT_FIELDS: SortField[] = ["added", "name", "size", "progress", "speed", "ratio", "state"];
+
+export const SORT_LABELS: Record<SortField, string> = {
+  added: "Сначала новые",
+  name: "Имя",
+  size: "Размер",
+  progress: "Прогресс",
+  speed: "Скорость",
+  ratio: "Рейтинг",
+  state: "Состояние",
+};
+
+/** Направление по умолчанию: «Сначала новые» — убывание даты добавления. */
+const SORT_DEFAULT_DIR: Record<SortField, SortDirection> = {
+  added: "desc",
+  name: "asc",
+  size: "desc",
+  progress: "desc",
+  speed: "desc",
+  ratio: "desc",
+  state: "asc",
+};
+
+const DEFAULT_SORT: SortSpec[] = [{ key: "added", dir: "desc" }];
+
+/** Канонический порядок состояний для сортировки: активные сверху. */
+const STATE_ORDER: Record<TorrentState, number> = {
+  downloading: 0,
+  seeding: 1,
+  metadata: 2,
+  queued: 3,
+  checking: 4,
+  completed: 5,
+  paused: 6,
+  error: 7,
+};
+
+const COLLATOR = new Intl.Collator("ru", { sensitivity: "base", numeric: true });
+
+function copySpec(spec: SortSpec): SortSpec {
+  return { key: spec.key, dir: spec.dir };
+}
+
+/** Поиск без учёта регистра и разницы «е»/«ё» — для названия, пути и хеша. */
+function normalizeText(value: string): string {
+  return value.toLowerCase().replace(/ё/g, "е");
+}
+
+function isSortField(value: unknown): value is SortField {
+  return typeof value === "string" && (SORT_FIELDS as string[]).includes(value);
+}
+
+function normalizeSort(value: unknown): SortSpec[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<SortField>();
+  const result: SortSpec[] = [];
+  for (const item of value) {
+    if (result.length >= MAX_SORT_KEYS) {
+      break;
+    }
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const raw = item as { key?: unknown; dir?: unknown };
+    if (!isSortField(raw.key) || seen.has(raw.key)) {
+      continue;
+    }
+    seen.add(raw.key);
+    result.push({ key: raw.key, dir: raw.dir === "asc" ? "asc" : "desc" });
+  }
+  return result;
+}
+
+function readSort(): SortSpec[] {
+  try {
+    const raw = window.localStorage.getItem(SORT_STORAGE_KEY);
+    const parsed = raw ? normalizeSort(JSON.parse(raw)) : [];
+    return parsed.length > 0 ? parsed : DEFAULT_SORT.map(copySpec);
+  } catch {
+    return DEFAULT_SORT.map(copySpec);
+  }
+}
+
+function storeSort(spec: SortSpec[]): void {
+  try {
+    window.localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify(spec));
+  } catch {
+    // Приватный режим или запрет хранилища — сортировка просто не запомнится.
+  }
+}
+
+/**
+ * Короткая подпись направления для строки ключа. У «Сначала новые» стрелка
+ * сама показывает смысл — текстом его дублировать не нужно.
+ */
+function directionText(spec: SortSpec): string {
+  if (spec.key === "name") {
+    return spec.dir === "asc" ? "А→Я" : "Я→А";
+  }
+  if (spec.key === "added") {
+    return "";
+  }
+  return spec.dir === "asc" ? "возр." : "убыв.";
+}
+
+/** Подпись ключа с учётом направления — для кнопки в тулбаре. */
+function fieldText(spec: SortSpec): string {
+  if (spec.key === "added") {
+    return spec.dir === "desc" ? "Сначала новые" : "Сначала старые";
+  }
+  return SORT_LABELS[spec.key];
+}
+
+function directionLabel(spec: SortSpec): string {
+  if (spec.key === "name") {
+    return spec.dir === "asc" ? "по алфавиту" : "в обратном порядке";
+  }
+  if (spec.key === "added") {
+    return spec.dir === "desc" ? "сначала новые" : "сначала старые";
+  }
+  return spec.dir === "asc" ? "по возрастанию" : "по убыванию";
+}
+
+function compareField(a: TorrentSnapshot, b: TorrentSnapshot, field: SortField): number {
+  switch (field) {
+    case "name":
+      return COLLATOR.compare(normalizeText(a.name), normalizeText(b.name));
+    case "size":
+      return a.total_bytes - b.total_bytes;
+    case "progress":
+      return a.progress - b.progress;
+    case "speed":
+      return a.down_rate + a.up_rate - (b.down_rate + b.up_rate);
+    case "ratio": {
+      // Ещё ничего не скачано — рейтинг неизвестен, такие всегда в конце.
+      const left = a.downloaded_bytes > 0 ? a.seed_ratio : Number.NEGATIVE_INFINITY;
+      const right = b.downloaded_bytes > 0 ? b.seed_ratio : Number.NEGATIVE_INFINITY;
+      if (left === right) {
+        return 0;
+      }
+      return left < right ? -1 : 1;
+    }
+    case "state":
+      return STATE_ORDER[a.state] - STATE_ORDER[b.state];
+    default:
+      return a.added_at - b.added_at;
+  }
+}
+
+function sortTorrents(torrents: TorrentSnapshot[], spec: SortSpec[]): TorrentSnapshot[] {
+  const keys = spec.length > 0 ? spec : DEFAULT_SORT;
+  return torrents.slice().sort((a, b) => {
+    for (const key of keys) {
+      const delta = compareField(a, b, key.key);
+      if (delta !== 0) {
+        return key.dir === "desc" ? -delta : delta;
+      }
+    }
+    // Устойчивый хвост: свежие выше, затем по id — порядок не «дрожит»
+    // при обновлении payload.
+    const added = b.added_at - a.added_at;
+    return added !== 0 ? added : b.id - a.id;
+  });
+}
+
+function visibleTorrents(state: AppState, spec: SortSpec[]): TorrentSnapshot[] {
+  const payload = state.payload;
+  if (!payload) {
+    return [];
+  }
+  const query = normalizeText(state.query.trim());
+  const filtered = payload.torrents.filter((torrent) => {
+    if (!matchesFilter(torrent, state.filter)) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    return (
+      normalizeText(torrent.name).includes(query) ||
+      normalizeText(torrent.save_path).includes(query) ||
+      normalizeText(torrent.info_hash).includes(query)
+    );
+  });
+  return sortTorrents(filtered, spec);
+}
 
 type ActionKind = "pause" | "resume" | "retry";
 
@@ -73,7 +271,6 @@ export interface ListOptions {
   onContextMenu(id: number, anchor: ContextAnchor): void;
   onAdd(): void;
   onQuery(query: string): void;
-  onSort(sort: SortKey): void;
   onClearFilters(): void;
   onRetry(): void;
 }
@@ -186,7 +383,7 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     class: "search__input",
     attrs: {
       type: "search",
-      placeholder: "Поиск по названию или хешу",
+      placeholder: "Поиск по названию, пути или хешу",
       "aria-label": "Поиск торрентов",
       autocomplete: "off",
       spellcheck: "false",
@@ -205,21 +402,293 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     searchClear,
   );
 
-  // Единый выпадающий список (контракт 4.7) вместо нативного <select>.
-  const sortSelect = createSelect({
-    label: "Сортировка списка",
-    options: SORT_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
-    value: "added",
-    onChange: (value) => options.onSort(value as SortKey),
-    className: "sort__control",
-    menuWidth: 196,
+  // --- Сортировка (1.7) --------------------------------------------------
+  // Панель с ключами вместо одиночного списка: до трёх ключей, порядок в
+  // списке задаёт приоритет, у каждого ключа своё направление.
+  let sortSpec = readSort();
+  let sortOpen = false;
+  let lastState: AppState | null = null;
+
+  type SortFocus = { action: "dir" | "up" | "down" | "remove"; index: number };
+
+  const sortValue = h("span", { class: "sort__value" });
+  const sortButton = h("button", {
+    class: "sort__button",
+    attrs: {
+      type: "button",
+      "aria-haspopup": "dialog",
+      "aria-expanded": "false",
+      "aria-label": "Сортировка списка",
+      title: "Сортировка списка",
+    },
   });
-  const sort = h(
-    "div",
-    { class: "sort" },
+  sortButton.append(
     h("span", { class: "sort__label", text: "Сортировка" }),
-    sortSelect.element,
+    sortValue,
+    icon("chevronDown", 13),
   );
+
+  const sortPanelTitle = h("h2", {
+    class: "sort-panel__title",
+    attrs: { id: "sort-panel-title" },
+    text: "Сортировка списка",
+  });
+  const sortKeysList = h("ol", { class: "sort-panel__keys" });
+  /** Пункт-заглушка: без него повторный выбор «того же» значения молчал бы. */
+  const SORT_ADD_PLACEHOLDER: SelectOption = { value: "", label: "Выберите поле" };
+
+  const sortAddSelect: SelectControl = createSelect({
+    label: "Добавить ключ сортировки",
+    options: [SORT_ADD_PLACEHOLDER],
+    value: "",
+    onChange: (value) => {
+      if (isSortField(value)) {
+        addSortKey(value);
+      }
+    },
+    className: "sort-panel__select",
+    menuWidth: 188,
+  });
+  const sortAddRow = h(
+    "div",
+    { class: "sort-panel__add-row" },
+    h("span", { class: "sort-panel__add-label", text: "Добавить ключ" }),
+    sortAddSelect.element,
+  );
+  const sortHint = h("p", {
+    class: "sort-panel__hint",
+    text: "Первый ключ — главный, остальные уточняют порядок.",
+  });
+  const sortReset = h("button", {
+    class: "btn btn--xs btn--ghost sort-panel__reset",
+    attrs: { type: "button" },
+    text: "Сбросить",
+  });
+  const sortPanel = h(
+    "div",
+    {
+      class: "sort-panel",
+      attrs: {
+        role: "dialog",
+        "aria-modal": "false",
+        "aria-labelledby": "sort-panel-title",
+        hidden: "",
+      },
+    },
+    sortPanelTitle,
+    sortKeysList,
+    sortAddRow,
+    h("div", { class: "sort-panel__foot" }, sortHint, sortReset),
+  );
+  const sort = h("div", { class: "sort" }, sortButton, sortPanel);
+
+  function syncSortButton(): void {
+    const first = sortSpec[0] ?? { key: "added" as SortField, dir: "desc" as SortDirection };
+    const extra = sortSpec.length > 1 ? ` +${sortSpec.length - 1}` : "";
+    setText(sortValue, `${fieldText(first)}${extra}`);
+    const chain = sortSpec
+      .map((item) => {
+        const short = directionText(item);
+        return short ? `${fieldText(item)} ${short}` : fieldText(item);
+      })
+      .join(", ");
+    setAttr(sortButton, "aria-label", `Сортировка списка: ${chain}`);
+    setAttr(sortButton, "title", `Сортировка списка: ${chain}`);
+    setAttr(sortButton, "aria-expanded", sortOpen ? "true" : "false");
+  }
+
+  function moveSortKey(index: number, delta: number): void {
+    const target = index + delta;
+    const item = sortSpec[index];
+    if (!item || target < 0 || target >= sortSpec.length) {
+      return;
+    }
+    sortSpec.splice(index, 1);
+    sortSpec.splice(target, 0, item);
+  }
+
+  function addSortKey(field: SortField): void {
+    if (sortSpec.length >= MAX_SORT_KEYS || sortSpec.some((item) => item.key === field)) {
+      return;
+    }
+    sortSpec.push({ key: field, dir: SORT_DEFAULT_DIR[field] });
+    applySort({ action: "dir", index: sortSpec.length - 1 });
+  }
+
+  function sortKeyRow(item: SortSpec, index: number): HTMLElement {
+    const label = SORT_LABELS[item.key];
+
+    const dirButton = h("button", {
+      class: "sort-panel__dir",
+      attrs: {
+        type: "button",
+        "data-action": "dir",
+        "aria-label": `Направление сортировки: ${directionLabel(item)}`,
+        title: "Изменить направление",
+      },
+    });
+    dirButton.append(icon(item.dir === "asc" ? "arrowUp" : "arrowDown", 12));
+    const dirText = directionText(item);
+    if (dirText) {
+      dirButton.append(h("span", { text: dirText }));
+    }
+    dirButton.addEventListener("click", () => {
+      sortSpec[index] = { key: item.key, dir: item.dir === "asc" ? "desc" : "asc" };
+      applySort({ action: "dir", index });
+    });
+
+    const upButton = h("button", {
+      class: "sort-panel__move",
+      attrs: {
+        type: "button",
+        "data-action": "up",
+        "aria-label": `Выше приоритетом: ${label}`,
+        title: "Выше приоритетом",
+      },
+    });
+    upButton.append(icon("arrowUp", 12));
+    upButton.disabled = index === 0;
+    upButton.addEventListener("click", () => {
+      moveSortKey(index, -1);
+      applySort({ action: "up", index: index - 1 });
+    });
+
+    const downButton = h("button", {
+      class: "sort-panel__move",
+      attrs: {
+        type: "button",
+        "data-action": "down",
+        "aria-label": `Ниже приоритетом: ${label}`,
+        title: "Ниже приоритетом",
+      },
+    });
+    downButton.append(icon("arrowDown", 12));
+    downButton.disabled = index === sortSpec.length - 1;
+    downButton.addEventListener("click", () => {
+      moveSortKey(index, 1);
+      applySort({ action: "down", index: index + 1 });
+    });
+
+    const removeButton = h("button", {
+      class: "sort-panel__remove",
+      attrs: {
+        type: "button",
+        "data-action": "remove",
+        "aria-label": `Убрать ключ: ${label}`,
+        title: "Убрать ключ",
+      },
+    });
+    removeButton.append(icon("close", 12));
+    removeButton.disabled = sortSpec.length === 1;
+    removeButton.addEventListener("click", () => {
+      sortSpec.splice(index, 1);
+      applySort({ action: "remove", index: Math.max(0, Math.min(index, sortSpec.length - 1)) });
+    });
+
+    return h(
+      "li",
+      { class: "sort-panel__key", attrs: { "data-index": String(index) } },
+      h("span", { class: "sort-panel__rank", attrs: { "aria-hidden": "true" }, text: String(index + 1) }),
+      h("span", { class: "sort-panel__name", text: label }),
+      h("span", { class: "sort-panel__controls" }, dirButton, upButton, downButton, removeButton),
+    );
+  }
+
+  function renderSortKeys(focus?: SortFocus): void {
+    sortKeysList.replaceChildren(...sortSpec.map((item, index) => sortKeyRow(item, index)));
+    const used = new Set(sortSpec.map((item) => item.key));
+    const unused = SORT_FIELDS.filter((field) => !used.has(field));
+    const canAdd = sortSpec.length < MAX_SORT_KEYS && unused.length > 0;
+    sortAddRow.hidden = !canAdd;
+    if (canAdd) {
+      sortAddSelect.setOptions(
+        [SORT_ADD_PLACEHOLDER, ...unused.map((field) => ({ value: field, label: SORT_LABELS[field] }))],
+        "",
+      );
+    }
+    syncSortButton();
+    if (focus) {
+      const selector = `[data-index="${focus.index}"] [data-action="${focus.action}"]`;
+      const node = sortKeysList.querySelector<HTMLElement>(selector) ?? sortButton;
+      node.focus();
+    }
+  }
+
+  function applySort(focus?: SortFocus): void {
+    storeSort(sortSpec);
+    renderSortKeys(focus);
+    if (lastState) {
+      render(lastState);
+    }
+  }
+
+  function onSortOutside(event: MouseEvent): void {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      closeSortPanel(false);
+      return;
+    }
+    if (sort.contains(target) || target.closest(".select__menu")) {
+      return;
+    }
+    closeSortPanel(false);
+  }
+
+  function onSortKeydown(event: KeyboardEvent): void {
+    if (event.key !== "Escape") {
+      return;
+    }
+    const active = document.activeElement;
+    if (!(active instanceof Node) || !(sortPanel.contains(active) || active === sortButton)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    closeSortPanel();
+  }
+
+  function openSortPanel(): void {
+    if (sortOpen) {
+      return;
+    }
+    sortOpen = true;
+    sortPanel.hidden = false;
+    sortPanel.classList.add("is-open");
+    renderSortKeys();
+    document.addEventListener("mousedown", onSortOutside, true);
+    document.addEventListener("keydown", onSortKeydown, true);
+    const first = sortKeysList.querySelector<HTMLElement>("[data-action='dir']");
+    (first ?? sortReset).focus();
+  }
+
+  function closeSortPanel(restoreFocus = true): void {
+    if (!sortOpen) {
+      return;
+    }
+    sortOpen = false;
+    sortPanel.hidden = true;
+    sortPanel.classList.remove("is-open");
+    sortAddSelect.close();
+    document.removeEventListener("mousedown", onSortOutside, true);
+    document.removeEventListener("keydown", onSortKeydown, true);
+    syncSortButton();
+    if (restoreFocus) {
+      sortButton.focus();
+    }
+  }
+
+  sortButton.addEventListener("click", () => {
+    if (sortOpen) {
+      closeSortPanel();
+    } else {
+      openSortPanel();
+    }
+  });
+  sortReset.addEventListener("click", () => {
+    sortSpec = DEFAULT_SORT.map(copySpec);
+    applySort({ action: "dir", index: 0 });
+  });
+  syncSortButton();
 
   const addButton = h("button", {
     class: "btn btn--primary",
@@ -598,7 +1067,6 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
   addButton.addEventListener("click", () => options.onAdd());
 
   let lastQuery = "";
-  let lastSort: SortKey | null = null;
 
   function focusSelected(): void {
     const rows = Array.from(rowsEl.children) as HTMLElement[];
@@ -609,6 +1077,62 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     (selected ?? rows[0])?.focus();
   }
 
+  function render(state: AppState): void {
+    lastState = state;
+    const visible = visibleTorrents(state, sortSpec);
+    const selectedId = state.selectedId;
+    const selectedVisible = visible.some((torrent) => torrent.id === selectedId);
+
+    setText(title, FILTER_LABELS[state.filter]);
+    setText(
+      subtitle,
+      state.payload
+        ? `${fmtTorrents(visible.length)} · ${fmtActive(activeCount(visible))}`
+        : "Подключение к движку…",
+    );
+
+    if (lastQuery !== state.query && searchInput.value !== state.query) {
+      searchInput.value = state.query;
+    }
+    lastQuery = state.query;
+    searchClear.hidden = state.query === "";
+
+    const seen = new Set<number>();
+    let previous: HTMLElement | null = null;
+    for (const torrent of visible) {
+      seen.add(torrent.id);
+      let view = rowsById.get(torrent.id);
+      if (!view) {
+        view = createRow(torrent);
+        rowsById.set(torrent.id, view);
+      }
+      updateRow(view, torrent, selectedVisible ? selectedId : null);
+      const reference: Node | null = previous ? previous.nextSibling : rowsEl.firstChild;
+      if (reference !== view.el) {
+        rowsEl.insertBefore(view.el, reference);
+      }
+      previous = view.el;
+    }
+    for (const [id, view] of rowsById) {
+      if (!seen.has(id)) {
+        view.el.remove();
+        rowsById.delete(id);
+      }
+    }
+
+    const ids = rowIds();
+    for (let index = 0; index < ids.length; index += 1) {
+      const view = rowsById.get(ids[index]);
+      if (!view) {
+        continue;
+      }
+      const tabbable = selectedVisible ? ids[index] === selectedId : index === 0;
+      setAttr(view.el, "tabindex", tabbable ? "0" : "-1");
+    }
+
+    emptyVariant(state, visible);
+  }
+
   return {
     element: mount,
     focusSearch() {
@@ -616,63 +1140,6 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
       searchInput.select();
     },
     focusSelected,
-    update(state) {
-      const visible = visibleTorrents(state);
-      const selectedId = state.selectedId;
-      const selectedVisible = visible.some((torrent) => torrent.id === selectedId);
-
-      setText(title, FILTER_LABELS[state.filter]);
-      setText(
-        subtitle,
-        state.payload
-          ? `${fmtTorrents(visible.length)} · ${fmtActive(activeCount(visible))}`
-          : "Подключение к движку…",
-      );
-
-      if (lastQuery !== state.query && searchInput.value !== state.query) {
-        searchInput.value = state.query;
-      }
-      lastQuery = state.query;
-      searchClear.hidden = state.query === "";
-      if (lastSort !== state.sort) {
-        lastSort = state.sort;
-        sortSelect.setValue(state.sort);
-      }
-
-      const seen = new Set<number>();
-      let previous: HTMLElement | null = null;
-      for (const torrent of visible) {
-        seen.add(torrent.id);
-        let view = rowsById.get(torrent.id);
-        if (!view) {
-          view = createRow(torrent);
-          rowsById.set(torrent.id, view);
-        }
-        updateRow(view, torrent, selectedVisible ? selectedId : null);
-        const reference: Node | null = previous ? previous.nextSibling : rowsEl.firstChild;
-        if (reference !== view.el) {
-          rowsEl.insertBefore(view.el, reference);
-        }
-        previous = view.el;
-      }
-      for (const [id, view] of rowsById) {
-        if (!seen.has(id)) {
-          view.el.remove();
-          rowsById.delete(id);
-        }
-      }
-
-      const ids = rowIds();
-      for (let index = 0; index < ids.length; index += 1) {
-        const view = rowsById.get(ids[index]);
-        if (!view) {
-          continue;
-        }
-        const tabbable = selectedVisible ? ids[index] === selectedId : index === 0;
-        setAttr(view.el, "tabindex", tabbable ? "0" : "-1");
-      }
-
-      emptyVariant(state, visible);
-    },
+    update: render,
   };
 }
