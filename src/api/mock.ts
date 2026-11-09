@@ -457,6 +457,9 @@ export async function createMockApi(): Promise<EngineApi> {
     close_to_tray: false,
     max_active_downloads: 0,
     max_active_seeds: 0,
+    watch_dir: "",
+    notify_on_complete: true,
+    restore_session: true,
     theme: "dark",
   };
 
@@ -1138,6 +1141,12 @@ export async function createMockApi(): Promise<EngineApi> {
       return settings.download_dir;
     },
 
+    // Браузер не открывает системный диалог выбора папки — считаем, что пользователь отменил (1.5).
+    pickWatchDir: async () => {
+      await delay(150);
+      return null;
+    },
+
     pause: async (id) => {
       const torrent = find(id);
       await delay(120);
@@ -1289,6 +1298,10 @@ export async function createMockApi(): Promise<EngineApi> {
         100,
         Math.max(0, Math.round(Number(next.max_active_seeds) || 0)),
       );
+      // 1.5: папка наблюдения (пустая — наблюдение выключено), уведомления и сессия.
+      settings.watch_dir = String(next.watch_dir ?? "").trim();
+      settings.notify_on_complete = Boolean(next.notify_on_complete);
+      settings.restore_session = Boolean(next.restore_session);
       if (!settings.auto_shutdown) {
         autoPending = null;
       }

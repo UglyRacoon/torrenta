@@ -293,6 +293,11 @@ a:hover {
   opacity: 0.6;
 }
 
+/* 1.5: путь, который выбирается только диалогом (папка наблюдения). */
+.input[readonly] {
+  cursor: default;
+}
+
 .input--area {
   min-height: 58px;
   padding: 8px 10px;
@@ -453,6 +458,8 @@ a:hover {
 
 .field__row .input {
   flex: 1;
+  /* Поле не должно расталкивать кнопки в узком окне (1.5). */
+  min-width: 0;
 }
 
 .field__button {

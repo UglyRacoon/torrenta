@@ -71,6 +71,7 @@ export async function createTauriApi(): Promise<EngineApi> {
     },
 
     pickDownloadDir: () => invoke<string | null>("pick_download_dir"),
+    pickWatchDir: () => invoke<string | null>("pick_watch_dir"),
 
     pause: (id) => invoke<void>("pause_torrent", { id }),
     resume: (id) => invoke<void>("resume_torrent", { id }),

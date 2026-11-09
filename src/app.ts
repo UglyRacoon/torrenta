@@ -257,6 +257,12 @@ export function mountApp(): void {
         onSave: async (next) => {
           next.auto_shutdown = autoState.enabled;
           const saved = await api().saveSettings(next);
+          // set_settings возвращает актуальный DTO: сразу обновляем настройки
+          // в сторе, чтобы новые поля (1.5) не ждали следующего тика движка.
+          const payload = state().payload;
+          if (payload) {
+            store.patch({ payload: { ...payload, settings: saved } });
+          }
           const theme: Theme = saved.theme === "light" ? "light" : "dark";
           if (theme !== state().theme) {
             applyTheme(theme);
@@ -266,6 +272,7 @@ export function mountApp(): void {
           toaster.push("success", "Настройки сохранены");
         },
         onBrowseDir: () => api().pickDownloadDir(),
+        onPickWatchDir: () => api().pickWatchDir(),
       });
     } catch (reason) {
       fail(reason, "Настройки недоступны");

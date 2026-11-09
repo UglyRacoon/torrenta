@@ -82,6 +82,22 @@ pub struct SettingsDto {
     /// Когда флаг включён, крестик окна прячет окно, а приложение продолжает
     /// работать в трее; выход выполняет пункт «Выход» меню трея.
     pub close_to_tray: bool,
+    /// Показывать уведомление Windows, когда загрузка завершилась.
+    ///
+    /// Уведомление появляется, только если главное окно не на переднем плане;
+    /// при выключенном флаге никаких уведомлений не показывается.
+    pub notify_on_complete: bool,
+    /// Папка наблюдения за `.torrent`-файлами; пустая строка — наблюдение выключено.
+    ///
+    /// Если путь задан, приложение раз в несколько секунд просматривает папку и
+    /// автоматически добавляет новые `.torrent`, перенося их в подкаталог `done`
+    /// (см. [`crate::watch`]). Путь должен быть абсолютным.
+    pub watch_dir: String,
+    /// Восстанавливать список торрентов при следующем запуске.
+    ///
+    /// Когда флаг выключен, сессия не сохраняется и не читается: после
+    /// перезапуска список торрентов будет пустым.
+    pub restore_session: bool,
     /// Тема оформления: `"dark"` или `"light"`.
     pub theme: String,
 }
@@ -101,6 +117,9 @@ impl Default for SettingsDto {
             autostart: false,
             start_minimized: false,
             close_to_tray: false,
+            notify_on_complete: true,
+            watch_dir: String::new(),
+            restore_session: true,
             theme: DEFAULT_THEME.to_string(),
         }
     }
@@ -121,6 +140,7 @@ impl SettingsDto {
     /// Функция идемпотентна: `normalize(normalize(x)) == normalize(x)`.
     pub fn normalize(&mut self) {
         self.download_dir = self.download_dir.trim().to_string();
+        self.watch_dir = self.watch_dir.trim().to_string();
         self.max_peers = clamp_peers(self.max_peers);
         self.max_active_downloads = clamp_active(self.max_active_downloads);
         self.max_active_seeds = clamp_active(self.max_active_seeds);
@@ -211,7 +231,52 @@ pub fn prepare(dto: SettingsDto, fallback_dir: &Path) -> Result<SettingsDto, Str
         return Err(format!("«{}» существует, но это не каталог", dir.display()));
     }
 
+    prepare_watch_dir(&dto.watch_dir)?;
+
     Ok(dto)
+}
+
+/// Проверяет папку наблюдения и создаёт её при необходимости.
+///
+/// Пустой путь — наблюдение выключено, проверять нечего. Ошибки на русском,
+/// чтобы их можно было показать пользователю без перевода.
+pub fn prepare_watch_dir(raw: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+
+    let dir = Path::new(raw);
+    if !dir.is_absolute() {
+        return Err(format!(
+            "папка наблюдения «{raw}» должна быть абсолютным путём (например, C:\\Загрузки\\torrents)"
+        ));
+    }
+
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!(
+            "«{}» существует, но это не каталог: выберите другую папку наблюдения",
+            dir.display()
+        ));
+    }
+
+    if !dir.is_dir() {
+        fs::create_dir_all(dir).map_err(|err| {
+            format!(
+                "не удалось создать папку наблюдения «{}»: {err}",
+                dir.display()
+            )
+        })?;
+    }
+
+    if !dir.is_dir() {
+        return Err(format!(
+            "«{}» существует, но это не каталог: выберите другую папку наблюдения",
+            dir.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Преобразует настройки в конфигурацию движка.
@@ -257,6 +322,11 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         autostart: false,
         start_minimized: false,
         close_to_tray: false,
+        // Настройки уведомлений, наблюдения за папкой и восстановления сессии
+        // не входят в `EngineConfig`: их хранит только `settings.json`.
+        notify_on_complete: true,
+        watch_dir: String::new(),
+        restore_session: true,
         theme: normalize_theme(theme),
     }
 }
@@ -380,6 +450,9 @@ mod tests {
             autostart: true,
             start_minimized: true,
             close_to_tray: true,
+            notify_on_complete: false,
+            watch_dir: "C:\\Torrents\\watch".to_string(),
+            restore_session: false,
             theme: "light".to_string(),
         }
     }
@@ -398,6 +471,9 @@ mod tests {
         assert!(!dto.autostart);
         assert!(!dto.start_minimized);
         assert!(!dto.close_to_tray);
+        assert!(dto.notify_on_complete);
+        assert!(dto.restore_session);
+        assert!(dto.watch_dir.is_empty());
         assert_eq!(dto.theme, DEFAULT_THEME);
         assert!(dto.download_dir.is_empty());
         assert_eq!(dto, dto.clone().normalized());
@@ -418,10 +494,14 @@ mod tests {
             autostart: false,
             start_minimized: false,
             close_to_tray: false,
+            notify_on_complete: true,
+            watch_dir: "  C:\\Torrents\\watch  ".to_string(),
+            restore_session: true,
             theme: "  LIGHT  ".to_string(),
         };
         dto.normalize();
         assert_eq!(dto.download_dir, "C:\\Torrents");
+        assert_eq!(dto.watch_dir, "C:\\Torrents\\watch");
         assert_eq!(dto.max_peers, 1);
         assert_eq!(dto.max_active_downloads, MAX_ACTIVE_LIMIT);
         assert_eq!(dto.max_active_seeds, MAX_ACTIVE_LIMIT);
@@ -538,6 +618,12 @@ mod tests {
             autostart: false,
             start_minimized: false,
             close_to_tray: false,
+            // Уведомления, наблюдение за папкой и восстановление сессии тоже не
+            // входят в `EngineConfig` — обратное преобразование отдаёт значения
+            // по умолчанию, а настоящие берутся из `settings.json`.
+            notify_on_complete: true,
+            watch_dir: String::new(),
+            restore_session: true,
             ..dto
         };
         assert_eq!(back, expected);
@@ -661,6 +747,96 @@ mod tests {
         assert_eq!(loaded.upload_limit_kib, 100);
         assert!(loaded.seed_after_complete);
         assert_eq!(loaded.theme, "dark");
+        assert!(
+            loaded.notify_on_complete,
+            "уведомления о завершении включены по умолчанию"
+        );
+        assert!(
+            loaded.restore_session,
+            "восстановление сессии включено по умолчанию"
+        );
+        assert!(
+            loaded.watch_dir.is_empty(),
+            "старый settings.json не включает папку наблюдения"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_settings_use_snake_case_keys_and_survive_roundtrip() {
+        let dir = test_dir("new-keys");
+        let path = settings_path(&dir);
+        let dto = SettingsDto {
+            // Пустой каталог загрузки при чтении заменяется запасным, поэтому
+            // в ожидаемом значении он задан явно.
+            download_dir: "C:\\Fallback".to_string(),
+            notify_on_complete: false,
+            watch_dir: "C:\\Torrents\\watch".to_string(),
+            restore_session: false,
+            ..SettingsDto::default()
+        };
+        save(&path, &dto).expect("настройки должны сохраняться");
+
+        let text = fs::read_to_string(&path).expect("файл настроек должен читаться");
+        assert!(
+            text.contains("\"notify_on_complete\": false"),
+            "нет ключа уведомлений: {text}"
+        );
+        assert!(
+            text.contains("\"watch_dir\": \"C:\\\\Torrents\\\\watch\""),
+            "нет ключа папки наблюдения: {text}"
+        );
+        assert!(
+            text.contains("\"restore_session\": false"),
+            "нет ключа восстановления сессии: {text}"
+        );
+
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert_eq!(loaded, dto);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_watch_dir_allows_empty_and_creates_missing() {
+        // Пустая строка — наблюдение выключено.
+        prepare_watch_dir("").expect("пустой путь допустим");
+        prepare_watch_dir("   ").expect("пробелы — тоже пустой путь");
+
+        let dir = test_dir("watch-create");
+        let target = dir.join("watch").join("nested");
+        // Каталога ещё нет: `prepare` должен его создать.
+        prepare_watch_dir(&target.to_string_lossy()).expect("папка наблюдения создаётся");
+        assert!(target.is_dir());
+        // Повторный вызов на существующем каталоге не ошибка.
+        prepare_watch_dir(&target.to_string_lossy()).expect("существующая папка допустима");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_watch_dir_rejects_relative_and_files() {
+        let err = prepare_watch_dir("watch").expect_err("относительный путь отклоняется");
+        assert!(err.contains("абсолютным"), "текст ошибки: {err}");
+
+        let dir = test_dir("watch-file");
+        let file_path = dir.join("not-a-dir");
+        fs::write(&file_path, b"x").expect("файл должен создаваться");
+        let err = prepare_watch_dir(&file_path.to_string_lossy())
+            .expect_err("файл вместо папки отклоняется");
+        assert!(err.contains("не каталог"), "текст ошибки: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_rejects_relative_watch_dir_but_keeps_download_dir() {
+        let dir = test_dir("watch-prepare");
+        let download = dir.join("downloads");
+        let dto = SettingsDto {
+            download_dir: download.to_string_lossy().into_owned(),
+            watch_dir: "relative".to_string(),
+            ..SettingsDto::default()
+        };
+        let err = prepare(dto, &dir).expect_err("относительная папка наблюдения отклоняется");
+        assert!(err.contains("папка наблюдения"), "текст ошибки: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
 

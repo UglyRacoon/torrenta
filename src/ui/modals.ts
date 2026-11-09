@@ -26,6 +26,8 @@ export interface AddHandlers {
 export interface SettingsHandlers {
   onSave(settings: SettingsDto): Promise<void>;
   onBrowseDir(): Promise<string | null>;
+  /** Диалог выбора папки наблюдения (1.5); null — пользователь отменил. */
+  onPickWatchDir(): Promise<string | null>;
 }
 
 export interface ModalHost {
@@ -764,6 +766,33 @@ export function createModalHost(root: HTMLElement): ModalHost {
       dirRow,
     );
 
+    // 1.5: папка наблюдения — путь выбирается только диалогом, вручную не правится.
+    let watchDir = settings.watch_dir ?? "";
+    const watchInput = h("input", {
+      class: "input",
+      attrs: {
+        type: "text",
+        value: watchDir,
+        placeholder: "Не выбрана",
+        spellcheck: "false",
+        autocomplete: "off",
+        readonly: true,
+      },
+    });
+    const watchPick = button("Выбрать…", "btn--ghost field__button");
+    const watchClear = button("Очистить", "btn--ghost field__button");
+    const watchRow = h("div", { class: "field__row" }, watchInput, watchPick, watchClear);
+    const watchField = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Папка наблюдения" }),
+      watchRow,
+      h("p", {
+        class: "field__hint",
+        text: "Новые .torrent из этой папки добавляются автоматически.",
+      }),
+    );
+
     let downLimit = settings.download_limit_kib;
     let upLimit = settings.upload_limit_kib;
     const downSelect = createSelect({
@@ -793,6 +822,19 @@ export function createModalHost(root: HTMLElement): ModalHost {
       "Раздавать после завершения",
       "Торрент продолжит отдавать данные после загрузки.",
       settings.seed_after_complete,
+    );
+    // 1.5: уведомление о завершении — рядом с раздачей, в секции поведения.
+    const notify = checkboxRow(
+      "Уведомлять о завершении загрузки",
+      "Когда торрент скачан полностью, появляется уведомление.",
+      settings.notify_on_complete ?? true,
+    );
+    const behaviorGroup = h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field__label", text: "Поведение" }),
+      seed.row,
+      notify.row,
     );
 
     // 1.3: очередь — сколько торрентов качать и раздавать одновременно.
@@ -827,6 +869,12 @@ export function createModalHost(root: HTMLElement): ModalHost {
       "Крестик скрывает окно, загрузки продолжаются. Выход — через значок Torrenta в трее.",
       settings.close_to_tray,
     );
+    // 1.5: восстановление списка при запуске — в секции запуска.
+    const restoreSession = checkboxRow(
+      "Восстанавливать список торрентов при запуске",
+      "После перезапуска в списке снова появятся торренты из прошлой сессии.",
+      settings.restore_session ?? true,
+    );
     const trayGroup = h(
       "div",
       { class: "field" },
@@ -834,6 +882,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
       autostart.row,
       startMinimized.row,
       closeToTray.row,
+      restoreSession.row,
     );
 
     let theme: "dark" | "light" = settings.theme === "light" ? "light" : "dark";
@@ -855,6 +904,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
     const errorEl = formError();
     modal.body.append(
       dirField,
+      watchField,
       h(
         "div",
         { class: "field-row" },
@@ -867,7 +917,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Порт прослушивания", port),
         field("Пиров на торрент", maxPeers),
       ),
-      seed.row,
+      behaviorGroup,
       queueGroup,
       trayGroup,
       themeField,
@@ -922,6 +972,29 @@ export function createModalHost(root: HTMLElement): ModalHost {
         });
     });
 
+    // 1.5: папка наблюдения задаётся диалогом; «Очистить» выключает наблюдение.
+    watchPick.addEventListener("click", () => {
+      watchPick.disabled = true;
+      void handlers
+        .onPickWatchDir()
+        .then((picked) => {
+          if (picked) {
+            watchDir = picked;
+            watchInput.value = picked;
+            showError(errorEl, null);
+          }
+        })
+        .catch((reason: unknown) => showError(errorEl, messageOf(reason)))
+        .finally(() => {
+          watchPick.disabled = false;
+        });
+    });
+    watchClear.addEventListener("click", () => {
+      watchDir = "";
+      watchInput.value = "";
+      showError(errorEl, null);
+    });
+
     cancel.addEventListener("click", () => {
       if (!(modal.dialog.classList.contains("is-busy"))) {
         modal.close();
@@ -946,6 +1019,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
         autostart: autostart.input.checked,
         start_minimized: startMinimized.input.checked,
         close_to_tray: closeToTray.input.checked,
+        watch_dir: watchDir.trim(),
+        notify_on_complete: notify.input.checked,
+        restore_session: restoreSession.input.checked,
         theme,
         auto_shutdown: settings.auto_shutdown,
       };

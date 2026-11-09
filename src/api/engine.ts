@@ -37,6 +37,8 @@ export interface EngineApi {
   setTorrentLimits(id: number, downKib: number, upKib: number): Promise<void>;
   pickTorrentFiles(): Promise<TorrentSource[]>;
   pickDownloadDir(): Promise<string | null>;
+  /** Диалог выбора папки наблюдения (1.5); null — пользователь отменил. */
+  pickWatchDir(): Promise<string | null>;
   pause(id: number): Promise<void>;
   resume(id: number): Promise<void>;
   pauseAll(): Promise<void>;

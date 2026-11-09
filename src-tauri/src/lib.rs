@@ -14,25 +14,35 @@
 //! * перехватывает закрытие окна, когда включено «закрывать в трей»;
 //! * держит один экземпляр приложения и открывает `.torrent`/magnet из
 //!   проводника ([`single_instance`]);
-//! * регистрирует 24 команды из [`commands`] и [`single_instance`].
+//! * восстанавливает сессию при запуске и сохраняет её на диск ([`session`]);
+//! * следит за папкой наблюдения и добавляет из неё `.torrent`-файлы ([`watch`]);
+//! * показывает уведомление Windows о завершённой загрузке;
+//! * обновляет подсказку иконки в трее текущими скоростями ([`tray`]);
+//! * регистрирует 25 команд из [`commands`] и [`single_instance`].
 
 pub mod auto_shutdown;
 pub mod autostart;
 pub mod commands;
+pub mod session;
 pub mod settings;
 pub mod single_instance;
 pub mod state;
 pub mod tray;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tauri::utils::config::Color;
 use tauri::{AppHandle, Emitter as _, Manager as _, Theme as NativeTheme};
-use torrent_core::TorrentManager;
+use tauri_plugin_notification::NotificationExt as _;
+use torrent_core::{EngineEvent, TorrentManager};
 
 use crate::auto_shutdown::{AutoShutdownEvent, AUTO_SHUTDOWN_EVENT, COUNTDOWN_INTERVAL};
-use crate::state::{AppEngine, ENGINE_EVENT, SIGNIFICANT_MIN_INTERVAL, STATE_EVENT, TICK_INTERVAL};
+use crate::session::SessionRegistry;
+use crate::state::{
+    AppEngine, AppStateDto, ENGINE_EVENT, SIGNIFICANT_MIN_INTERVAL, STATE_EVENT, TICK_INTERVAL,
+};
 
 /// Метка главного окна из `tauri.conf.json` (нужна модулю [`tray`]).
 pub(crate) const MAIN_WINDOW: &str = "main";
@@ -45,6 +55,16 @@ const DARK_BACKGROUND: Color = Color(0x0F, 0x13, 0x19, 0xFF);
 
 /// Фон окна для светлой темы: без него при смене темы видна тёмная вспышка.
 const LIGHT_BACKGROUND: Color = Color(0xF2, 0xF5, 0xF9, 0xFF);
+
+/// Как часто проверять, изменилась ли сессия, и сохранять её на диск.
+const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Как часто обновлять подсказку трея, даже если текст не изменился
+/// (иконку могли пересоздать, и подсказка потерялась бы).
+const TOOLTIP_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Заголовок уведомлений Windows.
+const NOTIFICATION_TITLE: &str = "Torrenta";
 
 /// Запускает приложение. Вызывается из `main.rs`.
 ///
@@ -67,6 +87,9 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Уведомления Windows о завершённых загрузках. Разрешение
+        // `notification:default` выдано в `capabilities/default.json`.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             setup(app).map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
             Ok(())
@@ -81,6 +104,7 @@ pub fn run() {
             commands::set_torrent_limits,
             commands::pick_torrent_files,
             commands::pick_download_dir,
+            commands::pick_watch_dir,
             commands::pause_torrent,
             commands::resume_torrent,
             commands::pause_all,
@@ -142,9 +166,13 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     let theme = loaded.theme.clone();
     let start_minimized = loaded.start_minimized;
     let autostart_enabled = loaded.autostart;
-    let engine = AppEngine::new(manager, loaded, app_dir, fallback_dir);
+    let engine = AppEngine::new(manager, loaded, app_dir.clone(), fallback_dir);
     let handle = app.handle().clone();
     let _ = app.manage(engine);
+    // Реестр сессии: помнит, откуда добавлен каждый торрент, и умеет читать
+    // и писать `session.json`. Создаётся до команд, чтобы `add_torrent` успел
+    // зарегистрировать источник.
+    let _ = app.manage(SessionRegistry::new(&app_dir));
     // Очередь «открыть источник»: плагин single-instance и стартовые аргументы
     // складывают сюда `.torrent`-путь или magnet, пока фронтенд не готов.
     let _ = app.manage(single_instance::PendingOpen::default());
@@ -185,7 +213,14 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
 
     spawn_state_ticker(handle.clone());
     spawn_engine_event_forwarder(handle.clone());
-    spawn_auto_shutdown_watcher(handle);
+    spawn_auto_shutdown_watcher(handle.clone());
+    // Сессию восстанавливаем уже после показа окна: добавление не блокирует
+    // старт, а торренты просто появляются в списке по мере готовности.
+    // Сохраняет сессию сам тикер состояния (см. `save_session`).
+    spawn_session_restore(handle.clone());
+    // Папка наблюдения живёт отдельной задачей: настройка читается на каждом
+    // шаге, поэтому её можно включать и выключать без перезапуска.
+    watch::spawn(handle);
 
     Ok(())
 }
@@ -257,6 +292,15 @@ fn spawn_state_ticker(app: AppHandle) {
         let mut last_significant: Option<u64> = None;
         let mut last_dynamic: Option<u64> = None;
         let mut last_significant_emit: Option<Instant> = None;
+        // Подсказка трея обновляется «по изменению», но не чаще раза в две
+        // секунды, и раз в две секунды — даже без изменений (иконку могли
+        // пересоздать).
+        let mut last_tooltip = String::new();
+        let mut last_tooltip_at: Option<Instant> = None;
+        // Сессия сохраняется тем же тикером, что и состояние: отдельный таймер
+        // не нужен, а запись на диск идёт только при изменении состава списка.
+        let mut last_session_hash: Option<u64> = None;
+        let mut last_session_save: Option<Instant> = None;
 
         loop {
             tokio::time::sleep(TICK_INTERVAL).await;
@@ -267,6 +311,9 @@ fn spawn_state_ticker(app: AppHandle) {
                 Some(engine) => engine.state(),
                 None => continue,
             };
+
+            update_tray_tooltip(&app, &payload, &mut last_tooltip, &mut last_tooltip_at);
+            save_session(&app, &mut last_session_hash, &mut last_session_save);
 
             let fingerprint = payload.fingerprints();
             let dynamic_changed = last_dynamic != Some(fingerprint.dynamic);
@@ -295,6 +342,148 @@ fn spawn_state_ticker(app: AppHandle) {
     });
 }
 
+/// Обновляет подсказку трея по текущим суммарным показателям.
+///
+/// Отдельная функция, чтобы тикер оставался читаемым: форматирование текста
+/// живёт в [`tray::tooltip_text`], здесь только решение «пора обновлять».
+fn update_tray_tooltip(
+    app: &AppHandle,
+    payload: &AppStateDto,
+    last_text: &mut String,
+    last_at: &mut Option<Instant>,
+) {
+    let totals = &payload.totals;
+    let text = tray::tooltip_text(
+        totals.torrents,
+        totals.active,
+        totals.down_rate,
+        totals.up_rate,
+    );
+    let due = match last_at {
+        Some(at) => at.elapsed() >= TOOLTIP_REFRESH_INTERVAL,
+        None => true,
+    };
+    if !due && *last_text == text {
+        return;
+    }
+    tray::set_tooltip(app, &text);
+    *last_text = text;
+    *last_at = Some(Instant::now());
+}
+
+/// Восстанавливает торренты из `session.json` в фоне.
+///
+/// Флаг `restore_session` читается один раз при старте: пользователь мог
+/// выключить восстановление ради «чистого» запуска. Ошибки отдельных записей
+/// не прерывают восстановление остальных — см. [`session::restore_from_session`].
+fn spawn_session_restore(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let Some(engine) = app.try_state::<AppEngine>() else {
+            eprintln!("[torrenta] сессия не восстановлена: состояние приложения не найдено");
+            return;
+        };
+        if !engine.settings().restore_session {
+            return;
+        }
+        let Some(registry) = app.try_state::<SessionRegistry>() else {
+            eprintln!("[torrenta] сессия не восстановлена: реестр сессии не найден");
+            return;
+        };
+
+        let report = session::restore_from_session(engine.inner(), registry.inner()).await;
+        if report.restored > 0 || report.skipped > 0 {
+            eprintln!(
+                "[torrenta] сессия: восстановлено {}, пропущено {}",
+                report.restored, report.skipped
+            );
+        }
+    });
+}
+
+/// Сохраняет сессию на диск, если её состав изменился.
+///
+/// Вызывается из тикера, поэтому не чаще [`SESSION_SAVE_INTERVAL`] и только при
+/// изменении сериализованной полезной нагрузки (сравнение по
+/// [`session::payload_hash`]): прогресс загрузки в файл не попадает, иначе
+/// приложение писало бы на диск каждые полсекунды. При выключенном
+/// `restore_session` не сохраняется ничего — иначе файл остался бы от прошлой
+/// настройки и «тихий» запуск не сработал бы.
+fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Option<Instant>) {
+    let due = match last_at {
+        Some(at) => at.elapsed() >= SESSION_SAVE_INTERVAL,
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    // Отметку ставим до попытки записи: иначе при ошибке (нет прав, занятый
+    // файл) журнал заполнялся бы на каждом тике.
+    *last_at = Some(Instant::now());
+
+    let Some(engine) = app.try_state::<AppEngine>() else {
+        return;
+    };
+    if !engine.settings().restore_session {
+        // Сбрасываем хеш: после включения настройки сессия сохранится сразу,
+        // даже если она не менялась.
+        *last_hash = None;
+        return;
+    }
+    let Some(registry) = app.try_state::<SessionRegistry>() else {
+        return;
+    };
+
+    let entries = registry.entries(&engine.manager.snapshot());
+    let hash = session::payload_hash(&entries);
+    if *last_hash == Some(hash) {
+        return;
+    }
+    match registry.save(&entries) {
+        Ok(()) => *last_hash = Some(hash),
+        Err(err) => eprintln!("[torrenta] не удалось сохранить сессию: {err}"),
+    }
+}
+
+/// Показывает уведомление Windows о завершённой загрузке.
+///
+/// Уведомление не нужно, когда пользователь и так смотрит на окно: проверяем,
+/// что главное окно видимо и в фокусе. Ошибки показа только логируются —
+/// уведомление не должно влиять на работу приложения.
+fn notify_completed(app: &AppHandle, name: &str) {
+    let Some(engine) = app.try_state::<AppEngine>() else {
+        return;
+    };
+    if !engine.settings().notify_on_complete {
+        return;
+    }
+    if main_window_in_foreground(app) {
+        return;
+    }
+
+    let result = app
+        .notification()
+        .builder()
+        .title(NOTIFICATION_TITLE)
+        .body(format!("«{name}» загружен"))
+        .show();
+    if let Err(err) = result {
+        eprintln!("[torrenta] не удалось показать уведомление о завершении «{name}»: {err}");
+    }
+}
+
+/// Видимо ли главное окно и в фокусе ли оно.
+///
+/// Ошибки Tauri трактуются как «не в фокусе»: уведомление показать не страшно,
+/// а пропустить его хуже.
+fn main_window_in_foreground(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return false;
+    };
+    let visible = window.is_visible().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
+    visible && focused
+}
+
 /// Транслирует события движка (`EngineEvent`) в отдельное событие `engine://event`.
 ///
 /// Полное состояние всё равно приходит в `engine://state`, поэтому здесь
@@ -318,6 +507,11 @@ fn spawn_engine_event_forwarder(app: AppHandle) {
                 Ok(event) => {
                     if let Err(err) = app.emit(ENGINE_EVENT, &event) {
                         eprintln!("[torrenta] не удалось отправить событие движка: {err}");
+                    }
+                    // Уведомление Windows показываем только на завершение:
+                    // остальные события интересны лишь интерфейсу.
+                    if let EngineEvent::Completed { name, .. } = &event {
+                        notify_completed(&app, name);
                     }
                 }
                 // Отставание подписчика не критично: актуальные данные придут

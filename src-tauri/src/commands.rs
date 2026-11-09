@@ -21,6 +21,7 @@ use tauri_plugin_opener as opener;
 use torrent_core::engine::{AddOptions, TorrentManager, TorrentPreview};
 
 use crate::auto_shutdown::{AutoShutdownDto, AutoShutdownEvent, AUTO_SHUTDOWN_EVENT};
+use crate::session::SessionRegistry;
 use crate::settings::{self, SettingsDto};
 use crate::state::{engine_error_text, AppEngine, AppStateDto};
 
@@ -198,9 +199,14 @@ pub async fn preview_torrent(
 ///
 /// `save_path` — каталог загрузки для этого торрента (`None` — из настроек),
 /// `files` — индексы выбранных файлов (`None` — все).
+///
+/// Источник запоминается в сессии (см. [`crate::session`]): при следующем
+/// запуске приложение сможет восстановить торрент. Ошибка записи в сессию не
+/// ломает добавление — торрент уже работает, поэтому она только логируется.
 #[tauri::command]
 pub async fn add_torrent(
     state: State<'_, AppEngine>,
+    session: State<'_, SessionRegistry>,
     source: String,
     save_path: Option<String>,
     files: Option<Vec<usize>>,
@@ -213,18 +219,45 @@ pub async fn add_torrent(
     match classify_source(&source)? {
         TorrentSource::File(path) => {
             let data = read_torrent_file(&path).await?;
-            state
+            let id = state
                 .manager
-                .add_file_with(data, opts)
+                .add_file_with(data.clone(), opts)
                 .await
-                .map_err(|err| engine_error_text(&err))
+                .map_err(|err| engine_error_text(&err))?;
+            let info_hash = info_hash_of(&state.manager, id);
+            if let Err(err) = session.register_file(id, &info_hash, &data) {
+                eprintln!("[torrenta] не удалось запомнить торрент в сессии (id {id}): {err}");
+            }
+            Ok(id)
         }
-        TorrentSource::Magnet(link) => state
-            .manager
-            .add_magnet_with(&link, opts)
-            .await
-            .map_err(|err| engine_error_text(&err)),
+        TorrentSource::Magnet(link) => {
+            let id = state
+                .manager
+                .add_magnet_with(&link, opts)
+                .await
+                .map_err(|err| engine_error_text(&err))?;
+            if let Err(err) = session.register_magnet(id, &link) {
+                eprintln!(
+                    "[torrenta] не удалось запомнить magnet-ссылку в сессии (id {id}): {err}"
+                );
+            }
+            Ok(id)
+        }
     }
+}
+
+/// Находит `info_hash` добавленного торрента по его идентификатору.
+///
+/// Движок возвращает только `id`, а для файла с сессией нужен `info_hash`;
+/// пустая строка означает «движок ещё не показал торрент» — сессия такой
+/// источник не примет и сообщит об этом вызывающей стороне.
+fn info_hash_of(manager: &TorrentManager, id: u64) -> String {
+    manager
+        .snapshot()
+        .into_iter()
+        .find(|torrent| torrent.id == id)
+        .map(|torrent| torrent.info_hash)
+        .unwrap_or_default()
 }
 
 /// Меняет набор скачиваемых файлов у добавленного торрента.
@@ -357,6 +390,27 @@ pub async fn pick_download_dir(app: AppHandle) -> Result<Option<String>, String>
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// Открывает диалог выбора папки наблюдения за `.torrent`-файлами.
+///
+/// Пустой ответ — пользователь отменил выбор (настройка не меняется).
+#[tauri::command]
+pub async fn pick_watch_dir(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<FilePath>>();
+    app.dialog()
+        .file()
+        .set_title("Папка наблюдения")
+        .pick_folder(move |folder| {
+            let _ = tx.send(folder);
+        });
+
+    let picked = rx
+        .await
+        .map_err(|_| "диалог выбора папки наблюдения закрылся без ответа".to_string())?;
+    Ok(picked
+        .and_then(|folder| folder.simplified().into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
 /// Ставит торрент на паузу.
 #[tauri::command]
 pub async fn pause_torrent(state: State<'_, AppEngine>, id: u64) -> Result<(), String> {
@@ -390,9 +444,13 @@ pub async fn resume_all(state: State<'_, AppEngine>) -> Result<(), String> {
 }
 
 /// Удаляет торрент; `delete_files` — удалить ли уже скачанные данные.
+///
+/// Запись сессии тоже удаляется: после перезапуска приложение не должно
+/// возвращать торрент, который пользователь убрал из списка.
 #[tauri::command]
 pub async fn remove_torrent(
     state: State<'_, AppEngine>,
+    session: State<'_, SessionRegistry>,
     id: u64,
     delete_files: bool,
 ) -> Result<(), String> {
@@ -400,7 +458,9 @@ pub async fn remove_torrent(
         .manager
         .remove(id, delete_files)
         .await
-        .map_err(|err| engine_error_text(&err))
+        .map_err(|err| engine_error_text(&err))?;
+    let _ = session.forget(id);
+    Ok(())
 }
 
 /// Возвращает текущие настройки.

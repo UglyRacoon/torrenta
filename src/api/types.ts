@@ -93,6 +93,12 @@ export interface SettingsDto {
   max_active_downloads: number;
   /** Сколько торрентов одновременно раздавать (1.3); 0 — без ограничения. */
   max_active_seeds: number;
+  /** Папка наблюдения (1.5): новые .torrent из неё добавляются автоматически. */
+  watch_dir: string;
+  /** Показывать уведомление о завершении загрузки (1.5). */
+  notify_on_complete: boolean;
+  /** Восстанавливать список торрентов при запуске (1.5). */
+  restore_session: boolean;
   theme: ThemeName;
 }
 
