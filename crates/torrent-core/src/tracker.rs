@@ -99,6 +99,13 @@ const UDP_ACTION_CONNECT: u32 = 0;
 const UDP_ACTION_ANNOUNCE: u32 = 1;
 const UDP_ACTION_ERROR: u32 = 3;
 
+/// Сколько пиров просить у трекера, если вызывающий не задал `num_want`.
+///
+/// qBittorrent и Transmission просят 200: трекеры отдают не всех, кто есть в
+/// раздаче, а только случайную выборку, поэтому маленькое `numwant` напрямую
+/// уменьшает пул пиров и скорость скачивания. Раньше здесь стояло 50.
+const DEFAULT_NUM_WANT: u32 = 200;
+
 /// Собирает URL announce с query-параметрами.
 ///
 /// `info_hash` и `peer_id` кодируются как сырые байты (percent-encoding),
@@ -136,7 +143,10 @@ pub fn build_http_url(base: &str, req: &AnnounceRequest) -> Result<String, Track
     push("downloaded", &req.downloaded.to_string());
     push("left", &req.left.to_string());
     push("compact", "1");
-    push("numwant", &req.num_want.unwrap_or(50).to_string());
+    push(
+        "numwant",
+        &req.num_want.unwrap_or(DEFAULT_NUM_WANT).to_string(),
+    );
     if let Some(event) = req.event {
         push("event", event.as_str());
     }
@@ -393,14 +403,13 @@ pub fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
 
 /// Разбирает компактный список пиров (BEP 23): 6 байт на пир (4 IP + 2 порт).
 pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<PeerAddr>, TrackerError> {
-    if data.len() % 6 != 0 {
-        return Err(TrackerError::Parse(format!(
-            "компактный список пиров длиной {} не кратен 6",
-            data.len()
-        )));
-    }
-    let mut peers = Vec::with_capacity(data.len() / 6);
-    for chunk in data.chunks_exact(6) {
+    // Раньше неполный хвост (трекеры иногда дописывают служебные байты или
+    // обрезают ответ по таймауту) считался ошибкой и ронял весь announce:
+    // терялся целиком список пиров, хотя валидные адреса в нём были. Теперь
+    // разбираем все полные записи, а неполный хвост просто игнорируем.
+    let usable = data.len() - data.len() % 6;
+    let mut peers = Vec::with_capacity(usable / 6);
+    for chunk in data[..usable].chunks_exact(6) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         let peer = PeerAddr {
@@ -417,14 +426,10 @@ pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<PeerAddr>, TrackerError> {
 
 /// Компактный список IPv6-пиров (18 байт на пир).
 fn parse_compact_peers6(data: &[u8]) -> Result<Vec<PeerAddr>, TrackerError> {
-    if data.len() % 18 != 0 {
-        return Err(TrackerError::Parse(format!(
-            "компактный список IPv6-пиров длиной {} не кратен 18",
-            data.len()
-        )));
-    }
-    let mut peers = Vec::with_capacity(data.len() / 18);
-    for chunk in data.chunks_exact(18) {
+    // См. parse_compact_peers: неполный хвост отбрасываем, а не роняем разбор.
+    let usable = data.len() - data.len() % 18;
+    let mut peers = Vec::with_capacity(usable / 18);
+    for chunk in data[..usable].chunks_exact(18) {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&chunk[..16]);
         let port = u16::from_be_bytes([chunk[16], chunk[17]]);
@@ -458,19 +463,55 @@ fn parse_peer_dict(value: &Value) -> Option<PeerAddr> {
 /// Пир, к которому вообще имеет смысл подключаться.
 ///
 /// Трекеры любят присылать записи-заглушки `0.0.0.0:0` и адреса с нулевым
-/// портом; подключаться к ним бессмысленно, поэтому отфильтровываем.
+/// портом; подключаться к ним бессмысленно, поэтому отфильтровываем. Туда же
+/// адреса, которые физически не могут быть собеседником: широковещательные,
+/// multicast и link-local автоконфигурация.
 fn is_usable_peer(peer: &PeerAddr) -> bool {
-    peer.port != 0 && !peer.ip.is_unspecified()
+    peer.port != 0 && is_dialable(&peer.ip)
 }
 
-/// Отправляет пакет и ждёт ответ; при таймауте повторяет отправку один раз.
+/// Может ли по этому адресу вообще быть пир.
+///
+/// Отсекаем только заведомо нерабочее. Приватные (`10/8`, `172.16/12`,
+/// `192.168/16`), CGNAT (`100.64/10`) и loopback-адреса **оставляем**: в
+/// локальной сети, у пиров за одним NAT и у трекера домашней раздачи это
+/// обычные рабочие адреса — именно так находят друг друга два клиента в одной
+/// квартире. Фильтр «только публичные IP» ломал такие раздачи и локальные
+/// тесты, поэтому его здесь нет.
+fn is_dialable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, ..] = ip.octets();
+            // 0.0.0.0/8 «эта сеть», 255.255.255.255, 224/4 multicast,
+            // 169.254/16 link-local.
+            !(a == 0 || ip.is_broadcast() || ip.is_multicast() || ip.is_link_local())
+        }
+        // В IPv6 отбрасываем лишь очевидно бесполезное; unique-local (fc00::/7)
+        // не трогаем — это аналог приватных сетей, за NAT64 он рабочий.
+        IpAddr::V6(ip) => {
+            let first = ip.octets()[0];
+            !(ip.is_unspecified()
+                || ip.is_multicast()
+                // fe80::/10 — link-local, как 169.254/16 в IPv4.
+                || (first == 0xfe && (ip.octets()[1] & 0xc0) == 0x80))
+        }
+    }
+}
+
+/// Отправляет пакет и ждёт ответ; при таймауте повторяет отправку.
+///
+/// UDP-пакеты теряются и на перегруженных трекерах, и в NAT; одна повторная
+/// попытка (было 2 попытки всего) слишком часто заканчивалась тем, что трекер
+/// выпадал из ротации и пиры с него не приходили вообще. Три попытки на
+/// таймауте 3–5 с всё ещё укладываются в бюджеты announce.
 async fn exchange(
     socket: &UdpSocket,
     packet: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, TrackerError> {
+    const ATTEMPTS: usize = 3;
     let mut buf = vec![0u8; 4096];
-    for attempt in 0..2 {
+    for attempt in 0..ATTEMPTS {
         socket
             .send(packet)
             .await
@@ -478,7 +519,7 @@ async fn exchange(
         match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
             Ok(Ok(len)) => return Ok(buf[..len].to_vec()),
             Ok(Err(err)) => return Err(TrackerError::Network(format!("udp recv: {err}"))),
-            Err(_) if attempt == 0 => continue,
+            Err(_) if attempt + 1 < ATTEMPTS => continue,
             Err(_) => {
                 return Err(TrackerError::Network(
                     "udp: трекер не ответил вовремя".to_string(),
@@ -643,7 +684,7 @@ mod tests {
         let map = query_map(&url);
         assert!(!map.contains_key("event"));
         assert!(!map.contains_key("key"));
-        assert_eq!(map["numwant"], "50");
+        assert_eq!(map["numwant"], "200");
         // Значения по умолчанию для счётчиков.
         assert!(url.starts_with("https://t.example/a?info_hash="));
     }
@@ -672,38 +713,92 @@ mod tests {
     #[test]
     fn parse_compact_peers_skips_zero_entries() {
         let data = [
-            127, 0, 0, 1, 0x1a, 0xe1, // 127.0.0.1:6881
+            93, 184, 216, 34, 0x1a, 0xe1, // 93.184.216.34:6881
             0, 0, 0, 0, 0, 0, // заглушка трекера
             10, 0, 0, 2, 0, 0, // порт 0 — бесполезен
-            0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x50, // 255.255.255.254:80
+            10, 0, 0, 3, 0x00,
+            0x50, // приватный адрес: рабочий собеседник в локальной сети
+            8, 8, 4, 4, 0x00, 0x50, // 8.8.4.4:80
         ];
         let peers = parse_compact_peers(&data).unwrap();
         assert_eq!(
             peers,
             vec![
                 PeerAddr {
-                    ip: "127.0.0.1".parse().unwrap(),
+                    ip: "93.184.216.34".parse().unwrap(),
                     port: 6881
                 },
                 PeerAddr {
-                    ip: "255.255.255.254".parse().unwrap(),
+                    ip: "10.0.0.3".parse().unwrap(),
+                    port: 80
+                },
+                PeerAddr {
+                    ip: "8.8.4.4".parse().unwrap(),
                     port: 80
                 },
             ]
         );
-        assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
+        assert_eq!(peers[0].to_string(), "93.184.216.34:6881");
         assert!(parse_compact_peers(&[]).unwrap().is_empty());
-        assert!(matches!(
-            parse_compact_peers(&[1, 2, 3, 4, 5]),
-            Err(TrackerError::Parse(_))
-        ));
+    }
+
+    #[test]
+    fn parse_compact_peers_keeps_full_records_before_incomplete_tail() {
+        // Трекер отдал 1.5 записи: полную берём, обрезанный хвост игнорируем —
+        // иначе из-за двух служебных байтов терялся весь список.
+        let data = [93u8, 184, 216, 34, 0x1a, 0xe1, 0xAA, 0xBB, 0xCC];
+        let peers = parse_compact_peers(&data).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].to_string(), "93.184.216.34:6881");
+        // Хвост короче одной записи — просто пусто, без ошибки.
+        assert!(parse_compact_peers(&[1, 2, 3, 4, 5]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_usable_peer_rejects_unusable_addresses() {
+        let peer = |ip: &str| PeerAddr {
+            ip: ip.parse().unwrap(),
+            port: 6881,
+        };
+        for ip in [
+            "0.0.0.0",         // 0/8 «эта сеть»
+            "169.254.1.1",     // link-local
+            "224.0.0.1",       // multicast
+            "255.255.255.255", // broadcast
+            "::",              // IPv6 unspecified
+            "fe80::1",         // IPv6 link-local
+            "ff02::1",         // IPv6 multicast
+        ] {
+            assert!(!is_usable_peer(&peer(ip)), "{ip} должен быть отброшен");
+        }
+        // Приватные, CGNAT и loopback-адреса — рабочие собеседники в локальной
+        // сети и за общим NAT; выкидывать их нельзя (на этом ломались раздачи
+        // внутри дома и интеграционные тесты).
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.31.9",
+            "192.168.1.10",
+            "100.64.0.1",
+            "93.184.216.34",
+            "8.8.8.8",
+            "::1",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(is_usable_peer(&peer(ip)), "{ip} должен остаться");
+        }
+        // Нулевой порт бесполезен независимо от адреса.
+        assert!(!is_usable_peer(&PeerAddr {
+            ip: "8.8.8.8".parse().unwrap(),
+            port: 0
+        }));
     }
 
     // ---------- parse_response ----------
 
     #[test]
     fn parse_response_compact_with_all_fields() {
-        let peers = [127u8, 0, 0, 1, 0x1a, 0xe1, 10, 0, 0, 3, 0x1f, 0x90];
+        let peers = [93u8, 184, 216, 34, 0x1a, 0xe1, 185, 220, 101, 4, 0x1f, 0x90];
         let mut body =
             b"d8:completei5e10:incompletei3e8:intervali1800e12:min intervali60e5:peers".to_vec();
         body.extend_from_slice(format!("{}:", peers.len()).as_bytes());
@@ -718,15 +813,17 @@ mod tests {
         assert_eq!(resp.leechers, Some(3));
         assert_eq!(resp.warning.as_deref(), Some("oops"));
         assert_eq!(resp.peers.len(), 2);
-        assert_eq!(resp.peers[1].to_string(), "10.0.0.3:8080");
+        assert_eq!(resp.peers[1].to_string(), "185.220.101.4:8080");
     }
 
     #[test]
     fn parse_response_dict_peers_and_missing_fields() {
         let mut body = b"d8:intervali900e5:peersl".to_vec();
-        body.extend_from_slice(b"d2:ip9:127.0.0.14:porti6881ee");
-        // Порт 0 и битый ip отбрасываются.
+        body.extend_from_slice(b"d2:ip13:93.184.216.344:porti6881ee");
+        // Порт 0 и битый ip отбрасываются, приватный адрес остаётся: в
+        // локальной сети и у пиров за одним NAT это рабочий собеседник.
         body.extend_from_slice(b"d2:ip3:1.24:porti0ee");
+        body.extend_from_slice(b"d2:ip8:10.0.0.34:porti6881ee");
         body.push(b'e');
         body.push(b'e');
 
@@ -738,10 +835,16 @@ mod tests {
         assert_eq!(resp.warning, None);
         assert_eq!(
             resp.peers,
-            vec![PeerAddr {
-                ip: "127.0.0.1".parse().unwrap(),
-                port: 6881
-            }]
+            vec![
+                PeerAddr {
+                    ip: "93.184.216.34".parse().unwrap(),
+                    port: 6881
+                },
+                PeerAddr {
+                    ip: "10.0.0.3".parse().unwrap(),
+                    port: 6881
+                },
+            ]
         );
 
         // Пустой словарь: всё по нулям, но не ошибка.
@@ -771,11 +874,12 @@ mod tests {
             parse_response(b"d5:peersi1ee"),
             Err(TrackerError::Parse(_))
         ));
-        // peers6 не кратен 18.
-        assert!(matches!(
-            parse_response(b"d6:peers65:abcdee"),
-            Err(TrackerError::Parse(_))
-        ));
+        // peers6 не кратен 18 — теперь просто пусто, а не ошибка: обрезанный
+        // хвост не повод терять весь ответ трекера.
+        assert!(parse_response(b"d6:peers65:abcdee")
+            .unwrap()
+            .peers
+            .is_empty());
         // Хвостовые пробелы/переводы строк допустимы.
         let resp = parse_response(b"d8:intervali60ee\n").unwrap();
         assert_eq!(resp.interval, 60);
@@ -784,10 +888,11 @@ mod tests {
     #[test]
     fn parse_response_handles_ipv6_compact_peers() {
         let mut body = b"d6:peers6".to_vec();
-        let mut peer6 = vec![0u8; 18];
-        peer6[15] = 1; // ::1
-        peer6[16] = 0x1a;
-        peer6[17] = 0xe1;
+        // 2001:4860:4860::8888 — публичный адрес; loopback тут не годится,
+        // потому что недостижимые адреса теперь отфильтровываются.
+        let peer6: [u8; 18] = [
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88, 0x1a, 0xe1,
+        ];
         body.extend_from_slice(format!("{}:", peer6.len()).as_bytes());
         body.extend_from_slice(&peer6);
         body.push(b'e');
@@ -796,7 +901,7 @@ mod tests {
         assert_eq!(
             resp.peers,
             vec![PeerAddr {
-                ip: "::1".parse().unwrap(),
+                ip: "2001:4860:4860::8888".parse().unwrap(),
                 port: 6881
             }]
         );
@@ -879,7 +984,7 @@ mod tests {
             reply.extend_from_slice(&1800u32.to_be_bytes()); // interval
             reply.extend_from_slice(&3u32.to_be_bytes()); // leechers
             reply.extend_from_slice(&5u32.to_be_bytes()); // seeds
-            reply.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
+            reply.extend_from_slice(&[93, 184, 216, 34, 0x1a, 0xe1]);
             // Неполный хвост (3 байта) не должен ломать разбор.
             reply.extend_from_slice(&[1, 2, 3]);
             server.send_to(&reply, peer).await.unwrap();
@@ -897,7 +1002,7 @@ mod tests {
         assert_eq!(
             resp.peers,
             vec![PeerAddr {
-                ip: "127.0.0.1".parse().unwrap(),
+                ip: "93.184.216.34".parse().unwrap(),
                 port: 6881
             }]
         );
@@ -998,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_announce_parses_response_and_sends_query() {
-        let peers = [127u8, 0, 0, 1, 0x1a, 0xe1];
+        let peers = [93u8, 184, 216, 34, 0x1a, 0xe1];
         let (base, server) = http_server("200 OK", bencode_peers_response(1800, &peers)).await;
         let resp = http_announce(
             &reqwest::Client::new(),
@@ -1012,7 +1117,7 @@ mod tests {
 
         assert_eq!(resp.interval, 1800);
         assert_eq!(resp.peers.len(), 1);
-        assert_eq!(resp.peers[0].to_string(), "127.0.0.1:6881");
+        assert_eq!(resp.peers[0].to_string(), "93.184.216.34:6881");
         let first_line = wire_request.lines().next().unwrap();
         assert!(
             first_line.starts_with("GET /announce?info_hash="),
@@ -1061,7 +1166,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, TrackerError::Unsupported(_)), "{err:?}");
 
-        let peers = [10u8, 0, 0, 7, 0x00, 0x50];
+        let peers = [185u8, 220, 101, 4, 0x00, 0x50];
         let (base, server) = http_server("200 OK", bencode_peers_response(60, &peers)).await;
         let resp = announce(
             &reqwest::Client::new(),
@@ -1073,6 +1178,6 @@ mod tests {
         .unwrap();
         server.await.unwrap();
         assert_eq!(resp.interval, 60);
-        assert_eq!(resp.peers[0].to_string(), "10.0.0.7:80");
+        assert_eq!(resp.peers[0].to_string(), "185.220.101.4:80");
     }
 }

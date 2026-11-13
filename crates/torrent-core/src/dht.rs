@@ -17,8 +17,10 @@
 //!
 //! Честные ограничения реализации:
 //!
-//! * поиск пиров выполняется одним раундом `get_peers` по ближайшим известным
-//!   узлам, без полноценного итеративного обхода;
+//! * поиск пиров — ограниченный итеративный обход: до `ANNOUNCE_ROUNDS` раундов
+//!   `get_peers`, каждый следующий идёт по узлам, которых ещё не спрашивали.
+//!   Полного обхода до схождения (как в Kademlia) нет: раундов ровно столько,
+//!   чтобы уложиться в `ANNOUNCE_TIMEOUT`;
 //! * `announce_peer` отправляется без ожидания ответа (best-effort);
 //! * в компактном поле `nodes` передаются только IPv4-узлы (формат BEP 5),
 //!   IPv6-пиры в `values` поддерживаются при разборе;
@@ -27,7 +29,7 @@
 //! Сеть может быть недоступна: при неудачном bootstrap таблица остаётся пустой,
 //! `announce` завершается ошибкой [`DhtError::Timeout`], а паники не происходит.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -78,8 +80,15 @@ const PEER_MAX_AGE: Duration = Duration::from_secs(600);
 const PEERS_PER_HASH_LIMIT: usize = 200;
 /// Сколько info-hash держим в кэше одновременно.
 const MAX_CACHED_HASHES: usize = 1024;
-/// Количество узлов, которым отправляется `get_peers` при announce.
+/// Количество узлов, которым отправляется `get_peers` за один раунд announce.
 const ANNOUNCE_TARGETS: usize = 8;
+/// Сколько раундов `get_peers` делает один `announce`.
+///
+/// Один раунд видит только [`ANNOUNCE_TARGETS`] ближайших узлов, а ответы
+/// приносят новых кандидатов — несколько раундов заметно расширяют охват сети.
+/// Раньше здесь был ровно один раунд, и на «редких» торрентах пиров находилось
+/// меньше, чем в qBittorrent.
+const ANNOUNCE_ROUNDS: usize = 3;
 /// Сколько пиров отдаём в одном ответе `get_peers`.
 const MAX_VALUES: usize = 50;
 /// Сколько bootstrap-адресов рассматриваем за один проход.
@@ -232,6 +241,12 @@ impl Dht {
 
     /// Ищет пиров по info-hash и анонсирует свой порт ближайшим узлам.
     ///
+    /// Поиск итеративный: каждый раунд — `get_peers` узлам, которых ещё не
+    /// спрашивали, начиная с ближайших к цели. Ответы приносят новых
+    /// кандидатов (они попадают в таблицу маршрутизации при обработке
+    /// ответа), поэтому следующие раунды уходят глубже к цели. Раньше здесь был
+    /// один раунд, и на торрентах с редкими пирами этого не хватало.
+    ///
     /// Найденные адреса складываются во внутренний кэш; забрать их можно
     /// через [`Dht::take_peers`]. Ошибка [`DhtError::Timeout`] означает, что
     /// ни один узел не ответил (например, таблица маршрутизации пуста).
@@ -245,69 +260,105 @@ impl Dht {
             ));
         }
         let socket = self.current_socket()?;
-        let nodes = self.known_nodes(info_hash).await;
-        if nodes.is_empty() {
+        if self.known_nodes(info_hash).await.is_empty() {
             return Err(DhtError::Timeout);
         }
 
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut pending = Vec::with_capacity(nodes.len());
+        let deadline = Instant::now() + ANNOUNCE_TIMEOUT;
+        // Кому уже отправили `get_peers`: второй раз не спрашиваем, иначе
+        // раунды будут топтаться на одних и тех же узлах.
+        let mut visited: HashSet<SocketAddr> = HashSet::new();
+        let mut tokens: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        let mut answered = 0usize;
         let mut last_error = None;
-        for node in nodes {
-            let transaction = self.register_pending(node.addr, &sender);
-            let packet = encode_query(
-                transaction,
-                &self.node_id,
-                &QueryKind::GetPeers {
-                    info_hash: *info_hash.as_bytes(),
-                },
-            );
-            match socket.send_to(&packet, node.addr).await {
-                Ok(_) => {
-                    self.queries.fetch_add(1, Ordering::Relaxed);
-                    pending.push(transaction);
-                }
-                Err(error) => {
-                    lock(&self.pending).remove(&transaction);
-                    last_error = Some(DhtError::Io(error));
+
+        for _ in 0..ANNOUNCE_ROUNDS {
+            // Бюджет времени на весь announce общий: новый раунд не начинаем,
+            // если он уже исчерпан.
+            if deadline.checked_duration_since(Instant::now()).is_none() {
+                break;
+            }
+            let candidates: Vec<SocketAddr> = lock(&self.routing)
+                .closest(info_hash.as_bytes(), ANNOUNCE_TARGETS)
+                .into_iter()
+                .map(|node| node.addr)
+                .filter(|addr| !visited.contains(addr))
+                .collect();
+            if candidates.is_empty() {
+                // Спрашивать больше некого — итеративный обход сошёлся.
+                break;
+            }
+
+            let mut pending = Vec::with_capacity(candidates.len());
+            for addr in candidates {
+                visited.insert(addr);
+                let transaction = self.register_pending(addr, &sender);
+                let packet = encode_query(
+                    transaction,
+                    &self.node_id,
+                    &QueryKind::GetPeers {
+                        info_hash: *info_hash.as_bytes(),
+                    },
+                );
+                match socket.send_to(&packet, addr).await {
+                    Ok(_) => {
+                        self.queries.fetch_add(1, Ordering::Relaxed);
+                        pending.push(transaction);
+                    }
+                    Err(error) => {
+                        lock(&self.pending).remove(&transaction);
+                        last_error = Some(DhtError::Io(error));
+                    }
                 }
             }
-        }
-        if pending.is_empty() {
-            return Err(last_error.unwrap_or(DhtError::Timeout));
+            if pending.is_empty() {
+                break;
+            }
+
+            let expected = pending.len();
+            let mut round_answers = 0usize;
+            while round_answers < expected {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match timeout(remaining, receiver.recv()).await {
+                    Ok(Some((PendingReply::Response(response), from))) => {
+                        round_answers += 1;
+                        answered += 1;
+                        if let Some(token) = response.token {
+                            if !token.is_empty() {
+                                tokens.push((from, token));
+                            }
+                        }
+                        self.store_peers(info_hash, &response.values);
+                    }
+                    Ok(Some((PendingReply::Error(_), _from))) => {
+                        round_answers += 1;
+                        answered += 1;
+                    }
+                    // Канал закрылся: узел остановили.
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            for transaction in pending {
+                lock(&self.pending).remove(&transaction);
+            }
+
+            // В этом раунде никто не ответил: таблица не расширится, идти
+            // дальше некуда.
+            if round_answers == 0 {
+                break;
+            }
+            // Пиров уже достаточно: лишние раунды только тратят время.
+            if self.cached_peers(info_hash.as_bytes()).len() >= MAX_VALUES {
+                break;
+            }
         }
 
-        let expected = pending.len();
-        let deadline = Instant::now() + ANNOUNCE_TIMEOUT;
-        let mut answered = 0usize;
-        let mut tokens = Vec::new();
-        while answered < expected {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            match timeout(remaining, receiver.recv()).await {
-                Ok(Some((PendingReply::Response(response), from))) => {
-                    answered += 1;
-                    if let Some(token) = response.token {
-                        if !token.is_empty() {
-                            tokens.push((from, token));
-                        }
-                    }
-                    self.store_peers(info_hash, &response.values);
-                }
-                Ok(Some((PendingReply::Error(_), _from))) => {
-                    answered += 1;
-                }
-                // Канал закрылся: узел остановили.
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        for transaction in pending {
-            lock(&self.pending).remove(&transaction);
-        }
         if answered == 0 {
-            return Err(DhtError::Timeout);
+            return Err(last_error.unwrap_or(DhtError::Timeout));
         }
 
         for (addr, token) in tokens {
@@ -1990,6 +2041,94 @@ mod tests {
         assert!(
             клиент.take_peers(&hash).is_empty(),
             "take_peers должен очищать кэш"
+        );
+
+        сервер.shutdown().await;
+        клиент.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn announce_опрашивает_узлы_из_ответа_и_собирает_их_пиров() {
+        // Ради чего нужны несколько раундов `get_peers`: адрес узла, которого в
+        // таблице не было на первом раунде, приходит только в ответе. Скрытый
+        // узел появляется у сервера уже после bootstrap клиента, поэтому дойти
+        // до него можно лишь следующим раундом.
+        let (сервер, порт_сервера) = поднять_узел(vec!["127.0.0.1:9".to_string()]).await;
+        let (клиент, _) = поднять_узел(vec![локальный_адрес(порт_сервера).to_string()]).await;
+        assert!(
+            дождаться(|| клиент.stats().nodes > 0, Duration::from_secs(5)).await,
+            "клиент не увидел сервер"
+        );
+
+        // Скрытый узел — сырой сокет, который умеет только отвечать на запросы.
+        let скрытый = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("сокет скрытого узла");
+        let адрес_скрытого = скрытый.local_addr().expect("локальный адрес скрытого узла");
+        let id_скрытого = [0x6Bu8; ID_LEN];
+        // Пинг — единственный способ попасть в таблицу сервера: клиент об этом
+        // адресе до announce ничего не знает.
+        let транзакция_пинга = 0x7777u16;
+        скрытый
+            .send_to(
+                &encode_query(транзакция_пинга, &id_скрытого, &QueryKind::Ping),
+                локальный_адрес(порт_сервера),
+            )
+            .await
+            .expect("пинг скрытого узла");
+        принять_сообщение(&скрытый, транзакция_пинга).await;
+        assert!(
+            !клиент.contains_node(адрес_скрытого),
+            "клиент не должен знать скрытый узел до announce"
+        );
+
+        let hash = InfoHash::new([0x6Cu8; ID_LEN]);
+        let пир_скрытого = локальный_адрес(51_415);
+        let анонс = {
+            let узел = Arc::clone(&клиент);
+            tokio::spawn(async move { узел.announce(hash, 51_414).await })
+        };
+
+        // Второй раунд обязан прийти на скрытый узел: отвечаем и отдаём пира.
+        let mut буфер = [0u8; 4096];
+        let (длина, откуда) = timeout(Duration::from_secs(5), скрытый.recv_from(&mut буфер))
+            .await
+            .expect("клиент не опросил узел из ответа")
+            .expect("ошибка приёма UDP");
+        assert!(откуда.ip().is_loopback(), "запрос пришёл не с loopback");
+        let сообщение = decode_message(&буфер[..длина]).expect("валидный KRPC");
+        let KrpcMessage::Query { transaction, query } = сообщение else {
+            panic!("ожидался get_peers, пришло: {сообщение:?}");
+        };
+        assert!(
+            matches!(query.kind, QueryKind::GetPeers { .. }),
+            "скрытому узлу пришёл не get_peers"
+        );
+        скрытый
+            .send_to(
+                &encode_response(
+                    transaction,
+                    &id_скрытого,
+                    &ResponseBody::GetPeers {
+                        token: vec![7u8; TOKEN_LEN],
+                        values: vec![пир_скрытого],
+                        nodes: Vec::new(),
+                    },
+                ),
+                откуда,
+            )
+            .await
+            .expect("ответ скрытого узла");
+
+        анонс
+            .await
+            .expect("задача announce не должна паниковать")
+            .expect("announce должен пройти");
+
+        let пиры = клиент.take_peers(&hash);
+        assert!(
+            пиры.contains(&пир_скрытого),
+            "пир узла, найденного во втором раунде, не попал в кэш: {пиры:?}"
         );
 
         сервер.shutdown().await;

@@ -167,6 +167,14 @@ interface FixtureOptions {
   piecesHave: number;
   peersConnected: number;
   peersKnown: number;
+  /**
+   * Сиды во всём рое по данным трекера (`complete`): мировой размер роя, а не
+   * число наших сокетов. Не задано — подставим правдоподобное значение ниже;
+   * 0 — анонса ещё не было, трекер размер роя не сообщил.
+   */
+  swarmSeeds?: number;
+  /** Личеры во всём рое (`incomplete`), правила те же, что у `swarmSeeds`. */
+  swarmLeechers?: number;
   down: number;
   up: number;
   eta: number | null;
@@ -202,6 +210,9 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     total_bytes: options.total,
     wanted_bytes: wanted,
     downloaded_bytes: options.downloaded,
+    // Остаток по выбранным файлам (1.8): в движке это отдельное поле, потому
+    // что `downloaded_bytes` включает и байты невыбранных файлов.
+    remaining_bytes: Math.max(0, wanted - options.downloaded),
     uploaded_bytes: options.uploaded,
     progress: wanted > 0 ? clamp(options.downloaded / wanted, 0, 1) : 0,
     piece_count: options.pieces,
@@ -209,6 +220,10 @@ function fixture(options: FixtureOptions, now: number): TorrentSnapshot {
     pieces_have: options.piecesHave,
     peers_connected: options.peersConnected,
     peers_known: options.peersKnown,
+    // Рой всегда шире того, что мы видим сокетами: в нём есть пиры, к которым
+    // мы ещё не подключились. Без явных чисел берём правдоподобную оценку.
+    swarm_seeds: options.swarmSeeds ?? Math.max(options.peersKnown, 96),
+    swarm_leechers: options.swarmLeechers ?? Math.max(options.peersKnown * 4, 540),
     down_rate: options.down,
     up_rate: options.up,
     down_limit_kib: 0,
@@ -240,6 +255,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 1_251,
         peersConnected: 27,
         peersKnown: 84,
+        // Свежий популярный релиз: в рое тысячи пиров, а сокетов у нас 27.
+        swarmSeeds: 412,
+        swarmLeechers: 1_286,
         down: 11_300_000,
         up: 1_150_000,
         eta: 308,
@@ -282,6 +300,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 0,
         peersConnected: 4,
         peersKnown: 12,
+        // Метаданные ещё не получены и анонса не было — размер роя неизвестен (0).
+        swarmSeeds: 0,
+        swarmLeechers: 0,
         down: 0,
         up: 0,
         eta: null,
@@ -313,6 +334,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 4_720,
         peersConnected: 14,
         peersKnown: 41,
+        // Раздаём старый популярный образ: сидов много, личеров ещё больше.
+        swarmSeeds: 246,
+        swarmLeechers: 1_912,
         down: 0,
         up: 3_240_000,
         eta: null,
@@ -356,6 +380,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 1_184,
         peersConnected: 0,
         peersKnown: 9,
+        // Трекеров нет (только DHT) — анонса не было, размер роя неизвестен.
+        swarmSeeds: 0,
+        swarmLeechers: 0,
         down: 0,
         up: 0,
         eta: null,
@@ -386,6 +413,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 947,
         peersConnected: 0,
         peersKnown: 37,
+        // Пауза не выводит нас из роя: трекер продолжает отдавать размер.
+        swarmSeeds: 158,
+        swarmLeechers: 604,
         down: 0,
         up: 0,
         eta: null,
@@ -419,6 +449,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 233,
         peersConnected: 0,
         peersKnown: 14,
+        // Трекер не ответил (ошибка выше) — размер роя взять неоткуда.
+        swarmSeeds: 0,
+        swarmLeechers: 0,
         down: 0,
         up: 0,
         eta: null,
@@ -451,6 +484,9 @@ function buildFixtures(now: number): TorrentSnapshot[] {
         piecesHave: 515,
         peersConnected: 0,
         peersKnown: 12,
+        // Лимит раздачи достигнут — торрент в рое на паузе, но размер роя известен.
+        swarmSeeds: 73,
+        swarmLeechers: 219,
         down: 0,
         up: 0,
         eta: null,
@@ -535,6 +571,17 @@ function previewOf(source: TorrentSource): TorrentPreview {
 export async function createMockApi(): Promise<EngineApi> {
   const now = Date.now();
   const torrents = buildFixtures(now);
+  /**
+   * Опорный размер роя (1.12): тикер колеблет числа вокруг него, иначе счётчики
+   * уползли бы от накопления поправок, а трекер отдаёт именно размер, а не сумму.
+   * Торрентов без опоры нет в карте — у них анонса ещё не было (размер неизвестен).
+   */
+  const swarmBase = new Map<number, { seeds: number; leechers: number }>();
+  for (const torrent of torrents) {
+    if (torrent.swarm_seeds > 0 || torrent.swarm_leechers > 0) {
+      swarmBase.set(torrent.id, { seeds: torrent.swarm_seeds, leechers: torrent.swarm_leechers });
+    }
+  }
   const runtimes = new Map<number, Runtime>([
     [1, { downTarget: 11_300_000, upTarget: 1_150_000, phase: 0.4, metaUntil: 0 }],
     [2, { downTarget: 4_600_000, upTarget: 380_000, phase: 1.7, metaUntil: now + 20_000 }],
@@ -543,7 +590,7 @@ export async function createMockApi(): Promise<EngineApi> {
 
   const settings: SettingsDto = {
     download_dir: DOWNLOADS,
-    max_peers: 50,
+    max_peers: 200,
     download_limit_kib: 0,
     upload_limit_kib: 0,
     listen_port: 51413,
@@ -621,6 +668,12 @@ export async function createMockApi(): Promise<EngineApi> {
   }
 
   function snapshot(): AppPayload {
+    // Остаток по выбранным файлам (1.8): в Tauri-сборке его считает движок,
+    // и mock обязан отдавать то же поле, иначе интерфейс в демо-режиме считал
+    // бы остаток по-своему и расходился с настоящим клиентом.
+    for (const torrent of torrents) {
+      torrent.remaining_bytes = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
+    }
     return {
       torrents: torrents.slice(),
       totals: deriveTotals(),
@@ -895,6 +948,10 @@ export async function createMockApi(): Promise<EngineApi> {
     torrent.progress = 0;
     torrent.peers_connected = 11;
     torrent.peers_known = 26;
+    // Метаданные получены — пошёл первый анонс, трекер вернул размер роя.
+    torrent.swarm_seeds = 168;
+    torrent.swarm_leechers = 512;
+    swarmBase.set(torrent.id, { seeds: torrent.swarm_seeds, leechers: torrent.swarm_leechers });
     torrent.down_rate = runtime.downTarget;
     torrent.up_rate = runtime.upTarget;
     torrent.eta_seconds = Math.ceil(2_400_000_000 / runtime.downTarget);
@@ -1064,6 +1121,22 @@ export async function createMockApi(): Promise<EngineApi> {
     // отданного/скачанного снимок отдаёт актуальное значение.
     for (const torrent of torrents) {
       torrent.seed_ratio = ratioOf(torrent.uploaded_bytes, torrent.downloaded_bytes);
+      // Рой «дышит»: трекер присылает свежие числа на каждом анонсе. Колеблем их
+      // вокруг опоры — так видно, что в интерфейсе мировой размер роя, а не наши сокеты.
+      let base = swarmBase.get(torrent.id);
+      if (!base) {
+        // Опоры нет, но размер роя уже известен (торрент пришёл из восстановленного
+        // состояния): принимаем текущие числа за опору, иначе счётчики замрут навсегда.
+        if (torrent.swarm_seeds > 0 || torrent.swarm_leechers > 0) {
+          base = { seeds: torrent.swarm_seeds, leechers: torrent.swarm_leechers };
+          swarmBase.set(torrent.id, base);
+        }
+      }
+      if (base) {
+        const breath = 0.94 + 0.12 * (0.5 + 0.5 * Math.sin(stamp / 21_000));
+        torrent.swarm_seeds = Math.max(0, Math.round(base.seeds * breath));
+        torrent.swarm_leechers = Math.max(0, Math.round(base.leechers * (2 - breath)));
+      }
     }
     emit();
   }
@@ -1109,6 +1182,8 @@ export async function createMockApi(): Promise<EngineApi> {
       total_bytes: total,
       wanted_bytes: 0,
       downloaded_bytes: 0,
+      // Метаданных ещё нет — считать остаток не из чего.
+      remaining_bytes: 0,
       uploaded_bytes: 0,
       progress: 0,
       piece_count: pieces,
@@ -1116,6 +1191,9 @@ export async function createMockApi(): Promise<EngineApi> {
       pieces_have: 0,
       peers_connected: state === "metadata" ? 5 : 0,
       peers_known: state === "metadata" ? 14 : 18,
+      // Только что добавленный торрент ещё не анонсировался — размер роя неизвестен.
+      swarm_seeds: 0,
+      swarm_leechers: 0,
       down_rate: 0,
       up_rate: 0,
       down_limit_kib: 0,
@@ -1551,7 +1629,7 @@ export async function createMockApi(): Promise<EngineApi> {
       await delay(180);
       const port = Math.round(next.listen_port);
       settings.download_dir = next.download_dir.trim() || DOWNLOADS;
-      settings.max_peers = clamp(Math.round(next.max_peers), 1, 500) || 50;
+      settings.max_peers = clamp(Math.round(next.max_peers), 1, 500) || 200;
       settings.download_limit_kib = Math.max(0, Math.round(next.download_limit_kib));
       settings.upload_limit_kib = Math.max(0, Math.round(next.upload_limit_kib));
       settings.listen_port = port >= 0 && port <= 65535 ? port : 51413;

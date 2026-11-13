@@ -20,7 +20,19 @@ use torrent_core::EngineConfig;
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
 /// Число пиров на торрент по умолчанию (совпадает с `EngineConfig::default()`).
-pub const DEFAULT_MAX_PEERS: u32 = 50;
+///
+/// Раньше здесь было 50, и это упирало скорость в потолок: при одном куске на
+/// пира десяток медленных соединений не разгонял торрент, даже когда трекер
+/// отдавал сотни адресов. 200 — как у libtorrent по умолчанию на торрент.
+pub const DEFAULT_MAX_PEERS: u32 = 200;
+/// Прежнее значение по умолчанию — для миграции уже установленных клиентов.
+///
+/// До 1.8.0 умолчанием было 50, и ровно это число попадало в `settings.json`
+/// при первом сохранении. Если оставить его как есть, обновление ничего не
+/// изменит: файл настроек перекрывает новое умолчание, и пользователь так и
+/// сидит на 50 соединениях. Поэтому в [`migrate_legacy_defaults`] ровно 50
+/// (и только оно) считается «старым умолчанием».
+pub const LEGACY_DEFAULT_MAX_PEERS: u32 = 50;
 /// Верхняя граница числа пиров на торрент.
 pub const MAX_PEERS_LIMIT: u32 = 500;
 /// Верхняя граница одновременно активных загрузок и раздач.
@@ -679,7 +691,29 @@ pub fn load(path: &Path, fallback_dir: &Path) -> SettingsDto {
         }
     };
 
-    normalize_with_fallback(stored.unwrap_or_default(), fallback_dir)
+    let from_disk = stored.is_some();
+    let mut dto = stored.unwrap_or_default();
+    if from_disk {
+        // Миграция нужна только для файла, который уже лежит на диске: свежие
+        // настройки и так получают актуальные значения по умолчанию.
+        migrate_legacy_defaults(&mut dto);
+    }
+    normalize_with_fallback(dto, fallback_dir)
+}
+
+/// Поднимает устаревшие значения по умолчанию до актуальных.
+///
+/// Пока трогаем одно поле: число пиров на торрент. В 1.7.0 и раньше умолчание
+/// было 50, и это же число сохранялось в `settings.json` при любом изменении
+/// других настроек. После 1.8.0 умолчание — 200; без миграции обновлённый
+/// клиент продолжал бы держать 50 соединений и не давал обещанного прироста.
+///
+/// Мигрируем только точное совпадение со старым умолчанием: если пользователь
+/// выбрал 30 или 100, это его осознанный выбор и мы его не переписываем.
+pub fn migrate_legacy_defaults(dto: &mut SettingsDto) {
+    if dto.max_peers == LEGACY_DEFAULT_MAX_PEERS {
+        dto.max_peers = DEFAULT_MAX_PEERS;
+    }
 }
 
 /// Атомарно сохраняет настройки в JSON.
@@ -1820,6 +1854,35 @@ mod tests {
             !loaded.auto_shutdown,
             "старый settings.json не включает автовыключение"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_migrates_legacy_peer_default() {
+        // Так выглядит settings.json клиента 1.7.0: 50 — это старое умолчание,
+        // а не осознанный выбор, поэтому после обновления поднимаем до 200.
+        let dir = test_dir("legacy-peers");
+        let path = settings_path(&dir);
+        fs::write(&path, br#"{"download_dir":"C:\\Other","max_peers":50}"#)
+            .expect("старый JSON должен создаваться");
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert_eq!(loaded.max_peers, DEFAULT_MAX_PEERS);
+        assert_eq!(
+            loaded.download_dir, "C:\\Other",
+            "остальные поля не тронуты"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keeps_explicit_peer_limit() {
+        // Не 50 — значит пользователь выбрал сам, миграция не должна вмешиваться.
+        let dir = test_dir("explicit-peers");
+        let path = settings_path(&dir);
+        fs::write(&path, br#"{"download_dir":"C:\\Other","max_peers":128}"#)
+            .expect("JSON с явным лимитом должен создаваться");
+        let loaded = load(&path, Path::new("C:\\Fallback"));
+        assert_eq!(loaded.max_peers, 128);
         let _ = fs::remove_dir_all(&dir);
     }
 

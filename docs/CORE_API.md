@@ -6,14 +6,17 @@ Tauri-бэкенд. Менять сигнатуры можно только си
 Крейт: `crates/torrent-core`, имя пакета `torrent-core`, подключение:
 `use torrent_core::{...};`
 
-Версия контракта: **1.7**. Подсистемы: bencode и метаинформация
+Версия контракта: **1.8**. Подсистемы: bencode и метаинформация
 (`announce` + `announce-list`), magnet-ссылки с `ut_metadata` (BEP 9),
 wire-протокол, HTTP- и UDP-трекеры, DHT (BEP 5), расширения (BEP 10), PEX
 (BEP 11), веб-сиды (BEP 19), SOCKS5 (RFC 1928/1929) и HTTP CONNECT, проброс
 портов (UPnP-IGD, NAT-PMP — RFC 6886). В 1.7 добавлены последовательная
 загрузка (`picker::PickOrder`), расписание ограничений, ручное управление
-трекерами и `TorrentManager::diagnostics()`; подробности — в одноимённом разделе
-в конце.
+трекерами и `TorrentManager::diagnostics()`. В 1.8 изменена подсистема обмена с
+пирами и метрики: адаптивное окно запросов, отдача по tit-for-tat, устойчивый
+разбор ответов трекера, сглаженные скорость и ETA, остаток по выбранным файлам и
+размер роя из ответа трекера; подробности — в разделе «Скорость, остаток и рой
+(1.8)» в конце документа.
 
 ## Карта модулей
 
@@ -182,14 +185,24 @@ pub enum TrackerError {
 
 Критично: `info_hash` и `peer_id` в HTTP URL кодируются как **сырые байты**
 (все не-alnum → `%XX`), а не как UTF-8 строка. UDP: connect (action 0) →
-announce (action 1), transaction id случайный, таймаут и один повтор.
+announce (action 1), transaction id случайный, таймаут и до трёх попыток
+(`DEFAULT_NUM_WANT`, см. ниже).
 
 Поведение, зафиксированное тестами:
 - `key` в HTTP — 8 hex-цифр (`format!("{:08x}")`), в UDP — сырой `u32`;
-- `numwant` по умолчанию 50 (для UDP — `-1`, «сколько есть»);
-- compact-пиры с `port == 0` или `0.0.0.0`/`::` отбрасываются как бесполезные;
+- `numwant` по умолчанию `DEFAULT_NUM_WANT = 200` (для UDP — `-1`, «сколько
+  есть»). До 1.8 было 50: трекер отдаёт не всех пиров роя, а случайную выборку
+  размером `numwant`, поэтому маленькое значение напрямую уменьшало пул пиров;
+- в UDP-запросе до трёх попыток: одна потеря пакета на перегруженном трекере
+  больше не выводит трекер из ротации;
+- compact-пиры с `port == 0` и заведомо нерабочими адресами (`0.0.0.0/8`,
+  широковещательный, multicast, link-local) отбрасываются; приватные, CGNAT и
+  loopback-адреса **остаются** — в локальной сети и за общим NAT это рабочие
+  собеседники;
 - `peers6` (18 байт на пир) разбирается, хотя в старом BEP не упоминался;
-- хвост UDP-ответа, не кратный 6, молча обрезается;
+- неполный хвост списка (UDP-ответ или компактный HTTP-ответ) больше не роняет
+  announce: разбираются все полные записи, остаток игнорируется. До 1.8 такая
+  мелочь теряла весь список пиров;
 - `failure reason` важнее кривого тела; хвостовые `\n`/пробелы у HTTP-ответа терпим.
 
 ## `dht`
@@ -227,8 +240,11 @@ impl Dht {
 
 Ограничения (сознательные, чтобы модуль не выглядел полным BEP 5):
 
-* один раунд `get_peers` по ближайшим известным узлам — без итеративного обхода
-  `nodes`;
+* `announce` делает до `ANNOUNCE_ROUNDS = 3` раундов `get_peers`: каждый
+  следующий идёт по узлам, которых ещё не спрашивали, и останавливается, если
+  раунд не принёс ответов или пиров уже достаточно. Полного обхода до схождения
+  (как в Kademlia) по-прежнему нет — раундов ровно столько, чтобы уложиться в
+  `ANNOUNCE_TIMEOUT`;
 * `announce_peer` уходит fire-and-forget, без ожидания полного раунда;
 * токены подписываются статическим секретом;
 * таблица IPv4-only: компактные `nodes` — только IPv4, IPv6-пиры из `values`
@@ -239,7 +255,7 @@ impl Dht {
 ## `pex`
 
 ```rust
-pub const EXT_PEX: u8 = 1;    // локальный id ut_pex; лимит — 50 адресов на поле
+pub const EXT_PEX: u8 = 1;    // локальный id ut_pex; лимит — 200 адресов на поле
 pub struct PexMessage { pub added: Vec<SocketAddr>, pub dropped: Vec<SocketAddr> }
 impl PexMessage {
     pub fn encode(&self) -> Vec<u8>;
@@ -248,20 +264,24 @@ impl PexMessage {
 }
 pub enum PexError {
     Bencode(String), NotDict, Malformed(&'static str), Truncated(&'static str),
-    TooMany { field: &'static str, count: usize, limit: usize },
 }
 ```
 
 Адреса — compact по 6 байт (IPv4). `encode` не пишет пустые поля (пустое
 сообщение — `de`), IPv6 молча отбрасывает, `added.f` заполняет нулями. `decode`
 читает `added`/`dropped`, поля `added6`/`dropped6` игнорирует (IPv6-пиры из PEX
-не попадают); больше 50 адресов в поле — `TooMany`.
+не попадают).
 
-`diff(known, fresh, dropped)` — что отправить соседу: дедупликация, не больше 50
-адресов на поле, отбрасываются порт 0, `0.0.0.0`, широковещательные и
-multicast-адреса, IPv6; адрес, попавший и в `fresh`, и в `dropped`, считается
-живым (уходит только в `added`). Loopback и приватные адреса сохраняются: в
-локальной сети они рабочие.
+`MAX_ADDRESSES = 200`: BEP 11 рекомендует 50, но libtorrent и qBittorrent кладут
+в поле до 200, поэтому длинный список **обрезается** до предела, а не считается
+ошибкой. До 1.8 (`limit = 50`, вариант ошибки `TooMany`) валидное сообщение с
+двумя сотнями живых пиров отбрасывалось целиком.
+
+`diff(known, fresh, dropped)` — что отправить соседу: дедупликация, не больше
+`MAX_ADDRESSES` адресов на поле, отбрасываются порт 0, `0.0.0.0`,
+широковещательные и multicast-адреса, IPv6; адрес, попавший и в `fresh`, и в
+`dropped`, считается живым (уходит только в `added`). Loopback и приватные
+адреса сохраняются: в локальной сети они рабочие.
 
 ## `web_seed`
 
@@ -364,7 +384,7 @@ pub async fn unmap_port(mapping: &PortMapping);
 ```rust
 pub struct EngineConfig {
     pub download_dir: PathBuf,
-    pub max_peers_per_torrent: usize,   // по умолчанию 50
+    pub max_peers_per_torrent: usize,   // по умолчанию 200 (1.8; было 50), верхняя граница 500
     pub download_limit_kib: u32,        // 0 = без лимита
     pub upload_limit_kib: u32,          // 0 = без лимита
     pub listen_port: u16,               // 0 = свободный порт
@@ -408,7 +428,8 @@ pub enum FilePriority { Skip, Low, #[default] Normal, High }
     pub error: Option<String>,
     pub total_bytes: u64,           // полный размер торрента
     pub wanted_bytes: u64,          // объём выбранных файлов
-    pub downloaded_bytes: u64,      // за сессию (полезные данные)
+    pub downloaded_bytes: u64,      // за сессию (полезные данные, включая невыбранные файлы)
+    pub remaining_bytes: u64,       // 1.8: остаток по выбранным файлам (0 = готово)
     pub uploaded_bytes: u64,
     pub progress: f64,              // 0.0..=1.0 по выбранным файлам
     pub piece_count: u32,
@@ -416,9 +437,11 @@ pub enum FilePriority { Skip, Low, #[default] Normal, High }
     pub pieces_have: u32,           // по всему торренту
     pub peers_connected: u32,
     pub peers_known: u32,
-    pub down_rate: f64,             // байт/с
-    pub up_rate: f64,
-    pub eta_seconds: Option<u64>,
+    pub swarm_seeds: u32,           // 1.8: сиды во всём рое по данным трекера (0 = трекер не ответил)
+    pub swarm_leechers: u32,        // 1.8: личеры во всём рое по данным трекера
+    pub down_rate: f64,             // байт/с, среднее за ~8 с по проводным байтам (1.8)
+    pub up_rate: f64,               // байт/с, то же окно
+    pub eta_seconds: Option<u64>,   // 1.8: по окну ~30 с, обновляется раз в секунду; None без оценки
     pub seed_ratio: f64,            // 1.6: отдано/скачано; 0.0, пока скачано 0
     pub seed_limit_reached: bool,   // 1.6: лимит раздачи сработал, ждём ручного resume
     pub sequential: bool,           // 1.7: этот торрент качается по порядку кусков
@@ -708,7 +731,7 @@ PEX — метаданные ищутся только у пиров с трек
 **PEX.** `our_extended_handshake` объявляет `ut_metadata: 1` и `ut_pex: 2`;
 входящий extended-`0` запоминает `ut_pex` пира, после чего каждое сообщение
 `ut_pex` разбирается в `PexMessage`, а его адреса становятся кандидатами.
-Исходящий дифф строится раз в 60 с (`PEX_INTERVAL`), не больше 50 адресов
+Исходящий дифф строится раз в 60 с (`PEX_INTERVAL`), не больше `MAX_ADDRESSES` = 200 адресов (с 1.8; было 50)
 (`PEX_MAX_ADDRESSES`), и отправляется только тем, кто объявил `ut_pex`. Номер в
 сообщении берётся из handshake пира, а `pex::EXT_PEX = 1` — внутреннее соглашение
 модуля, на провод оно не влияет.
@@ -981,3 +1004,143 @@ Tauri-ошибки нужно дополнить веткой, а текст п�
 `sequential_order_skips_missing_and_excluded`, `sequential_order_ignores_piece_levels`
 (порядок, выбор файлов и игнор уровней). Гейты: `cargo clippy --workspace
 --all-targets -- -D warnings` и `cargo fmt --all -- --check` — чисто.
+
+## Скорость, остаток и рой (1.8)
+
+Релиз меняет то, как считаются метрики и как устроен обмен с пирами. Контракт
+остался аддитивным: новые поля снимка, новые константы движка, но ни одно
+существующее поле не переименовано и не удалено.
+
+### Метрики скорости и ETA
+
+`Stats` (внутри `TorrentHandle`, crate-private) получил счётчик проводных байт и
+окна отсчётов:
+
+```rust
+pub(crate) wire_down: AtomicU64;      // байты, пришедшие из сети (пиры + веб-сиды)
+struct RateWindow { /* VecDeque<(f64, u64)>, сумма байт, сумма секунд */ }
+struct EtaState { value: Option<u64>, updated: Option<Instant> }
+
+const RATE_WINDOW: usize = 16;        // 16 × 500 мс = 8 с — то, что видно в UI
+const ETA_WINDOW: usize = 60;         // 30 с — только для прогноза
+const ETA_REFRESH: Duration = Duration::from_secs(1);
+const ETA_MIN_RATE: f64 = 2.0 * 1024.0;
+const STALE_SAMPLE: f64 = 5.0;        // разрыв между тиками больше — «процесс стоял»
+```
+
+* `down_rate` / `up_rate` — среднее по окну `сумма байт / сумма времени`, а не
+  EMA по двум отсчётам. Считаются по `wire_down`, поэтому на крупных кусках
+  больше нет провалов в ноль между проверками.
+* `eta_seconds`: скорость берётся из 30-секундного окна (или из короткого, пока
+  оно не наполнилось наполовину), оценка смешивается `0.7 * prev + 0.3 * raw`,
+  пересчёт не чаще раза в секунду. `None` — если остаток `0` или скорость ниже
+  `ETA_MIN_RATE`; в этот момент кэш сбрасывается, чтобы после возобновления
+  загрузки не показать забытую цифру.
+* Разрыв между тиками больше `STALE_SAMPLE` считается паузой процесса: отсчёт
+  отбрасывается, окно начинается заново (иначе сон машины просаживал среднюю на
+  8 секунд вперёд).
+
+### Остаток и рой в снимке
+
+* `remaining_bytes` — `wanted_bytes - wanted_have`, где `wanted_have` считается
+  только по выбранным файлам. `downloaded_bytes` для этого не годится: в нём
+  есть и байты файлов с приоритетом `Skip`.
+* `swarm_seeds` / `swarm_leechers` заполняются из `AnnounceResponse.seeds` /
+  `.leechers` на каждом ответе трекера. `0` = трекер ещё не ответил (или
+  сообщил `null`): это не «рой пуст». Собственные `peers_connected` /
+  `peers_known` ограничены лимитом подключений и о размере роя ничего не говорят.
+
+### Обмен с пирами
+
+Конвейер запросов на соединение (`engine/peer.rs`, `engine/torrent.rs`):
+
+```rust
+pub(crate) const REQUEST_WINDOW: usize = 32;      // стартовое окно, блоков
+pub(crate) const REQUEST_WINDOW_MIN: usize = 8;
+pub(crate) const REQUEST_WINDOW_MAX: usize = 512;
+const BLOCK_TIMEOUT: Duration = Duration::from_secs(8);
+const UNCHOKE_SLOTS: usize = 8;
+```
+
+* окно хранится в `PeerRecord.window` и адаптируется: `+1` на каждый принятый
+  блок, `÷2` при истечении `BLOCK_TIMEOUT` (с нижней границей `MIN`);
+* `Runtime::peer_window` заодно снимает просроченные запросы из
+  `PeerRecord.inflight` и `PieceBuffer.inflight` (оба стали
+  `HashMap<u32, Instant>`), иначе «призрак» потерянного блока занимал бы место
+  в окне вечно;
+* `pump_requests` вызывается после каждого блока и после `Unchoke`, а не только
+  по тику 250 мс;
+* `Runtime::on_cancel` освобождает блок по `Cancel` от пира;
+* `release_piece` при `Choke`/разрыве не выбрасывает частично скачанный кусок:
+  `buffer.owner = 0`, и его подхватит следующий пир (`next_requests` умеет
+  «усыновлять» такой кусок);
+* отдача — tit-for-tat: `PeerRecord` начинает с `am_choking = true`,
+  `should_unchoke`/`should_choke`/`set_am_choking` разчокивают
+  `UNCHOKE_SLOTS` лучших по текущей скорости отдачи нам заинтересованных
+  пиров (`peer_interested` теперь отдельный флаг).
+
+Кондуктор подключений: `CONNECT_BURST = 32` (было 8), `PENDING_LIMIT = 1024`
+(было 256, выбрасывается хвост, а не голова); если слотов нет, адрес
+возвращается в начало очереди, а не помечается известным навсегда.
+
+Планировщик: `PiecePicker::max_in_progress = (pieces / 8).clamp(8, 64)` — было
+`(pieces / 40).clamp(4, 64)`, из-за чего на торренте 700 МБ одновременно
+работало 4–8 пиров.
+
+### Трекеры, PEX, DHT
+
+* `DEFAULT_NUM_WANT = 200` (`tracker.rs`), `ANNOUNCE_NUM_WANT = 200` в движке —
+  было 50, то есть ровно столько же, сколько разрешалось подключить;
+* `parse_compact_peers` / `parse_compact_peers6` разбирают все полные записи и
+  игнорируют неполный хвост вместо ошибки на весь announce;
+* `is_usable_peer` отбрасывает только `0.0.0.0/8`, широковещательный,
+  multicast, link-local и порт `0`; приватные, CGNAT (`100.64/10`) и loopback
+  адреса остаются рабочими (локальные раздачи и пиры за общим NAT);
+* UDP-обмен — до трёх попыток вместо двух;
+* PEX: `MAX_ADDRESSES = 200`, длинный список обрезается (варианта ошибки
+  `TooMany` больше нет), `diff` тоже ограничивает поле двумя сотнями;
+* DHT: `ANNOUNCE_ROUNDS = 3` итеративных раунда `get_peers` в общем бюджете
+  `ANNOUNCE_TIMEOUT`; раунд не начинается, если бюджет исчерпан, никто не
+  ответил в предыдущем раунде или пиров уже достаточно.
+
+### Настройки и миграция
+
+* `EngineConfig::default().max_peers_per_torrent = 200`, `sanitized()` зажимает
+  значение в `1..=MAX_PEERS_PER_TORRENT = 500`;
+* в Tauri-слое `settings::DEFAULT_MAX_PEERS = 200` и
+  `settings::migrate_legacy_defaults`: файл `settings.json`, в котором
+  `max_peers == LEGACY_DEFAULT_MAX_PEERS (50)`, при загрузке поднимается до 200.
+  Миграция применяется только к файлу, прочитанному с диска, и только к точному
+  совпадению: 30, 100 или 128 не переписываются.
+
+### Ограничения 1.8
+
+* шифрование трафика (MSE/PE) не реализовано: пиры, требующие шифрование,
+  недостижимы;
+* uTP не реализован — только TCP; пиры, у которых открыт лишь uTP-порт, для нас
+  невидимы;
+* fast extension (`allowed fast`) не поддержан;
+* `Message::Port` (BEP 5 relay) игнорируется;
+* адаптация окна — эвристика, а не полноценная оценка BDP: на нестабильном
+  канале возможны и недобор, и лишние запросы (лишние снимаются таймаутом);
+* `swarm_seeds` / `swarm_leechers` известны только после ответа трекера: у
+  раздачи без трекеров (DHT/PEX) они остаются `0`;
+* `max_peers_per_torrent` больше не ограничен двумя сотнями, но каждое
+  соединение — сокет, задача tokio и буфер приёма; 500 — сознательный потолок.
+
+### Проверки
+
+`cargo test --workspace` — 437 тестов, 436 пройдено, 1 пропущен
+(`port_map::tests::map_port_on_real_gateway` — нужен живой роутер). Из них 228 в
+библиотеке ядра (227 пройдено + 1 `#[ignore]`), 45 интеграционных в 8 наборах и
+164 в Tauri-обвязке. По 1.8 добавлено: `engine::tests::rate_window_averages_and_forgets_old_samples`,
+`rate_window_ignores_bad_intervals`, `eta_state_stays_stable_between_refreshes`,
+`eta_is_none_without_measurable_speed`,
+`engine::tests::peer_record_starts_choked_in_both_directions` (обновлён под
+BEP 3), `tracker::tests::is_usable_peer_rejects_unusable_addresses`,
+`parse_compact_peers_keeps_full_records_before_incomplete_tail`,
+`pex::tests::decode_truncates_long_list_instead_of_rejecting`,
+`dht::tests::announce_опрашивает_узлы_из_ответа_и_собирает_их_пиров`,
+`settings::tests::load_migrates_legacy_peer_default` и
+`load_keeps_explicit_peer_limit`. Гейты: `cargo clippy --workspace --all-targets
+-- -D warnings` и `cargo fmt --all -- --check` — чисто.

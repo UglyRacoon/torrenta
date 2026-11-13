@@ -69,7 +69,13 @@ impl PiecePicker {
             status: vec![PieceStatus::Missing; piece_count],
             availability: vec![0; piece_count],
             in_progress_count: 0,
-            max_in_progress: (piece_count / 40).clamp(4, 64),
+            // Сколько кусков держать «в работе» одновременно: это же число
+            // пиров, у которых есть чем заняться. Раньше делили на 40 — на
+            // торренте в 700 МБ получалось 4 куска, то есть 4 работающих пира
+            // из полусотни подключённых, и скорость упиралась в потолок.
+            // Потолок 64 оставлен из-за памяти: каждый кусок в работе держит
+            // буфер размером с кусок (до 4 МиБ).
+            max_in_progress: (piece_count / 8).clamp(8, 64),
             wanted: Bitfield::all_set(piece_count),
             levels: vec![LEVEL_NORMAL; piece_count],
             order: PickOrder::default(),

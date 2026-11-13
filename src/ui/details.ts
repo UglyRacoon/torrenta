@@ -7,6 +7,7 @@ import {
   fmtEta,
   fmtPercent,
   fmtRate,
+  remainingBytes,
   truncateMiddle,
 } from "../lib/format";
 import { h, messageOf, setAttr, setScaleX, setText } from "../lib/dom";
@@ -96,7 +97,7 @@ function seedRatioText(ratio: number): string {
 }
 
 function progressText(torrent: TorrentSnapshot): string {
-  const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
+  const remaining = remainingBytes(torrent);
   // Лимит раздачи (1.6): торрент остановлен движком, а не пользователем.
   if (torrent.seed_limit_reached) {
     return "Раздача остановлена по лимиту";
@@ -207,6 +208,10 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
   const uploaded = statCard("Отдано");
   const ratio = statCard("Рейтинг");
   const left = statCard("Осталось");
+  // Размер роя по данным трекера: не путать с нашими сокетами — их в разы меньше,
+  // поэтому высокие числа здесь норма, а не ошибка.
+  const swarmSeeds = statCard("Сиды в рое");
+  const swarmLeechers = statCard("Личеры в рое");
   const stats = h(
     "div",
     { class: "details__stats" },
@@ -214,6 +219,8 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     uploaded.card,
     ratio.card,
     left.card,
+    swarmSeeds.card,
+    swarmLeechers.card,
   );
 
   // --- Опции торрента (1.7) ----------------------------------------------
@@ -797,7 +804,18 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     const missing = torrent.peers_connected - peers.length;
     peersNote.hidden = peers.length === 0 || missing <= 0;
     if (!peersNote.hidden) {
-      setText(peersNote, `Показаны ${peers.length} из ${torrent.peers_connected} подключённых`);
+      // Рядом с числом сокетов — размер роя (1.12): «11 из 12 000 в рое» объясняет,
+      // почему подключённых так мало, и не даёт спутать рой с нашими соединениями.
+      const seeds = Number.isFinite(torrent.swarm_seeds) ? Math.max(0, torrent.swarm_seeds) : 0;
+      const leechers = Number.isFinite(torrent.swarm_leechers)
+        ? Math.max(0, torrent.swarm_leechers)
+        : 0;
+      const swarm = seeds + leechers;
+      const tail = swarm > 0 ? ` · в рое ${fmtCount(swarm)}` : "";
+      setText(
+        peersNote,
+        `Показаны ${peers.length} из ${torrent.peers_connected} подключённых${tail}`,
+      );
     }
   }
 
@@ -992,7 +1010,7 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     setText(progressNote, progressText(torrent));
     setAttr(bar, "aria-valuenow", String(Math.round(torrent.progress * 100)));
 
-    const remaining = Math.max(0, torrent.wanted_bytes - torrent.downloaded_bytes);
+    const remaining = remainingBytes(torrent);
     // Все файлы исключены (1.3): качать нечего, поэтому «осталось 0» — это ещё не «завершено».
     const allSkipped = torrent.wanted_bytes === 0 && torrent.files.length > 0;
     setText(downloaded.value, fmtBytes(torrent.downloaded_bytes));
@@ -1021,6 +1039,25 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
         : allSkipped
           ? "файлы не выбраны"
           : "завершено",
+    );
+
+    // Сиды и личеры в рое (1.12): мировой размер роя от трекера, а не число наших
+    // сокетов. 0 — анонса ещё не было (UDP-трекер, ошибка), поэтому пишем
+    // «неизвестно»: ноль здесь означал бы «в рое никого», а это неправда.
+    const swarmSeedsKnown = torrent.swarm_seeds > 0;
+    setText(
+      swarmSeeds.value,
+      swarmSeedsKnown ? fmtCount(torrent.swarm_seeds) : "неизвестно",
+    );
+    setText(swarmSeeds.sub, swarmSeedsKnown ? "по данным трекера" : "трекер не ответил");
+    const swarmLeechersKnown = torrent.swarm_leechers > 0;
+    setText(
+      swarmLeechers.value,
+      swarmLeechersKnown ? fmtCount(torrent.swarm_leechers) : "неизвестно",
+    );
+    setText(
+      swarmLeechers.sub,
+      swarmLeechersKnown ? "по данным трекера" : "трекер не ответил",
     );
 
     renderFiles(torrent.files);

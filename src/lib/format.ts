@@ -6,6 +6,8 @@
  * — не бесплатный. Кэш ограничен, чтобы не расти бесконечно.
  */
 
+import type { TorrentSnapshot } from "../api/types";
+
 const BYTE_UNITS = ["Б", "КБ", "МБ", "ГБ", "ТБ", "ПБ"];
 
 const numberFormats = new Map<number, Intl.NumberFormat>();
@@ -42,9 +44,24 @@ export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/**
+ * Сколько байт осталось скачать по выбранным файлам.
+ *
+ * Остаток приходит из движка готовым полем `remaining_bytes`. Считать его на
+ * месте как `wanted_bytes - downloaded_bytes` нельзя: `downloaded_bytes` — это
+ * всё, что пришло из сети, включая байты файлов «не скачивать», поэтому такая
+ * разность занижает остаток и умеет уходить в минус.
+ *
+ * Страховка от мусора в снимке (`NaN`, отрицательные значения) — здесь, чтобы
+ * ни список, ни карточка не показывали «−2,3 ГБ» и не печатали «NaN».
+ */
+export function remainingBytes(torrent: TorrentSnapshot): number {
+  const value = torrent.remaining_bytes;
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
 /** 0 → «0 Б», 1536 → «1,5 КБ», 6.1e9 → «5,7 ГБ». */
-export function fmtBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
+export function fmtBytes(bytes: number): string {  if (!Number.isFinite(bytes) || bytes <= 0) {
     return "0 Б";
   }
   const rounded = Math.round(bytes);

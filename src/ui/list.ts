@@ -10,6 +10,7 @@ import {
   fmtRate,
   fmtTorrents,
   fmtActive,
+  remainingBytes,
 } from "../lib/format";
 import { h, setAttr, setScaleX, setText } from "../lib/dom";
 import { icon } from "../lib/icons";
@@ -312,9 +313,26 @@ function actionLabel(kind: ActionKind, state: TorrentState): string {
   return "Пауза";
 }
 
+/**
+ * Мировой размер роя по данным трекера: сиды + личеры.
+ * Это НЕ число наших сокетов: в рое есть пиры, к которым мы не подключены,
+ * поэтому величина не ограничена лимитом подключений. 0 — анонса ещё не было.
+ */
+function swarmSize(torrent: TorrentSnapshot): number {
+  const seeds = Number.isFinite(torrent.swarm_seeds) ? torrent.swarm_seeds : 0;
+  const leechers = Number.isFinite(torrent.swarm_leechers) ? torrent.swarm_leechers : 0;
+  return Math.max(0, seeds) + Math.max(0, leechers);
+}
+
 function metaMainText(torrent: TorrentSnapshot): string {
   const size = torrent.total_bytes > 0 ? fmtBytes(torrent.total_bytes) : "Размер неизвестен";
-  const peers = `${fmtCount(torrent.peers_connected)}/${fmtCount(torrent.peers_known)}`;
+  // В скобках — размер роя, как Seeds/Peers у qBittorrent: иначе «12» читается
+  // как «всего 12 пиров», хотя это только наши сокеты.
+  const swarm = swarmSize(torrent);
+  const peers =
+    swarm > 0
+      ? `${fmtCount(torrent.peers_connected)} (${fmtCount(swarm)})`
+      : fmtCount(torrent.peers_connected);
   return `${size} · пиры ${peers}`;
 }
 
@@ -368,8 +386,8 @@ function statValue(torrent: TorrentSnapshot, kind: "down" | "up" | "left"): stri
       : "—";
   }
   if (torrent.state === "downloading" || torrent.state === "paused" || torrent.state === "queued") {
-    // Осталось скачать только выбранные файлы (контракт 1.1).
-    const remaining = torrent.wanted_bytes - torrent.downloaded_bytes;
+    // Осталось скачать только выбранные файлы; считает движок (1.8).
+    const remaining = remainingBytes(torrent);
     return remaining > 0 && torrent.wanted_bytes > 0 ? fmtBytes(remaining) : "—";
   }
   return "—";
@@ -955,6 +973,16 @@ export function createList(mount: HTMLElement, options: ListOptions): TorrentLis
     }
 
     setText(view.metaMain, metaMainText(torrent));
+    // Расшифровка скобок: сколько подключено и сколько всего в рое. Без размера
+    // роя подсказка не нужна — цифра в строке и так читается однозначно.
+    const swarm = swarmSize(torrent);
+    setAttr(
+      view.metaMain,
+      "title",
+      swarm > 0
+        ? `подключено ${fmtCount(torrent.peers_connected)} из ${fmtCount(swarm)} в рое`
+        : null,
+    );
     const status = metaStatusText(torrent);
     setText(view.metaStatus, status);
     if (torrent.state === "error") {

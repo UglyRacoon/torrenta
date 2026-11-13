@@ -14,7 +14,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use super::torrent::Runtime;
-use super::{rd, read_exact_timeout, REQUEST_WINDOW};
+use super::{rd, read_exact_timeout};
 use crate::bencode::{self, Value};
 use crate::metainfo::InfoHash;
 use crate::wire::{Handshake, Message, HANDSHAKE_LEN};
@@ -217,6 +217,31 @@ enum Ev {
     Tick,
 }
 
+/// Исходящая сторона соединения: когда писали в последний раз и сказали ли
+/// пиру `Interested`.
+///
+/// Оба поля меняются из одних и тех же мест — из обработчика сообщений и из
+/// тика, поэтому живут вместе: иначе `handle_message` обрастает аргументами, а
+/// «сказали `Interested`» и «записали в сокет» легко разъедутся.
+struct Outgoing {
+    last_write: Instant,
+    interested: bool,
+}
+
+impl Outgoing {
+    fn new() -> Outgoing {
+        Outgoing {
+            last_write: Instant::now(),
+            interested: false,
+        }
+    }
+
+    /// Отмечает успешную запись в сокет.
+    fn wrote(&mut self) {
+        self.last_write = Instant::now();
+    }
+}
+
 async fn session_loop(
     runtime: &Arc<Runtime>,
     id: u64,
@@ -228,8 +253,7 @@ async fn session_loop(
     let mut have_rx = runtime.have_tx.subscribe();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_write = Instant::now();
-    let mut interested = false;
+    let mut out = Outgoing::new();
 
     loop {
         if runtime.stopping() || runtime.flags.paused() {
@@ -245,17 +269,16 @@ async fn session_loop(
             Ev::Message(Some(Err(message))) => return Err(message),
             Ev::Message(Some(Ok(Message::KeepAlive))) => {}
             Ev::Message(Some(Ok(message))) => {
-                handle_message(runtime, id, writer, message, extended, &mut last_write, pex)
-                    .await?;
+                handle_message(runtime, id, writer, message, extended, &mut out, pex).await?;
             }
             Ev::Have(Ok(index)) => {
                 send(writer, &Message::Have(index)).await?;
-                last_write = Instant::now();
+                out.wrote();
             }
             Ev::Have(Err(_)) => {}
             Ev::Tick => {
-                tick(runtime, id, writer, &mut interested, &mut last_write).await?;
-                send_pex(runtime, writer, pex, &mut last_write).await?;
+                tick(runtime, id, writer, &mut out).await?;
+                send_pex(runtime, writer, pex, &mut out).await?;
             }
         }
     }
@@ -267,13 +290,24 @@ async fn handle_message(
     writer: &mut OwnedWriteHalf,
     message: Message,
     extended: bool,
-    last_write: &mut Instant,
+    out: &mut Outgoing,
     pex: &mut PexSession,
 ) -> Result<(), String> {
     match message {
         Message::KeepAlive => {}
         Message::Choke => runtime.set_peer_choking(id, true),
-        Message::Unchoke => runtime.set_peer_choking(id, false),
+        Message::Unchoke => {
+            runtime.set_peer_choking(id, false);
+            // Пир только что открыл нам поток — не ждём ближайшего тика:
+            // говорим «интересно» и сразу же заполняем конвейер.
+            if !out.interested && runtime.should_be_interested(id) {
+                send(writer, &Message::Interested).await?;
+                runtime.set_am_interested(id, true);
+                out.interested = true;
+                out.wrote();
+            }
+            pump_requests(runtime, id, writer, out).await?;
+        }
         Message::Interested => runtime.set_peer_interested(id, true),
         Message::NotInterested => runtime.set_peer_interested(id, false),
         Message::Have(index) => runtime.on_have(id, index),
@@ -288,7 +322,7 @@ async fn handle_message(
             if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
                 send(writer, &Message::Piece { index, begin, data }).await?;
-                *last_write = Instant::now();
+                out.wrote();
                 runtime.add_uploaded(id, sent);
             }
         }
@@ -297,11 +331,14 @@ async fn handle_message(
             if let Some((index, full)) = ready {
                 if runtime.complete_piece(index, &full)? {
                     send(writer, &Message::Have(index)).await?;
-                    *last_write = Instant::now();
+                    out.wrote();
                 }
             }
+            // Освободившееся место в окне занимаем сразу, а не через тик:
+            // конвейер не должен простаивать ни один RTT.
+            pump_requests(runtime, id, writer, out).await?;
         }
-        Message::Cancel { .. } => {}
+        Message::Cancel { index, begin, .. } => runtime.on_cancel(id, index, begin),
         Message::Port(_) => {}
         Message::Extended { ext_id, payload } => {
             if !extended {
@@ -318,7 +355,7 @@ async fn handle_message(
                     // Пир также мог объявить ut_metadata другим номером, но
                     // запросы он шлёт по нашему — отдельное сопоставление не нужно.
                     serve_metadata(runtime, writer, &payload).await?;
-                    *last_write = Instant::now();
+                    out.wrote();
                 }
                 OUR_UT_PEX => on_pex(runtime, &payload),
                 _ => {}
@@ -407,7 +444,7 @@ async fn send_pex(
     runtime: &Arc<Runtime>,
     writer: &mut OwnedWriteHalf,
     pex: &mut PexSession,
-    last_write: &mut Instant,
+    out: &mut Outgoing,
 ) -> Result<(), String> {
     let Some(peer_id) = pex.peer_id else {
         return Ok(());
@@ -437,7 +474,7 @@ async fn send_pex(
         },
     )
     .await?;
-    *last_write = Instant::now();
+    out.wrote();
     // Следующий дифф считаем от того, что пир теперь знает: что осталось
     // актуальным из прошлой отправки плюс новые адреса.
     let mut known: Vec<SocketAddr> = pex
@@ -456,34 +493,69 @@ async fn send_pex(
     Ok(())
 }
 
-/// Периодические действия: интерес, запросы блоков, keep-alive.
+/// Периодические действия: интерес, отдача, запросы блоков, keep-alive.
 async fn tick(
     runtime: &Arc<Runtime>,
     id: u64,
     writer: &mut OwnedWriteHalf,
-    interested: &mut bool,
-    last_write: &mut Instant,
+    out: &mut Outgoing,
 ) -> Result<(), String> {
     let complete = runtime.is_complete();
     if complete {
-        if *interested {
+        if out.interested {
             send(writer, &Message::NotInterested).await?;
             runtime.set_am_interested(id, false);
-            *interested = false;
-            *last_write = Instant::now();
+            out.interested = false;
+            out.wrote();
         }
-    } else if !*interested && runtime.should_be_interested(id) {
+    } else if !out.interested && runtime.should_be_interested(id) {
         send(writer, &Message::Interested).await?;
         runtime.set_am_interested(id, true);
-        *interested = true;
-        *last_write = Instant::now();
+        out.interested = true;
+        out.wrote();
     }
 
-    let inflight = runtime.peer_inflight(id);
-    let window = REQUEST_WINDOW.saturating_sub(inflight);
+    // Отдача по tit-for-tat. Пока мы явно не сказали `Unchoke`, пир не имеет
+    // права просить у нас блоки, и для него мы — бесполезный собеседник:
+    // именно поэтому наш клиент раньше отдавал ноль и получал худшую очередь.
+    if runtime.should_unchoke(id) {
+        send(writer, &Message::Unchoke).await?;
+        runtime.set_am_choking(id, false);
+        out.wrote();
+    } else if runtime.should_choke(id) {
+        send(writer, &Message::Choke).await?;
+        runtime.set_am_choking(id, true);
+        out.wrote();
+    }
+
+    if !pump_requests(runtime, id, writer, out).await? && out.last_write.elapsed() >= KEEPALIVE {
+        send(writer, &Message::KeepAlive).await?;
+        out.wrote();
+    }
+    Ok(())
+}
+
+/// Заполняет конвейер запросов, пока не выбрано окно пира.
+///
+/// Вызывается не только по тику (раз в 250 мс), но и сразу после прихода блока
+/// и после `Unchoke`. Раньше запросы выдавались исключительно по тику, и потолок
+/// выходил жёстким: 32 запроса по 16 КБ каждые 250 мс ≈ 2 МБ/с на соединение,
+/// сколько бы ни было свободно в канале. Возвращает `true`, если что-то ушло.
+async fn pump_requests(
+    runtime: &Arc<Runtime>,
+    id: u64,
+    writer: &mut OwnedWriteHalf,
+    out: &mut Outgoing,
+) -> Result<bool, String> {
+    let window = runtime.peer_window(id);
+    if window == 0 {
+        return Ok(false);
+    }
     let budget = runtime.download_budget(window);
     let requests = runtime.next_requests(id, budget);
-    let requested = !requests.is_empty();
+    if requests.is_empty() {
+        return Ok(false);
+    }
     for request in requests {
         send(
             writer,
@@ -495,13 +567,8 @@ async fn tick(
         )
         .await?;
     }
-    if requested {
-        *last_write = Instant::now();
-    } else if last_write.elapsed() >= KEEPALIVE {
-        send(writer, &Message::KeepAlive).await?;
-        *last_write = Instant::now();
-    }
-    Ok(())
+    out.wrote();
+    Ok(true)
 }
 
 /// Отправляет сообщение и сбрасывает буфер.

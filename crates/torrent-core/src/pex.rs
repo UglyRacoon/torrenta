@@ -14,10 +14,11 @@
 //! (`added6`/`dropped6`) при разборе просто игнорируются: сообщения этого модуля
 //! описывают только IPv4.
 //!
-//! В каждом поле — не больше 50 адресов: столько же отдаёт
-//! [`PexMessage::diff`], а [`PexMessage::decode`] отвергает более длинные
-//! списки, чтобы враждебный пир не заставил нас держать в памяти мегабайты
-//! адресов.
+//! В каждом поле — не больше [`MAX_ADDRESSES`] адресов: столько же отдаёт
+//! [`PexMessage::diff`], а [`PexMessage::decode`] обрезает более длинный список
+//! до этого предела, а не отвергает сообщение. Раньше лимит был 50 и длинный
+//! список считался ошибкой — сообщения libtorrent и qBittorrent (они кладут в
+//! `added` до 200 адресов) отбрасывались целиком вместе со всеми пирами.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -29,8 +30,11 @@ use crate::bencode::{self, Value};
 /// Идентификатор расширения PEX в рукопожатии BEP 10 (`ext_id`).
 pub const EXT_PEX: u8 = 1;
 
-/// Предельное число адресов в одном поле сообщения (BEP 11 рекомендует 50).
-const MAX_ADDRESSES: usize = 50;
+/// Предельное число адресов в одном поле сообщения.
+///
+/// BEP 11 рекомендует 50, но libtorrent и qBittorrent шлют до 200 — берём по
+/// ним: лишние адреса всё равно полезны, а память на 200 адресов ничтожна.
+const MAX_ADDRESSES: usize = 200;
 
 /// Размер одного адреса в компактном виде: 4 байта IPv4 + 2 байта порта.
 const COMPACT_LEN: usize = 6;
@@ -53,13 +57,6 @@ pub enum PexError {
     /// Длина компактного списка не кратна размеру адреса.
     #[error("длина списка «{0}» не кратна 6 байтам")]
     Truncated(&'static str),
-    /// Адресов в поле больше лимита.
-    #[error("слишком много адресов в поле «{field}»: {count} (лимит {limit})")]
-    TooMany {
-        field: &'static str,
-        count: usize,
-        limit: usize,
-    },
 }
 
 /// Сообщение PEX: кого предложить пиру и кого предложить выбросить.
@@ -109,8 +106,9 @@ impl PexMessage {
     /// Разбирает полезную нагрузку расширения PEX.
     ///
     /// Отсутствующее поле — пустой список. Ошибка возвращается, если данные не
-    /// bencode, верхний уровень не словарь, поле не является строкой, длина
-    /// компактного списка не кратна 6 байтам или адресов больше лимита.
+    /// bencode, верхний уровень не словарь, поле не является строкой или длина
+    /// компактного списка не кратна 6 байтам. Слишком длинный список — не
+    /// ошибка: лишние адреса сверх [`MAX_ADDRESSES`] просто отбрасываются.
     pub fn decode(payload: &[u8]) -> Result<Self, PexError> {
         let value =
             bencode::decode_all(payload).map_err(|err| PexError::Bencode(err.to_string()))?;
@@ -205,17 +203,12 @@ fn parse_compact(
     if bytes.len() % COMPACT_LEN != 0 {
         return Err(PexError::Truncated(field_name));
     }
-    let count = bytes.len() / COMPACT_LEN;
-    if count > MAX_ADDRESSES {
-        return Err(PexError::TooMany {
-            field: field_name,
-            count,
-            limit: MAX_ADDRESSES,
-        });
-    }
 
+    // Длинный список не отвергаем, а обрезаем: первые [`MAX_ADDRESSES`]
+    // адресов ничуть не хуже остальных, а терять из-за них пиров незачем.
     Ok(bytes
         .chunks_exact(COMPACT_LEN)
+        .take(MAX_ADDRESSES)
         .map(|chunk| {
             SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3])),
@@ -334,20 +327,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_more_than_limit() {
+    fn decode_truncates_long_list_instead_of_rejecting() {
+        // Так выглядят сообщения libtorrent/qBittorrent: адресов заметно больше
+        // лимита, но терять их полностью нельзя — раньше такое сообщение
+        // отбрасывалось целиком.
         let mut compact = Vec::new();
-        for octet in 1..=(MAX_ADDRESSES + 1) {
-            compact.extend_from_slice(&[10, 0, 0, octet as u8, 0x1a, 0xe1]);
+        for octet in 1..=201u8 {
+            compact.extend_from_slice(&[10, 0, 0, octet, 0x1a, 0xe1]);
         }
         let payload = compact_payload(&[("added", compact)]);
-        assert_eq!(
-            PexMessage::decode(&payload),
-            Err(PexError::TooMany {
-                field: "added",
-                count: MAX_ADDRESSES + 1,
-                limit: MAX_ADDRESSES,
-            })
-        );
+        let message = PexMessage::decode(&payload).expect("длинный список — не ошибка разбора");
+        assert_eq!(message.added.len(), MAX_ADDRESSES);
+        assert_eq!(message.added[0], addr("10.0.0.1:6881"));
+        assert_eq!(message.added[MAX_ADDRESSES - 1], addr("10.0.0.200:6881"));
     }
 
     #[test]
@@ -391,24 +383,25 @@ mod tests {
     }
 
     #[test]
-    fn diff_limits_added_to_fifty() {
-        let fresh: Vec<SocketAddr> = (1..=60u8)
+    fn diff_limits_added_to_max_addresses() {
+        let fresh: Vec<SocketAddr> = (1..=205u16)
             .map(|octet| addr(&format!("10.1.0.{octet}:6881")))
             .collect();
         let message = PexMessage::diff(&[], &fresh, &[]);
         assert_eq!(message.added.len(), MAX_ADDRESSES);
         assert_eq!(message.added[0], addr("10.1.0.1:6881"));
-        assert_eq!(message.added[MAX_ADDRESSES - 1], addr("10.1.0.50:6881"));
+        assert_eq!(message.added[MAX_ADDRESSES - 1], addr("10.1.0.200:6881"));
     }
 
     #[test]
-    fn diff_limits_dropped_to_fifty() {
-        let dropped: Vec<SocketAddr> = (1..=55u8)
+    fn diff_limits_dropped_to_max_addresses() {
+        let dropped: Vec<SocketAddr> = (1..=205u16)
             .map(|octet| addr(&format!("10.2.0.{octet}:1")))
             .collect();
         let message = PexMessage::diff(&[], &[], &dropped);
         assert!(message.added.is_empty());
         assert_eq!(message.dropped.len(), MAX_ADDRESSES);
+        assert_eq!(message.dropped[MAX_ADDRESSES - 1], addr("10.2.0.200:1"));
     }
 
     #[test]

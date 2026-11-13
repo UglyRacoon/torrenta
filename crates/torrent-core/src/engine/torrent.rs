@@ -14,7 +14,8 @@ use sha1::{Digest, Sha1};
 use super::peer;
 use super::{
     effective_limit, lk, rd, wr, EngineConfig, EngineEvent, Flags, HttpClient, Limits, Selection,
-    Stats, TorrentHandle, TorrentState, BLOCK_SIZE,
+    Stats, TorrentHandle, TorrentState, ANNOUNCE_NUM_WANT, BLOCK_SIZE, REQUEST_WINDOW,
+    REQUEST_WINDOW_MAX, REQUEST_WINDOW_MIN,
 };
 use crate::bitfield::Bitfield;
 use crate::metainfo::{InfoHash, Metainfo};
@@ -35,12 +36,30 @@ const WEB_SEED_RETRY: Duration = Duration::from_secs(5);
 /// Предельное время одной попытки скачать кусок с веб-сида.
 const WEB_SEED_DEADLINE: Duration = Duration::from_secs(90);
 /// Сколько новых соединений открываем за один такт кондуктора.
-const CONNECT_BURST: usize = 8;
+const CONNECT_BURST: usize = 32;
+/// Сколько адресов держим в очереди на подключение.
+///
+/// Очередь — это буфер между «нашли пира» и «позвонили ему». При 256 адресах
+/// и всплеске DHT/PEX на популярном торренте мы выбрасывали свежие адреса
+/// раньше, чем до них доходила очередь.
+const PENDING_LIMIT: usize = 1024;
 /// Сколько циклов объявлений держим на один торрент.
 ///
 /// Трекеров в метаинфо бывает десятки, а объявляться всем сразу — это шквал
 /// запросов на старте. Остальные адреса подхватываются, если список изменится.
-const MAX_TRACKER_LOOPS: usize = 16;
+const MAX_TRACKER_LOOPS: usize = 64;
+/// Через сколько считаем запрошенный блок потерянным и просим заново.
+///
+/// Без этого таймаута «призрак» в `inflight` навсегда съедает место в окне
+/// запросов (а `Cancel` от пира мы игнорируем), и соединение деградирует
+/// до скорости одного блока за приём.
+const BLOCK_TIMEOUT: Duration = Duration::from_secs(8);
+/// Сколько пиров одновременно держим разчокнутыми на отдачу.
+///
+/// По BEP 3 обе стороны стартуют «зачокнутыми», и пока мы не пришлём
+/// `Unchoke`, пир не отдаёт нам ничего. Один-два разчокнутых пира дают
+/// тит-фо-тат рейтинг на уровне новичка, и хорошие сиды нас игнорируют.
+const UNCHOKE_SLOTS: usize = 8;
 
 /// Окружение, общее для всех сессий одного торрента (без ссылки на менеджер,
 /// чтобы не образовывать цикл `Arc`).
@@ -77,7 +96,9 @@ pub(crate) struct PieceBuffer {
     pub(crate) received: Vec<bool>,
     pub(crate) total_blocks: u32,
     pub(crate) got: u32,
-    pub(crate) inflight: HashSet<u32>,
+    /// Запрошенные блоки и время запроса: без времени «призрак» в наборе
+    /// занимал бы место в окне вечно (на `Cancel` от пира мы не реагируем).
+    pub(crate) inflight: HashMap<u32, Instant>,
 }
 
 impl PieceBuffer {
@@ -89,7 +110,7 @@ impl PieceBuffer {
             received: vec![false; total_blocks as usize],
             total_blocks,
             got: 0,
-            inflight: HashSet::new(),
+            inflight: HashMap::new(),
         }
     }
 }
@@ -102,8 +123,14 @@ pub(crate) struct PeerRecord {
     pub(crate) am_choking: bool,
     pub(crate) am_interested: bool,
     pub(crate) peer_choking: bool,
+    /// Пир сообщил, что заинтересован в нас, — отдельно от `am_choking`.
+    pub(crate) peer_interested: bool,
     pub(crate) owned_piece: Option<u32>,
-    pub(crate) inflight: HashSet<u32>,
+    /// Запрошенные блоки и время отправки запроса (для таймаута блока).
+    pub(crate) inflight: HashMap<u32, Instant>,
+    /// Сколько блоков держим «в полёте» у этого пира (растёт на быстрых
+    /// соединениях, сжимается при потерях и таймаутах).
+    pub(crate) window: usize,
     pub(crate) down_bytes: u64,
     pub(crate) up_bytes: u64,
     pub(crate) last_down: u64,
@@ -119,11 +146,16 @@ impl PeerRecord {
             addr,
             client: "неизвестный".to_string(),
             have: Bitfield::new(piece_count),
-            am_choking: false,
+            // По BEP 3 в начале мы обоих «душим», но раз мы не отдаём
+            // кусков, пока не пришлём Unchoke, честнее сразу считать себя
+            // разблокированным для отдачи — см. `should_unchoke`.
+            am_choking: true,
             am_interested: false,
             peer_choking: true,
+            peer_interested: false,
             owned_piece: None,
-            inflight: HashSet::new(),
+            inflight: HashMap::new(),
+            window: REQUEST_WINDOW,
             down_bytes: 0,
             up_bytes: 0,
             last_down: 0,
@@ -290,6 +322,51 @@ fn grant_upload(
         own_limiter.take(length);
     }
     true
+}
+
+/// Освобождает кусок, который качал пир.
+///
+/// Если в буфере уже есть принятые блоки, кусок не выбрасываем: оставляем его
+/// ничейным (`owner = 0`), и его подхватит следующий пир (см. `next_requests`).
+/// Иначе на каждом `Choke` мы теряли бы до целого куска скачанного.
+fn release_piece(state: &mut RuntimeState, index: u32) {
+    let keep = match state.buffers.get_mut(&index) {
+        Some(buffer) => {
+            buffer.owner = 0;
+            buffer.inflight.clear();
+            buffer.got > 0
+        }
+        None => false,
+    };
+    if keep {
+        return;
+    }
+    state.buffers.remove(&index);
+    state.picker.release(index as usize);
+}
+
+/// Позиция пира в тит-фо-тат рейтинге (0 — лучший), либо `None`, если пир не
+/// заинтересован в наших данных и разчокивать его незачем.
+///
+/// Считаем по текущей скорости отдачи нам, а не по накопленным байтам: иначе
+/// новичок с быстрым каналом никогда не обгонит старожила со счётчиком.
+fn unchoke_rank(state: &RuntimeState, id: u64) -> Option<usize> {
+    let peer = state.peers.get(&id)?;
+    if !peer.peer_interested {
+        return None;
+    }
+    let mut rank = 0;
+    for (other_id, other) in &state.peers {
+        if !other.peer_interested {
+            continue;
+        }
+        let better = other.down_rate > peer.down_rate
+            || (other.down_rate == peer.down_rate && *other_id < id);
+        if better {
+            rank += 1;
+        }
+    }
+    Some(rank)
 }
 
 /// Активный торрент: метаданные уже есть, идёт обмен с пирами.
@@ -576,7 +653,10 @@ impl Runtime {
                 state.pending.push_back(addr);
             }
         }
-        while state.pending.len() > 256 {
+        // Выбрасываем хвост, а не голову: на популярном торренте трекер отдаёт
+        // свежие адреса последними (и ими же отвечают повторные объявления), а
+        // старые в очереди — это те, до которых за минуты так и не дошло.
+        while state.pending.len() > PENDING_LIMIT {
             state.pending.pop_back();
         }
     }
@@ -646,6 +726,13 @@ impl Runtime {
         let mut state = lk(&self.state);
         state.connecting = state.connecting.saturating_sub(1);
         if state.peers.len() >= max {
+            // Мест нет — адрес не «сжигаем», а возвращаем в очередь. Иначе пир,
+            // которому просто не хватило слота, пропадает до конца сессии: он
+            // уже в `seen`, повторно трекер его не добавит, а соединения нет.
+            state.seen.remove(&addr);
+            if state.pending.len() < PENDING_LIMIT && !state.pending.contains(&addr) {
+                state.pending.push_front(addr);
+            }
             return None;
         }
         let id = self.next_peer.fetch_add(1, Ordering::Relaxed);
@@ -662,8 +749,7 @@ impl Runtime {
             // (пауза, смена торрента), и трекер может предложить его повторно.
             state.seen.remove(&peer.addr);
             if let Some(index) = peer.owned_piece {
-                state.buffers.remove(&index);
-                state.picker.release(index as usize);
+                release_piece(&mut state, index);
             }
         }
     }
@@ -723,17 +809,19 @@ impl Runtime {
                 peer.inflight.clear();
             }
         }
+        // По BEP 3 после Unchoke пир обязан повторить запросы заново, поэтому
+        // недокачанный кусок не выбрасываем: уже принятые блоки остаются в
+        // буфере, а сам кусок подхватит следующий пир (см. `next_requests`).
         if choking {
             if let Some(index) = owned {
-                state.buffers.remove(&index);
-                state.picker.release(index as usize);
+                release_piece(&mut state, index);
             }
         }
     }
 
     pub(crate) fn set_peer_interested(&self, id: u64, interested: bool) {
         if let Some(peer) = lk(&self.state).peers.get_mut(&id) {
-            peer.am_choking = !interested;
+            peer.peer_interested = interested;
         }
     }
 
@@ -744,13 +832,89 @@ impl Runtime {
         }
     }
 
-    /// Сколько блоков уже запрошено у пира.
-    pub(crate) fn peer_inflight(&self, id: u64) -> usize {
-        lk(&self.state)
-            .peers
-            .get(&id)
-            .map(|peer| peer.inflight.len())
-            .unwrap_or(0)
+    /// Сколько блоков ещё можно запросить у пира прямо сейчас.
+    ///
+    /// Заодно снимает просроченные запросы: `Cancel` от пира мы не
+    /// обрабатываем, и без таймаута «призрак» потерянного блока занимал бы
+    /// место в окне вечно, а пир тихо простаивал бы с пустым конвейером.
+    pub(crate) fn peer_window(&self, id: u64) -> usize {
+        let mut state = lk(&self.state);
+        let now = Instant::now();
+        let (window, busy, owned, stale) = {
+            let Some(peer) = state.peers.get_mut(&id) else {
+                return 0;
+            };
+            let stale: Vec<u32> = peer
+                .inflight
+                .iter()
+                .filter(|(_, at)| now.duration_since(**at) >= BLOCK_TIMEOUT)
+                .map(|(begin, _)| *begin)
+                .collect();
+            for begin in &stale {
+                peer.inflight.remove(begin);
+            }
+            if !stale.is_empty() {
+                // Блоки не пришли за `BLOCK_TIMEOUT` — канал узкий или пир
+                // молчит: сжимаем окно, чтобы не заваливать его запросами.
+                peer.window = (peer.window / 2).max(REQUEST_WINDOW_MIN);
+            }
+            (peer.window, peer.inflight.len(), peer.owned_piece, stale)
+        };
+        if let Some(index) = owned {
+            if let Some(buffer) = state.buffers.get_mut(&index) {
+                for begin in &stale {
+                    buffer.inflight.remove(&(begin / BLOCK_SIZE));
+                }
+            }
+        }
+        window.saturating_sub(busy)
+    }
+
+    /// Пора ли отдавать пиру несжатый поток: он заинтересован, мы его душим и
+    /// он входит в число лучших по отдаче нам.
+    pub(crate) fn should_unchoke(&self, id: u64) -> bool {
+        let state = lk(&self.state);
+        let Some(peer) = state.peers.get(&id) else {
+            return false;
+        };
+        if !peer.am_choking || !peer.peer_interested {
+            return false;
+        }
+        matches!(unchoke_rank(&state, id), Some(rank) if rank < UNCHOKE_SLOTS)
+    }
+
+    /// Пора ли задушить пира: интерес потерян, либо он вылетел из числа лучших.
+    pub(crate) fn should_choke(&self, id: u64) -> bool {
+        let state = lk(&self.state);
+        let Some(peer) = state.peers.get(&id) else {
+            return false;
+        };
+        if peer.am_choking {
+            return false;
+        }
+        !peer.peer_interested
+            || matches!(unchoke_rank(&state, id), Some(rank) if rank >= UNCHOKE_SLOTS)
+    }
+
+    /// Запоминает, что `Unchoke`/`Choke` пиру уже отправлен.
+    pub(crate) fn set_am_choking(&self, id: u64, choking: bool) {
+        if let Some(peer) = lk(&self.state).peers.get_mut(&id) {
+            peer.am_choking = choking;
+        }
+    }
+
+    /// Пир отказался от блока (`Cancel`): снимаем его из «в полёте».
+    ///
+    /// Иначе блок считался бы занятым до `BLOCK_TIMEOUT`, хотя его уже никто
+    /// не шлёт: окно пира выглядело бы заполненным, а кусок — потерянным.
+    pub(crate) fn on_cancel(&self, id: u64, index: u32, begin: u32) {
+        let mut state = lk(&self.state);
+        if let Some(peer) = state.peers.get_mut(&id) {
+            peer.inflight.remove(&begin);
+        }
+        if let Some(buffer) = state.buffers.get_mut(&index) {
+            buffer.inflight.remove(&(begin / BLOCK_SIZE));
+        }
     }
 
     pub(crate) fn should_be_interested(&self, id: u64) -> bool {
@@ -799,10 +963,37 @@ impl Runtime {
         if peer_choking || !am_interested {
             return Vec::new();
         }
+        let now = Instant::now();
+        if owned.is_none() {
+            // Сначала подбираем кусок, брошенный другим пиром (Choke или
+            // разрыв): в нём уже лежат принятые блоки, и начинать заново —
+            // значит выкинуть скачанное.
+            let adopt = {
+                let have = state.picker.have();
+                state
+                    .buffers
+                    .iter()
+                    .find(|(index, buffer)| {
+                        buffer.owner == 0
+                            && buffer.got > 0
+                            && peer_have.get(**index as usize)
+                            && !have.get(**index as usize)
+                    })
+                    .map(|(index, _)| *index)
+            };
+            if let Some(index) = adopt {
+                if let Some(buffer) = state.buffers.get_mut(&index) {
+                    buffer.owner = id;
+                }
+                owned = Some(index);
+                if let Some(peer) = state.peers.get_mut(&id) {
+                    peer.owned_piece = Some(index);
+                }
+            }
+        }
         if owned.is_none() {
             // Куски, недавно не прошедшие проверку, временно не берём: иначе
             // на испорченном куске зацикливается всё, а остальные голодают.
-            let now = Instant::now();
             state.cooldown.retain(|_, entry| entry.until > now);
             let mut exclude: HashSet<usize> =
                 state.cooldown.keys().map(|index| *index as usize).collect();
@@ -834,12 +1025,12 @@ impl Runtime {
                 if requests.len() >= want {
                     break;
                 }
-                if buffer.received[block as usize] || buffer.inflight.contains(&block) {
+                if buffer.received[block as usize] || buffer.inflight.contains_key(&block) {
                     continue;
                 }
                 let begin = block * BLOCK_SIZE;
                 let length = BLOCK_SIZE.min(buffer.data.len() as u32 - begin);
-                buffer.inflight.insert(block);
+                buffer.inflight.insert(block, now);
                 requests.push(Request {
                     index,
                     begin,
@@ -849,7 +1040,7 @@ impl Runtime {
         }
         if let Some(peer) = state.peers.get_mut(&id) {
             for request in &requests {
-                peer.inflight.insert(request.begin);
+                peer.inflight.insert(request.begin, now);
             }
         }
         requests
@@ -873,6 +1064,12 @@ impl Runtime {
             peer.down_bytes += data.len() as u64;
             peer.inflight.remove(&begin);
         }
+        // Скорость в интерфейсе считаем по проводным байтам, а не по
+        // проверенным кускам: иначе на крупных кусках график идёт ступеньками,
+        // а между кусками показывает честный ноль, хотя данные шли всё время.
+        self.stats
+            .wire_down
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         let Some(buffer) = state.buffers.get_mut(&index) else {
             return Ok(None);
         };
@@ -897,11 +1094,20 @@ impl Runtime {
         buffer.data[offset..offset + data.len()].copy_from_slice(&data);
         buffer.received[block as usize] = true;
         buffer.got += 1;
-        if buffer.got < buffer.total_blocks {
+        let done = buffer.got >= buffer.total_blocks;
+        // Блок пришёл раньше таймаута — канал держит больше, чем лежит в
+        // полёте: расширяем окно (адаптация под BDP, см. `peer_window`).
+        if let Some(peer) = state.peers.get_mut(&id) {
+            peer.window = (peer.window + 1).min(REQUEST_WINDOW_MAX);
+        }
+        if !done {
             return Ok(None);
         }
-        let full = std::mem::take(&mut buffer.data);
-        state.buffers.remove(&index);
+        let mut collected = match state.buffers.remove(&index) {
+            Some(buffer) => buffer,
+            None => return Ok(None),
+        };
+        let full = std::mem::take(&mut collected.data);
         if let Some(peer) = state.peers.get_mut(&id) {
             if peer.owned_piece == Some(index) {
                 peer.owned_piece = None;
@@ -1399,6 +1605,12 @@ impl Runtime {
                     continue;
                 }
             };
+            // Скорость считаем по тем же проводным байтам, что и у пиров:
+            // иначе загрузка с веб-сида шла бы «мимо» счётчика и скорость в
+            // интерфейсе показывала ноль, хотя файлы качались.
+            self.stats
+                .wire_down
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             match self.complete_piece(index, &data) {
                 Ok(true) => {}
                 // Хэш не сошёлся: кусок уже отложен планировщиком с паузой.
@@ -1498,7 +1710,7 @@ impl Runtime {
                 downloaded: self.stats.downloaded.load(Ordering::Relaxed),
                 left,
                 event,
-                num_want: Some(50),
+                num_want: Some(ANNOUNCE_NUM_WANT),
                 key: None,
             };
             let http = self.env.http.get();
@@ -1508,6 +1720,16 @@ impl Runtime {
                     failures = 0;
                     self.clear_tracker_failure();
                     self.add_candidates(response.peers);
+                    // Размер роя по данным трекера: собственный счётчик пиров
+                    // упирается в лимит подключений, а здесь видно, сколько
+                    // сидов и личеров в торренте вообще. Трекер вправе не
+                    // сообщать эти числа — тогда оставляем прежнюю оценку.
+                    if let Some(seeds) = response.seeds {
+                        self.stats.swarm_seeds.store(seeds, Ordering::Relaxed);
+                    }
+                    if let Some(leechers) = response.leechers {
+                        self.stats.swarm_leechers.store(leechers, Ordering::Relaxed);
+                    }
                     let interval = response.interval.clamp(30, 1800);
                     // Завершение из-за смены выбора файлов будит нас раньше,
                     // чтобы `event=completed` ушёл сразу, а не через интервал.
@@ -1658,7 +1880,7 @@ async fn metadata_task(handle: Arc<TorrentHandle>) {
                     downloaded: 0,
                     left: 16 * 1024,
                     event: Some(AnnounceEvent::Started),
-                    num_want: Some(50),
+                    num_want: Some(ANNOUNCE_NUM_WANT),
                     key: None,
                 };
                 let http = handle.env.http.get();
@@ -1807,13 +2029,19 @@ mod tests {
         assert_eq!(grant_download(&own, &shared, 0, 64, 16), 4);
     }
 
+    /// Новое соединение стартует задушенным в обе стороны (BEP 3).
+    ///
+    /// Раньше мы считали, что «по умолчанию мы не душим», и вообще не слали
+    /// `Unchoke` — из-за этого отдача всегда была нулевой, а мы выглядели для
+    /// чужих клиентов как чистый личер, которого нечего держать в очереди.
     #[test]
-    fn peer_record_starts_choked_and_unchoked_by_us() {
+    fn peer_record_starts_choked_in_both_directions() {
         let peer = PeerRecord::new("127.0.0.1:6881".parse().unwrap(), 10);
-        assert!(peer.peer_choking);
-        assert!(!peer.am_choking);
+        assert!(peer.peer_choking, "пир не должен раздавать до Unchoke");
+        assert!(peer.am_choking, "мы не должны раздавать до своего Unchoke");
         assert!(!peer.am_interested);
         assert_eq!(peer.have.len(), 10);
+        assert_eq!(peer.window, REQUEST_WINDOW, "окно запросов стартовое");
     }
 
     /// Побудка не теряется, если пришла до того, как цикл начал ждать.

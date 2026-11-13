@@ -40,10 +40,45 @@ use crate::wire::Handshake;
 
 /// Сколько байт в блоке запроса (`request`/`piece`).
 pub(crate) const BLOCK_SIZE: u32 = 16 * 1024;
-/// Сколько одновременно «в полёте» блоков у одного пира.
-pub(crate) const REQUEST_WINDOW: usize = 24;
+/// Стартовое число одновременно «в полёте» блоков у одного пира.
+///
+/// Окно не константа: оно растёт, пока пир отдаёт блоки без потерь, и
+/// сжимается при таймаутах или `Choke`. Фиксированные 24 блока при задержке
+/// 100 мс дают потолок ~4 МиБ/с на соединение — меньше, чем отдаёт хороший сид.
+pub(crate) const REQUEST_WINDOW: usize = 32;
+/// Нижняя граница окна запросов: даже на плохом соединении держим запас,
+/// чтобы не уйти в режим «блок за RTT».
+pub(crate) const REQUEST_WINDOW_MIN: usize = 8;
+/// Верхняя граница окна запросов (BDP большого канала).
+pub(crate) const REQUEST_WINDOW_MAX: usize = 512;
+/// Сколько пиров просим у трекера в одном объявлении.
+///
+/// Было 50 — ровно столько же, сколько разрешено подключать, поэтому рой
+/// казался маленьким даже там, где у qBittorrent сотни сидов: трекер отдавал
+/// первую горстку и мы в неё упирались. Просим с запасом, лишние адреса
+/// оседают в очереди кандидатов и подключаются по мере освобождения мест.
+pub(crate) const ANNOUNCE_NUM_WANT: u32 = 200;
 /// Период тика статистики.
 const STATS_TICK: Duration = Duration::from_millis(500);
+/// Сколько отсчётов скорости показываем в UI (16 × 500 мс = 8 секунд).
+///
+/// Одно значение EMA (как было до 1.7.1) помнит только два отсчёта: один тик
+/// без данных ронял цифру на 40 %, и она дёргалась между соседними кадрами.
+/// Среднее по окну из [`RATE_WINDOW`] отсчётов гасит такие выбросы, но всё
+/// ещё реагирует на реальное изменение скорости за пару секунд.
+const RATE_WINDOW: usize = 16;
+/// Сколько отсчётов копим для оценки остатка (60 × 500 мс = 30 секунд).
+///
+/// ETA считается по длинному окну: короткое окно даёт красивую цифру в
+/// текущей скорости, но «осталось 40 минут» на нём превращается в «3 часа»
+/// при первом же провале — а пользователю нужен прогноз, а не мгновенность.
+const ETA_WINDOW: usize = 60;
+/// Как часто пересчитывается ETA (снимок состояния запрашивается чаще).
+const ETA_REFRESH: Duration = Duration::from_secs(1);
+/// Ниже этой скорости ETA не считается — прогноз был бы фантастикой.
+const ETA_MIN_RATE: f64 = 2.0 * 1024.0;
+/// Разрыв между тиками больше этого считаем «процесс стоял» (сон, заморозка).
+const STALE_SAMPLE: f64 = 5.0;
 /// Срок аренды проброса порта на роутере, секунды.
 const PORT_MAP_LIFETIME_SECS: u32 = 3600;
 
@@ -281,6 +316,12 @@ pub struct EngineConfig {
     /// Каталог, куда по умолчанию сохраняются торренты.
     pub download_dir: PathBuf,
     /// Максимум подключённых пиров на торрент.
+    ///
+    /// qBittorrent по умолчанию держит до 500 соединений на торрент и до 2000
+    /// на клиент. Прежние 50 были главным ограничителем скорости: при 4 МиБ
+    /// кусках и одном куске на пира десяток медленных пиров не давал разогнать
+    /// торрент, даже если трекер отдал сотни адресов. Берём 200 как компромисс
+    /// между скоростью и числом сокетов/дескрипторов.
     pub max_peers_per_torrent: usize,
     /// Ограничение скорости загрузки, КиБ/с (0 — без ограничения).
     pub download_limit_kib: u32,
@@ -341,11 +382,18 @@ const MAX_SCHEDULE_LIMIT_KIB: u32 = 1_048_576;
 /// Сколько трекеров можно задать торренту вручную.
 const MAX_TRACKERS: usize = 100;
 
+/// Верхняя граница числа соединений на торрент.
+///
+/// Не даём выставить «бесконечно»: каждое соединение — сокет, задача tokio и
+/// буфер приёма, а планировщик обходится по всем пирам на каждом тике движка.
+/// 500 — примерно как `connections_limit_per_torrent` у libtorrent.
+const MAX_PEERS_PER_TORRENT: usize = 500;
+
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
             download_dir: default_download_dir(),
-            max_peers_per_torrent: 50,
+            max_peers_per_torrent: 200,
             download_limit_kib: 0,
             upload_limit_kib: 0,
             listen_port: 0,
@@ -376,7 +424,7 @@ impl EngineConfig {
         if self.download_dir.as_os_str().is_empty() {
             self.download_dir = default_download_dir();
         }
-        self.max_peers_per_torrent = self.max_peers_per_torrent.clamp(1, 200);
+        self.max_peers_per_torrent = self.max_peers_per_torrent.clamp(1, MAX_PEERS_PER_TORRENT);
         // 0 — «без ограничения», поэтому нижняя граница именно 0.
         self.max_active_downloads = self.max_active_downloads.min(MAX_ACTIVE_LIMIT);
         self.max_active_seeds = self.max_active_seeds.min(MAX_ACTIVE_LIMIT);
@@ -486,6 +534,11 @@ pub struct TorrentSnapshot {
     /// Сколько байт занимают выбранные файлы.
     pub wanted_bytes: u64,
     pub downloaded_bytes: u64,
+    /// Сколько байт осталось скачать по выбранным файлам (0 — загрузка
+    /// завершена). Считает движок: UI раньше выводил остаток как
+    /// `wanted_bytes - downloaded_bytes`, но `downloaded_bytes` включает и
+    /// невыбранные файлы, поэтому «осталось» могло уйти в минус.
+    pub remaining_bytes: u64,
     pub uploaded_bytes: u64,
     pub progress: f64,
     pub piece_count: u32,
@@ -493,6 +546,15 @@ pub struct TorrentSnapshot {
     pub pieces_have: u32,
     pub peers_connected: u32,
     pub peers_known: u32,
+    /// Сиды в рое по данным трекера (0 — трекер не сообщил).
+    ///
+    /// `peers_connected`/`peers_known` — это только то, что мы сами нашли и
+    /// подключили (упирается в лимит пиров), поэтому real-размер роя виден
+    /// лишь здесь: у qBittorrent в том же торренте сотни сидов, а локально
+    /// подключено несколько десятков.
+    pub swarm_seeds: u32,
+    /// Личеры в рое по данным трекера (0 — трекер не сообщил).
+    pub swarm_leechers: u32,
     pub down_rate: f64,
     pub up_rate: f64,
     /// Действующий лимит скачивания, КиБ/с (0 — без ограничения).
@@ -814,17 +876,96 @@ pub(crate) struct Stats {
     pub(crate) uploaded: AtomicU64,
     pub(crate) down_rate: AtomicU64,
     pub(crate) up_rate: AtomicU64,
+    /// Сколько байт реально пришло из сети.
+    ///
+    /// Скорость считаем по этому счётчику, а не по `downloaded` (проверенным
+    /// кускам): кусок — это несколько мегабайт, и между двумя завершениями
+    /// график показывал бы ноль, хотя данные шли всё время.
+    pub(crate) wire_down: AtomicU64,
     pub(crate) pieces_have: AtomicU32,
     pub(crate) piece_count: AtomicU32,
     pub(crate) piece_length: AtomicU32,
     pub(crate) peers_connected: AtomicU32,
     pub(crate) peers_known: AtomicU32,
+    /// Размер роя по последнему ответу трекера (0 — трекер не сообщил).
+    pub(crate) swarm_seeds: AtomicU32,
+    pub(crate) swarm_leechers: AtomicU32,
     pub(crate) files: RwLock<Vec<FileView>>,
     pub(crate) trackers: RwLock<Vec<String>>,
     pub(crate) peers: RwLock<Vec<PeerView>>,
     last_down: AtomicU64,
     last_up: AtomicU64,
     last_sample: Mutex<Instant>,
+    /// Короткое окно скорости — то, что видно в колонке «скорость».
+    down_window: Mutex<RateWindow>,
+    up_window: Mutex<RateWindow>,
+    /// Длинное окно скорости — только для оценки остатка.
+    down_long: Mutex<RateWindow>,
+    /// Сглаженная оценка остатка и момент её последнего пересчёта.
+    eta: Mutex<EtaState>,
+}
+
+/// Кольцевое окно отсчётов скорости: сумма байт и сумма времени.
+///
+/// Храним именно пары «байты / секунды», а не готовую скорость: среднее по
+/// окну равно `сумма байт / сумма времени`, поэтому неровные интервалы между
+/// тиками не искажают результат.
+struct RateWindow {
+    samples: std::collections::VecDeque<(f64, u64)>,
+    cap: usize,
+    bytes: u64,
+    seconds: f64,
+}
+
+impl RateWindow {
+    fn new(cap: usize) -> RateWindow {
+        RateWindow {
+            samples: std::collections::VecDeque::with_capacity(cap),
+            cap: cap.max(1),
+            bytes: 0,
+            seconds: 0.0,
+        }
+    }
+
+    /// Добавляет отсчёт, вытесняя самый старый за пределами окна.
+    fn push(&mut self, dt: f64, bytes: u64) {
+        self.samples.push_back((dt, bytes));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.seconds += dt;
+        while self.samples.len() > self.cap {
+            if let Some((old_dt, old_bytes)) = self.samples.pop_front() {
+                self.bytes = self.bytes.saturating_sub(old_bytes);
+                self.seconds = (self.seconds - old_dt).max(0.0);
+            }
+        }
+    }
+
+    /// Средняя скорость по окну, байт/с.
+    fn rate(&self) -> f64 {
+        if self.seconds <= 0.0 {
+            0.0
+        } else {
+            self.bytes as f64 / self.seconds
+        }
+    }
+
+    /// Наполнилось ли окно хотя бы наполовину — до этого оценка слишком шумная.
+    fn filled(&self) -> bool {
+        self.samples.len() * 2 >= self.cap
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.bytes = 0;
+        self.seconds = 0.0;
+    }
+}
+
+/// Состояние сглаженной оценки остатка.
+#[derive(Default)]
+struct EtaState {
+    value: Option<u64>,
+    updated: Option<Instant>,
 }
 
 impl Stats {
@@ -840,17 +981,24 @@ impl Stats {
             uploaded: AtomicU64::new(0),
             down_rate: AtomicU64::new(0f64.to_bits()),
             up_rate: AtomicU64::new(0f64.to_bits()),
+            wire_down: AtomicU64::new(0),
             pieces_have: AtomicU32::new(0),
             piece_count: AtomicU32::new(0),
             piece_length: AtomicU32::new(0),
             peers_connected: AtomicU32::new(0),
             peers_known: AtomicU32::new(0),
+            swarm_seeds: AtomicU32::new(0),
+            swarm_leechers: AtomicU32::new(0),
             files: RwLock::new(Vec::new()),
             trackers: RwLock::new(Vec::new()),
             peers: RwLock::new(Vec::new()),
             last_down: AtomicU64::new(0),
             last_up: AtomicU64::new(0),
             last_sample: Mutex::new(Instant::now()),
+            down_window: Mutex::new(RateWindow::new(RATE_WINDOW)),
+            up_window: Mutex::new(RateWindow::new(RATE_WINDOW)),
+            down_long: Mutex::new(RateWindow::new(ETA_WINDOW)),
+            eta: Mutex::new(EtaState::default()),
         }
     }
 
@@ -899,27 +1047,105 @@ impl Stats {
 
     /// Пересчитывает скорости (вызывается тикером раз в 500 мс).
     pub(crate) fn tick(&self) {
-        let mut last = lk(&self.last_sample);
-        let dt = last.elapsed().as_secs_f64().max(0.05);
-        *last = Instant::now();
-        let down = self.downloaded.load(Ordering::Relaxed);
-        let up = self.uploaded.load(Ordering::Relaxed);
-        let delta_down = down.saturating_sub(self.last_down.swap(down, Ordering::Relaxed));
-        let delta_up = up.saturating_sub(self.last_up.swap(up, Ordering::Relaxed));
-        smooth_rate(&self.down_rate, delta_down as f64 / dt);
-        smooth_rate(&self.up_rate, delta_up as f64 / dt);
+        let (delta_down, delta_up, elapsed) = {
+            let mut last = lk(&self.last_sample);
+            let elapsed = last.elapsed().as_secs_f64();
+            *last = Instant::now();
+            let down = self.wire_down.load(Ordering::Relaxed);
+            let up = self.uploaded.load(Ordering::Relaxed);
+            (
+                down.saturating_sub(self.last_down.swap(down, Ordering::Relaxed)),
+                up.saturating_sub(self.last_up.swap(up, Ordering::Relaxed)),
+                elapsed,
+            )
+        };
+        // Пауза процесса (сон машины, отладчик, заморозка окна) даёт один
+        // огромный интервал: если добавить его в окно, средняя скорость
+        // просядет почти до нуля на все следующие 8 секунд. Такие отсчёты
+        // просто выбрасываем и начинаем окно заново.
+        let stale = elapsed > STALE_SAMPLE;
+        let dt = if stale { 0.0 } else { elapsed.max(0.05) };
+        push_rate(&self.down_window, &self.down_rate, dt, delta_down, stale);
+        push_rate(&self.up_window, &self.up_rate, dt, delta_up, stale);
+        // Длинное окно наполняем всегда, чтобы ETA не «забывала» историю
+        // из-за одного пропущенного тика.
+        let mut long = lk(&self.down_long);
+        if stale {
+            long.clear();
+        } else {
+            long.push(dt, delta_down);
+        }
+    }
+
+    /// Скорость для оценки остатка, байт/с.
+    ///
+    /// Берём длинное окно, но пока оно не наполнилось наполовину (первые
+    /// ~15 секунд жизни торрента) — короткое, иначе ETA в начале загрузки
+    /// считается по одному-двум отсчётам.
+    fn eta_rate(&self) -> f64 {
+        let long = lk(&self.down_long);
+        if long.filled() && long.rate() > 0.0 {
+            long.rate()
+        } else {
+            drop(long);
+            load_f64(&self.down_rate)
+        }
+    }
+
+    /// Оценка времени до завершения, секунды.
+    ///
+    /// Раньше ETA считалась как `остаток / мгновенная скорость` на каждый
+    /// кадр: скорость дрожала на ±30 %, и оценка перескакивала с «40 минут»
+    /// на «3 часа» между соседними отрисовками. Теперь скорость берётся за
+    /// 30 секунд, сама оценка смешивается с предыдущей (70/30) и
+    /// пересчитывается не чаще раза в секунду — цифра ползёт плавно и при
+    /// этом честно догоняет реальность за несколько секунд.
+    fn eta_estimate(&self, remaining: u64) -> Option<u64> {
+        let mut eta = lk(&self.eta);
+        let now = Instant::now();
+        if remaining == 0 {
+            // Докачивать нечего — оценки нет (контракт снимка: `None`, а не
+            // «ноль секунд»). Заодно сбрасываем накопленное значение, иначе
+            // после возобновления загрузки первая цифра была бы старой.
+            eta.value = None;
+            eta.updated = None;
+            return None;
+        }
+        if let Some(updated) = eta.updated {
+            if now.duration_since(updated) < ETA_REFRESH {
+                return eta.value;
+            }
+        }
+        let rate = self.eta_rate();
+        let next = if rate >= ETA_MIN_RATE {
+            let raw = remaining as f64 / rate;
+            match eta.value {
+                Some(previous) => Some((previous as f64 * 0.7 + raw * 0.3).round() as u64),
+                None => Some(raw.round() as u64),
+            }
+        } else {
+            // Скорости нет — прогнозировать нечего, честнее показать прочерк.
+            None
+        };
+        eta.value = next;
+        eta.updated = Some(now);
+        next
     }
 }
 
-/// Сглаживает мгновенную скорость, чтобы цифры в UI не «дрожали».
-fn smooth_rate(atom: &AtomicU64, instant: f64) {
-    let previous = load_f64(atom);
-    let next = if instant > previous {
-        previous * 0.4 + instant * 0.6
-    } else {
-        previous * 0.6 + instant * 0.4
-    };
-    store_f64(atom, if next < 1.0 { 0.0 } else { next });
+/// Кладёт отсчёт в окно и обновляет показываемую скорость.
+fn push_rate(window: &Mutex<RateWindow>, shown: &AtomicU64, dt: f64, bytes: u64, stale: bool) {
+    let mut window = lk(window);
+    if stale {
+        window.clear();
+        store_f64(shown, 0.0);
+        return;
+    }
+    window.push(dt, bytes);
+    // Порог в 1 байт/с убирает «0,3 Б/с» на простаивающем торренте: окно
+    // из нулевых отсчётов само даёт ровно 0, поэтому принудительных
+    // сбросов вроде прежнего `next < 1.0` больше не нужно.
+    store_f64(shown, window.rate());
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,11 +1534,7 @@ impl TorrentHandle {
         let down_rate = load_f64(&self.stats.down_rate);
         let up_rate = load_f64(&self.stats.up_rate);
         let remaining = wanted_bytes.saturating_sub(wanted_have);
-        let eta = if remaining > 0 && down_rate > 1.0 {
-            Some((remaining as f64 / down_rate).ceil() as u64)
-        } else {
-            None
-        };
+        let eta = self.stats.eta_estimate(remaining);
         let limits = *rd(&self.limits);
         let downloaded = self.stats.downloaded.load(Ordering::Relaxed);
         let uploaded = self.stats.uploaded.load(Ordering::Relaxed);
@@ -1325,6 +1547,7 @@ impl TorrentHandle {
             total_bytes: total,
             wanted_bytes,
             downloaded_bytes: downloaded,
+            remaining_bytes: remaining,
             uploaded_bytes: uploaded,
             progress: if wanted_bytes == 0 {
                 0.0
@@ -1336,6 +1559,8 @@ impl TorrentHandle {
             pieces_have: self.stats.pieces_have.load(Ordering::Relaxed),
             peers_connected: self.stats.peers_connected.load(Ordering::Relaxed),
             peers_known: self.stats.peers_known.load(Ordering::Relaxed),
+            swarm_seeds: self.stats.swarm_seeds.load(Ordering::Relaxed),
+            swarm_leechers: self.stats.swarm_leechers.load(Ordering::Relaxed),
             down_rate,
             up_rate,
             down_limit_kib: effective_limit(self.env.now.down_kib(), limits.down_kib),
@@ -1814,7 +2039,7 @@ impl TorrentManager {
                         downloaded: 0,
                         left: 16 * 1024,
                         event: Some(AnnounceEvent::Started),
-                        num_want: Some(50),
+                        num_want: Some(ANNOUNCE_NUM_WANT),
                         key: None,
                     };
                     let response =
@@ -2449,14 +2674,58 @@ mod tests {
     }
 
     #[test]
-    fn rates_smooth_and_reset_to_zero() {
-        let atom = AtomicU64::new(0f64.to_bits());
-        smooth_rate(&atom, 1000.0);
-        assert!(load_f64(&atom) > 500.0);
-        smooth_rate(&atom, 0.0);
-        smooth_rate(&atom, 0.0);
-        smooth_rate(&atom, 0.0);
-        assert!(load_f64(&atom) < 400.0);
+    fn rate_window_averages_and_forgets_old_samples() {
+        let mut window = RateWindow::new(4);
+        assert!(!window.filled());
+        // Четыре отсчёта по 0,5 с и 1000 байт дают ровно 2000 байт/с.
+        for _ in 0..4 {
+            window.push(0.5, 1000);
+        }
+        assert!((window.rate() - 2000.0).abs() < 1e-6, "{}", window.rate());
+        assert!(window.filled());
+        // Пятый отсчёт с нулём вытесняет самый старый: 3000 байт за 2 с.
+        window.push(0.5, 0);
+        assert!((window.rate() - 1500.0).abs() < 1e-6, "{}", window.rate());
+        // Полная остановка: окно заполняется нулями и честно показывает ноль.
+        for _ in 0..4 {
+            window.push(0.5, 0);
+        }
+        assert_eq!(window.rate(), 0.0);
+        window.clear();
+        assert_eq!(window.rate(), 0.0);
+        assert!(!window.filled());
+    }
+
+    #[test]
+    fn rate_window_ignores_bad_intervals() {
+        // Нулевой интервал не должен давать деление на ноль (бесконечность).
+        let mut window = RateWindow::new(4);
+        window.push(0.0, 500);
+        assert!(window.rate().is_finite(), "{}", window.rate());
+    }
+
+    #[test]
+    fn eta_state_stays_stable_between_refreshes() {
+        let stats = Stats::new("тест".to_string(), TorrentState::Downloading);
+        store_f64(&stats.down_rate, 100_000.0);
+        let first = stats.eta_estimate(10_000_000);
+        assert!(first.is_some());
+        // Второй вызов в пределах ETA_REFRESH обязан вернуть то же значение,
+        // иначе цифра в UI дёргалась бы на каждом кадре.
+        assert_eq!(stats.eta_estimate(10_000_000), first);
+        // Остаток ноль — оценки нет (не «0 с»), и кэш сброшен.
+        assert_eq!(stats.eta_estimate(0), None);
+        // Вернувшаяся загрузка считается заново, а не отдаёт прошлую цифру.
+        assert!(stats.eta_estimate(10_000_000).is_some());
+    }
+
+    #[test]
+    fn eta_is_none_without_measurable_speed() {
+        let stats = Stats::new("тест".to_string(), TorrentState::Downloading);
+        assert_eq!(stats.eta_estimate(1_000_000), None);
+        // Ниже порога ETA_MIN_RATE прогноз не строится.
+        store_f64(&stats.down_rate, 100.0);
+        assert_eq!(stats.eta_estimate(1_000_000), None);
     }
 
     #[test]

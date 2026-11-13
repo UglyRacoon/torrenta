@@ -45,6 +45,15 @@ export interface TorrentSnapshot {
   /** Размер только выбранных файлов — база для прогресса. */
   wanted_bytes: number;
   downloaded_bytes: number;
+  /**
+   * Сколько байт осталось скачать по выбранным файлам (0 — загрузка готова).
+   *
+   * Считает движок. Считать остаток на месте как `wanted_bytes -
+   * downloaded_bytes` нельзя: `downloaded_bytes` — это всё, что пришло из сети,
+   * включая байты файлов с приоритетом «не скачивать», поэтому разность врёт и
+   * умеет уходить в минус.
+   */
+  remaining_bytes: number;
   uploaded_bytes: number;
   progress: number;
   piece_count: number;
@@ -52,6 +61,17 @@ export interface TorrentSnapshot {
   pieces_have: number;
   peers_connected: number;
   peers_known: number;
+  /**
+   * Сиды во всём рое по данным трекера (`complete`). Это мировой размер роя,
+   * а не число наших сокетов: он не ограничен лимитом подключений.
+   * 0 — трекер ещё не ответил (UDP-трекеры, ожидание анонса).
+   */
+  swarm_seeds: number;
+  /**
+   * Личеры во всём рое по данным трекера (`incomplete`).
+   * 0 — трекер ещё не ответил, то же правило, что у `swarm_seeds`.
+   */
+  swarm_leechers: number;
   down_rate: number;
   up_rate: number;
   /** 0 — без ограничения. */
