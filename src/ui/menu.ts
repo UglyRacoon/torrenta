@@ -80,13 +80,26 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
     }
   }
 
-  function openSubmenu(wrap: HTMLElement, trigger: HTMLElement, children: MenuItem[]): HTMLElement {
+  /**
+   * Открывает подменю пункта.
+   *
+   * `itemDepth` — сколько подменю уже открыто над этим пунктом (у пункта
+   * корневого меню 0). Закрываем только подменю того же и более глубокого
+   * уровня: иначе наведение на вложенную группу закрывало бы её собственных
+   * предков.
+   */
+  function openSubmenu(
+    wrap: HTMLElement,
+    trigger: HTMLElement,
+    children: MenuItem[],
+    itemDepth: number,
+  ): HTMLElement {
     const existing = submenus.find((entry) => entry.wrap === wrap);
     if (existing) {
       return existing.panel;
     }
-    closeSubmenus(0);
-    const panel = buildPanel(children, submenus.length + 1);
+    closeSubmenus(itemDepth);
+    const panel = buildPanel(children, itemDepth + 1);
     document.body.append(panel);
     setAttr(trigger, "aria-expanded", "true");
     wrap.classList.add("is-open");
@@ -116,7 +129,7 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
     return groupChildren.get(group) ?? [];
   }
 
-  function buildItem(item: MenuItem): HTMLElement {
+  function buildItem(item: MenuItem, itemDepth: number): HTMLElement {
     const children = item.children?.filter(Boolean) ?? [];
     const hasChildren = children.length > 0;
     const radio = item.checked !== undefined && !hasChildren;
@@ -154,7 +167,7 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
       const wrap = h("div", { class: "menu__group" }, button);
       button.addEventListener("mouseenter", () => {
         if (!button.disabled) {
-          openSubmenu(wrap, button, children);
+          openSubmenu(wrap, button, children, itemDepth);
         }
       });
       button.addEventListener("click", (event) => {
@@ -162,15 +175,18 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
         if (button.disabled) {
           return;
         }
-        const panel = openSubmenu(wrap, button, children);
+        const panel = openSubmenu(wrap, button, children, itemDepth);
         focusablesOf(panel)[0]?.focus();
       });
       groupChildren.set(wrap, children);
       return wrap;
     }
 
+    // Наведение на обычный пункт закрывает подменю, но только чужие: пункт
+    // внутри подменю не должен закрывать собственное меню (раньше «Ограничить
+    // скорость» исчезало, как только курсор доходил до варианта скорости).
     button.addEventListener("mouseenter", () => {
-      closeSubmenus(0);
+      closeSubmenus(itemDepth);
     });
     button.addEventListener("click", () => {
       if (button.disabled) {
@@ -182,18 +198,18 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
     return button;
   }
 
-  function buildPanel(list: MenuItem[], depth: number): HTMLElement {
+  function buildPanel(list: MenuItem[], panelDepth: number): HTMLElement {
     const panel = h("div", {
-      class: `menu${depth > 0 ? " menu--sub" : ""}`,
+      class: `menu${panelDepth > 0 ? " menu--sub" : ""}`,
       attrs: { role: "menu" },
     });
     for (const item of list) {
       if (item.separatorBefore) {
         panel.append(h("div", { class: "menu__sep", attrs: { role: "separator" } }));
       }
-      panel.append(buildItem(item));
+      panel.append(buildItem(item, panelDepth));
     }
-    panel.addEventListener("keydown", (event) => onPanelKey(event, panel, depth));
+    panel.addEventListener("keydown", (event) => onPanelKey(event, panel, panelDepth));
     return panel;
   }
 
@@ -226,7 +242,7 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
         const group = node?.closest<HTMLElement>(".menu__group");
         if (node && group) {
           event.preventDefault();
-          const childPanel = openSubmenu(group, node, groupItems(group));
+          const childPanel = openSubmenu(group, node, groupItems(group), depth);
           focusablesOf(childPanel)[0]?.focus();
         }
         return;
@@ -316,7 +332,7 @@ export function openMenu(target: MenuTarget, items: MenuItem[]): MenuHandle {
     }
   }
 
-  root.append(...items.map((item) => buildItem(item)));
+  root.append(...items.map((item) => buildItem(item, 0)));
   root.addEventListener("keydown", (event) => onPanelKey(event, root, 0));
 
   document.body.append(root);

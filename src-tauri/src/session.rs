@@ -33,10 +33,13 @@ use std::fs;
 use std::hash::Hasher as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
-use torrent_core::{AddOptions, FilePriority, TorrentSnapshot, TorrentState};
+use torrent_core::{
+    AddOptions, FilePriority, ResumeData, TorrentManager, TorrentSnapshot, TorrentState,
+};
 
 use crate::state::AppEngine;
 
@@ -80,6 +83,39 @@ pub struct SessionFilePriority {
     pub priority: FilePriority,
 }
 
+/// Отпечаток одного файла торрента на диске.
+///
+/// Размер и время изменения — единственное, что дёшево проверить при старте.
+/// Если хоть один файл изменился или пропал, карта кусков уже не гарантия, и
+/// вместо быстрого возобновления запускается обычная проверка хэшами.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileStamp {
+    /// Абсолютный путь файла.
+    pub path: String,
+    /// Длина файла в байтах.
+    pub length: u64,
+    /// Время изменения (секунды от UNIX_EPOCH); `-1` — прочитать не удалось.
+    pub mtime: i64,
+}
+
+/// Данные быстрого возобновления одной записи сессии.
+///
+/// Без них после перезапуска торрент начинал качать всё заново: движок не знал,
+/// что уже лежит на диске, и заново запрашивал те же куски.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResume {
+    /// Битовая карта проверенных кусков в hex (старший бит — кусок 0).
+    pub pieces: String,
+    /// Число кусков и размер куска — сверка с метаданными.
+    pub piece_count: u32,
+    /// Размер куска из метаданных.
+    pub piece_length: u32,
+    /// Отпечатки всех файлов торрента на момент сохранения.
+    pub files: Vec<SessionFileStamp>,
+    /// Когда карта сохранена (unix seconds) — для журнала и отладки.
+    pub saved_at: i64,
+}
+
 /// Одна запись сессии — всё, что нужно, чтобы вернуть торрент после перезапуска.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -110,6 +146,12 @@ pub struct SessionEntry {
     /// Локальный лимит отдачи, КиБ/с (`0` — без ограничения).
     #[serde(default)]
     pub up_limit_kib: u32,
+    /// Карта проверенных кусков и отпечатки файлов (с 1.8.1).
+    ///
+    /// `None` — данных нет (старый `session.json`, метаданные не получены,
+    /// файлы не найдены): после перезапуска торрент проверится хэшами.
+    #[serde(default)]
+    pub resume: Option<SessionResume>,
 }
 
 /// Содержимое `session.json`.
@@ -208,6 +250,226 @@ pub fn payload_hash(entries: &[SessionEntry]) -> u64 {
         Err(_) => hasher.write_u8(0),
     }
     hasher.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Быстрое возобновление
+// ---------------------------------------------------------------------------
+
+/// Кодирует байты в hex (нижний регистр) — формат карты в `session.json`.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// Разбирает hex; `None`, если строка не hex.
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
+/// Текущее время в секундах от UNIX_EPOCH (0, если часы сломаны).
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Время изменения файла в секундах; `-1` — прочитать не удалось.
+fn file_mtime(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(-1)
+}
+
+/// Путь файла торрента на диске: каталог сохранения + путь из метаданных.
+///
+/// В метаданных разделитель всегда `/`, а `Path::join` с таким путём на Windows
+/// тоже работает, поэтому нормализовать вручную не нужно; но пустые сегменты
+/// (двойной слэш) отбрасываем.
+fn file_path(save_path: &str, relative: &str) -> PathBuf {
+    let mut path = Path::new(save_path).to_path_buf();
+    for part in relative.split('/').filter(|part| !part.is_empty()) {
+        path.push(part);
+    }
+    path
+}
+
+/// Собирает карту возобновления по снимку и данным движка.
+///
+/// `None`, если хотя бы одного файла нет на диске: тогда честнее проверить
+/// торрент хэшами, чем доверять карте кусков.
+pub fn resume_of(torrent: &TorrentSnapshot, data: &ResumeData) -> Option<SessionResume> {
+    if torrent.files.is_empty() {
+        return None;
+    }
+    let mut files = Vec::with_capacity(torrent.files.len());
+    for file in &torrent.files {
+        let path = file_path(&torrent.save_path, &file.path);
+        let meta = fs::metadata(&path).ok()?;
+        files.push(SessionFileStamp {
+            path: path.to_string_lossy().into_owned(),
+            length: meta.len(),
+            mtime: file_mtime(&meta),
+        });
+    }
+    Some(SessionResume {
+        pieces: hex_encode(&data.pieces),
+        piece_count: data.piece_count,
+        piece_length: data.piece_length,
+        files,
+        saved_at: now_seconds(),
+    })
+}
+
+/// Не менялись ли файлы с момента сохранения карты.
+pub fn resume_files_match(resume: &SessionResume) -> bool {
+    if resume.files.is_empty() {
+        return false;
+    }
+    resume
+        .files
+        .iter()
+        .all(|stamp| match fs::metadata(&stamp.path) {
+            Ok(meta) => meta.len() == stamp.length && file_mtime(&meta) == stamp.mtime,
+            Err(_) => false,
+        })
+}
+
+/// Превращает сохранённую карту в данные движка; `None` — карта битая/короткая.
+pub fn resume_to_data(resume: &SessionResume) -> Option<ResumeData> {
+    let pieces = hex_decode(&resume.pieces)?;
+    if pieces.len() != (resume.piece_count as usize).div_ceil(8) {
+        return None;
+    }
+    Some(ResumeData {
+        piece_count: resume.piece_count,
+        piece_length: resume.piece_length,
+        pieces,
+    })
+}
+
+/// Дополняет записи сессии картами возобновления из движка.
+///
+/// Реестр не имеет доступа к рантайму, поэтому карту подкладывает вызывающий:
+/// без этого шага в `session.json` нечего восстанавливать, и после перезапуска
+/// торрент качался бы заново (так и было до 1.8.1).
+pub fn attach_resume(
+    entries: &mut [SessionEntry],
+    manager: &TorrentManager,
+    torrents: &[TorrentSnapshot],
+) {
+    for entry in entries.iter_mut() {
+        let Some(torrent) = torrents
+            .iter()
+            .find(|torrent| torrent.info_hash == entry.info_hash)
+        else {
+            entry.resume = None;
+            continue;
+        };
+        let data = match manager.resume_data(torrent.id) {
+            Ok(data) => data,
+            Err(_) => {
+                entry.resume = None;
+                continue;
+            }
+        };
+        entry.resume = resume_of(torrent, &data);
+    }
+}
+
+/// Что делать с отложенной картой magnet-торрента после получения метаданных.
+struct DeferredResume {
+    resume: Option<SessionResume>,
+    paused: bool,
+}
+
+fn deferred_resumes() -> &'static Mutex<HashMap<u64, DeferredResume>> {
+    static DEFERRED: OnceLock<Mutex<HashMap<u64, DeferredResume>>> = OnceLock::new();
+    DEFERRED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Запоминает карту до появления метаданных (у magnet их ещё нет).
+fn defer_resume(id: u64, resume: Option<SessionResume>, paused: bool) {
+    if let Ok(mut map) = deferred_resumes().lock() {
+        map.insert(id, DeferredResume { resume, paused });
+    }
+}
+
+fn take_deferred_resume(id: u64) -> Option<DeferredResume> {
+    deferred_resumes().lock().ok()?.remove(&id)
+}
+
+/// Применяет отложенную карту, когда у magnet-торрента появились метаданные.
+///
+/// Вызывается из обвязки при смене состояния: до метаданных ни карту применить,
+/// ни хэши проверить нельзя — кусков ещё не существует.
+pub fn apply_deferred_resume(engine: &AppEngine, id: u64) {
+    let Some(deferred) = take_deferred_resume(id) else {
+        return;
+    };
+    let mut resumed = false;
+    if let Some(resume) = deferred.resume.as_ref() {
+        if resume_files_match(resume) {
+            if let Some(data) = resume_to_data(resume) {
+                match engine.manager.apply_resume(id, &data) {
+                    Ok(()) => resumed = true,
+                    Err(err) => eprintln!(
+                        "[torrenta] сессия: карта торрента {id} не применена ({err}), проверяю хэши"
+                    ),
+                }
+            }
+        }
+    }
+    if !resumed {
+        if let Err(err) = engine.manager.recheck(id) {
+            eprintln!("[torrenta] сессия: не удалось запустить проверку торрента {id}: {err}");
+        }
+    }
+    if !deferred.paused {
+        if let Err(err) = engine.manager.resume(id) {
+            eprintln!("[torrenta] сессия: не удалось возобновить торрент {id}: {err}");
+        }
+    }
+}
+
+/// Восстанавливает прогресс после добавления: карта кусков или проверка хэшами.
+fn restore_progress(engine: &AppEngine, id: u64, entry: &SessionEntry) {
+    if let Some(resume) = entry.resume.as_ref() {
+        if resume_files_match(resume) {
+            if let Some(data) = resume_to_data(resume) {
+                match engine.manager.apply_resume(id, &data) {
+                    Ok(()) => return,
+                    Err(err) => eprintln!(
+                        "[torrenta] сессия: карта «{}» не применена ({err}), проверяю хэши",
+                        entry.name.trim()
+                    ),
+                }
+            }
+        }
+    }
+    // Карты нет или файлы изменились: полная проверка вместо повторной загрузки.
+    if let Err(err) = engine.manager.recheck(id) {
+        eprintln!(
+            "[torrenta] сессия: не удалось запустить проверку «{}»: {err}",
+            entry.name.trim()
+        );
+    }
 }
 
 /// Превращает записи сессии в список действий восстановления.
@@ -614,6 +876,9 @@ impl SessionRegistry {
             priorities,
             down_limit_kib: torrent.down_limit_kib,
             up_limit_kib: torrent.up_limit_kib,
+            // Карту возобновления подкладывает `attach_resume`: у реестра нет
+            // доступа к рантайму движка, а у снимка — к битовой карте.
+            resume: None,
         })
     }
 
@@ -703,7 +968,19 @@ async fn apply_restore_action(
                     entry.name
                 );
             }
+            // Останавливаем обмен до применения карты: иначе движок успеет
+            // начать качать заново, пока мы сверяем отпечатки файлов.
+            pause_quietly(engine, id, &entry.name);
             apply_entry_details(engine, id, &entry);
+            restore_progress(engine, id, &entry);
+            if !entry.paused {
+                if let Err(err) = engine.manager.resume(id) {
+                    eprintln!(
+                        "[torrenta] сессия: не удалось возобновить «{}»: {err}",
+                        entry.name.trim()
+                    );
+                }
+            }
             Ok(())
         }
         RestoreAction::Magnet { entry, link } => {
@@ -728,9 +1005,24 @@ async fn apply_restore_action(
                     entry.name
                 );
             }
+            // У magnet до метаданных ни карту применить, ни хэши проверить
+            // нельзя: запоминаем и вернёмся к этому после получения метаданных.
+            pause_quietly(engine, id, &entry.name);
             apply_entry_details(engine, id, &entry);
+            let resume = entry.resume.clone().filter(resume_files_match);
+            defer_resume(id, resume, entry.paused);
             Ok(())
         }
+    }
+}
+
+/// Ставит торрент на паузу, не считая ошибку фатальной.
+fn pause_quietly(engine: &AppEngine, id: u64, name: &str) {
+    if let Err(err) = engine.manager.pause(id) {
+        eprintln!(
+            "[torrenta] сессия: не удалось приостановить «{}» на время восстановления: {err}",
+            name.trim()
+        );
     }
 }
 
@@ -824,6 +1116,151 @@ mod tests {
         std::iter::repeat_n(ch, INFO_HASH_HEX_LEN).collect()
     }
 
+    /// Снимок с одним файлом: минимум полей, которые читает `resume_of`.
+    fn snapshot_with_file(root: &Path, length: u64) -> TorrentSnapshot {
+        let file = FileView {
+            path: "data.bin".to_string(),
+            length,
+            downloaded: length,
+            selected: true,
+            priority: FilePriority::Normal,
+        };
+        TorrentSnapshot {
+            id: 1,
+            name: "resume".to_string(),
+            info_hash: hash('a'),
+            state: TorrentState::Downloading,
+            error: None,
+            total_bytes: length,
+            wanted_bytes: length,
+            downloaded_bytes: length,
+            remaining_bytes: 0,
+            uploaded_bytes: 0,
+            progress: 1.0,
+            piece_count: (length.div_ceil(16 * 1024)) as u32,
+            piece_length: 16 * 1024,
+            pieces_have: 0,
+            peers_connected: 0,
+            peers_known: 0,
+            swarm_seeds: 0,
+            swarm_leechers: 0,
+            down_rate: 0.0,
+            up_rate: 0.0,
+            down_limit_kib: 0,
+            up_limit_kib: 0,
+            eta_seconds: None,
+            seed_ratio: 0.0,
+            seed_limit_reached: false,
+            sequential: false,
+            save_path: root.to_string_lossy().into_owned(),
+            added_at: 0,
+            files: vec![file],
+            trackers: Vec::new(),
+            peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resume_roundtrip_keeps_pieces_and_stamps() {
+        let dir = test_dir("resume-roundtrip");
+        let root = dir.join("downloads");
+        fs::create_dir_all(&root).expect("каталог загрузки");
+        let file_path = root.join("data.bin");
+        fs::write(&file_path, vec![7u8; 40 * 1024]).expect("файл данных");
+
+        let snapshot = snapshot_with_file(&root, 40 * 1024);
+        let data = ResumeData {
+            piece_count: snapshot.piece_count,
+            piece_length: snapshot.piece_length,
+            pieces: vec![0b1100_0000],
+        };
+        let resume = resume_of(&snapshot, &data).expect("карта должна собираться");
+        assert_eq!(resume.piece_count, data.piece_count);
+        assert_eq!(resume.piece_length, data.piece_length);
+        assert_eq!(resume.files.len(), 1);
+        assert_eq!(resume.files[0].length, 40 * 1024);
+        assert!(resume_files_match(&resume), "файл не менялся");
+
+        let restored = resume_to_data(&resume).expect("карта должна разбираться");
+        assert_eq!(restored, data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_rejects_changed_or_missing_files() {
+        let dir = test_dir("resume-changed");
+        let root = dir.join("downloads");
+        fs::create_dir_all(&root).expect("каталог загрузки");
+        let file_path = root.join("data.bin");
+        fs::write(&file_path, vec![1u8; 16 * 1024]).expect("файл данных");
+
+        let snapshot = snapshot_with_file(&root, 16 * 1024);
+        let data = ResumeData {
+            piece_count: snapshot.piece_count,
+            piece_length: snapshot.piece_length,
+            pieces: vec![0b1000_0000],
+        };
+        let resume = resume_of(&snapshot, &data).expect("карта должна собираться");
+        assert!(resume_files_match(&resume));
+
+        // Размер изменился — карте больше нельзя доверять.
+        fs::write(&file_path, vec![1u8; 32 * 1024]).expect("файл вырос");
+        assert!(!resume_files_match(&resume), "изменённый файл не совпадает");
+
+        // Файл удалён — тоже не совпадает.
+        fs::write(&file_path, vec![1u8; 16 * 1024]).expect("файл вернулся");
+        fs::remove_file(&file_path).expect("файл удаляется");
+        assert!(!resume_files_match(&resume), "удалённый файл не совпадает");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_to_data_verifies_hex_and_length() {
+        let good = SessionResume {
+            pieces: "ff00".to_string(),
+            piece_count: 16,
+            piece_length: 16 * 1024,
+            files: vec![SessionFileStamp {
+                path: "x".to_string(),
+                length: 1,
+                mtime: 0,
+            }],
+            saved_at: 0,
+        };
+        assert!(resume_to_data(&good).is_some());
+        // Не hex.
+        let bad_hex = SessionResume {
+            pieces: "zz".to_string(),
+            ..good.clone()
+        };
+        assert!(resume_to_data(&bad_hex).is_none());
+        // Длина карты не соответствует числу кусков.
+        let short = SessionResume {
+            pieces: "ff".to_string(),
+            ..good.clone()
+        };
+        assert!(resume_to_data(&short).is_none());
+        // Пустой список файлов — доверять нечему.
+        let no_files = SessionResume {
+            files: Vec::new(),
+            ..good
+        };
+        assert!(!resume_files_match(&no_files));
+    }
+
+    #[test]
+    fn old_session_json_without_resume_still_parses() {
+        // Так выглядел файл до 1.8.1: поля resume нет, и это не ошибка.
+        let json = format!(
+            r#"{{"torrents":[{{"info_hash":"{}","name":"old","source":{{"kind":"magnet","link":"magnet:?xt=urn:btih:{}"}},"save_path":"C:\\\\Temp","paused":false}}]}}"#,
+            hash('b'),
+            hash('b')
+        );
+        let entries = parse_session_json(&json).expect("старый JSON должен читаться");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].resume.is_none());
+    }
+
     fn entry(info_hash: &str) -> SessionEntry {
         SessionEntry {
             info_hash: info_hash.to_string(),
@@ -837,6 +1274,7 @@ mod tests {
             priorities: Vec::new(),
             down_limit_kib: 0,
             up_limit_kib: 0,
+            resume: None,
         }
     }
 

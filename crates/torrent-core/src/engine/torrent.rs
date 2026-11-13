@@ -60,6 +60,12 @@ const BLOCK_TIMEOUT: Duration = Duration::from_secs(8);
 /// `Unchoke`, пир не отдаёт нам ничего. Один-два разчокнутых пира дают
 /// тит-фо-тат рейтинг на уровне новичка, и хорошие сиды нас игнорируют.
 const UNCHOKE_SLOTS: usize = 8;
+/// Как часто пробуем нового пира «на удачу».
+///
+/// Раз в 30 секунд разчокиваем одного случайного пира вне топ-8: без этого
+/// новый быстрый сид никогда не получит от нас данные, а его tit-for-tat так и
+/// не разчокнет нас. По BEP 3 такой «оптимистичный разчок» и задуман.
+pub(crate) const OPTIMISTIC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Окружение, общее для всех сессий одного торрента (без ссылки на менеджер,
 /// чтобы не образовывать цикл `Arc`).
@@ -187,6 +193,16 @@ pub(crate) struct RuntimeState {
     pub(crate) connecting: usize,
     /// Куски, отложенные после неудачной проверки хэша: индекс -> срок паузы.
     pub(crate) cooldown: HashMap<u32, PieceCooldown>,
+    /// Пир, которому мы разчокиваем «на пробу» вопреки рейтингу.
+    ///
+    /// Без этого пир вне топ-8 никогда не получит от нас данные, а значит и сам
+    /// не разчокнет нас: новый быстрый сид оставался бы задушенным навсегда.
+    pub(crate) optimistic: Option<u64>,
+    /// Когда оптимистичного пира выбирали в прошлый раз.
+    pub(crate) optimistic_at: Instant,
+    /// Состояние простого xorshift-генератора: выбор «на пробу» не должен
+    /// каждый раз попадать в одного и того же пира.
+    pub(crate) rng: u64,
 }
 
 /// Простейший ограничитель скорости по блокам/байтам.
@@ -419,6 +435,17 @@ impl Runtime {
                 known: HashSet::new(),
                 connecting: 0,
                 cooldown: HashMap::new(),
+                optimistic: None,
+                optimistic_at: Instant::now(),
+                rng: {
+                    // Начальное зерно: время старта плюс адрес торрента не нужен,
+                    // достаточно разного старта у разных торрентов.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_nanos() as u64)
+                        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+                    nanos ^ (piece_count as u64).wrapping_mul(0x2545_F491_4F6C_DD1D) | 1
+                },
             }),
             stats,
             flags,
@@ -583,6 +610,74 @@ impl Runtime {
         }
     }
 
+    /// Применяет карту проверенных кусков без чтения диска.
+    ///
+    /// Вызывается только из [`TorrentHandle::apply_resume`], когда вызывающая
+    /// сторона сверила файлы на диске с сохранёнными отпечатками (размер и
+    /// mtime). В отличие от [`Self::verify_all`] ничего не хэширует: карта
+    /// считается верной, поэтому состояние выставляется сразу.
+    pub(crate) fn apply_have(&self, have: &Bitfield, meta: &Metainfo) -> Result<(), String> {
+        let piece_count = meta.info.piece_count();
+        let mut have_bytes = 0u64;
+        let mut count = 0u32;
+        {
+            let mut state = lk(&self.state);
+            // Недоделанные куски и запросы не имеют смысла: карта заменяет их
+            // целиком, а обмена с пирами в этот момент ещё нет.
+            state.buffers.clear();
+            state.pending.clear();
+            state.cooldown.clear();
+            for peer in state.peers.values_mut() {
+                peer.owned_piece = None;
+                peer.inflight.clear();
+            }
+            state.picker.reset_have();
+            for index in 0..piece_count {
+                if !have.get(index) {
+                    continue;
+                }
+                state.picker.mark_have(index);
+                have_bytes += meta.info.piece_size(index) as u64;
+                count += 1;
+            }
+        }
+        self.stats.pieces_have.store(count, Ordering::Relaxed);
+        self.stats.have_bytes.store(have_bytes, Ordering::Relaxed);
+
+        let complete = self.is_complete();
+        let seed = rd(&self.env.config).seed_after_complete;
+        let mut next = match (complete, seed) {
+            (true, true) => TorrentState::Seeding,
+            (true, false) => TorrentState::Completed,
+            (false, _) => TorrentState::Downloading,
+        };
+        // Пауза пользователя сильнее результата: он сам решил не качать.
+        if self.flags.user_paused() {
+            next = TorrentState::Paused;
+        }
+        if next == TorrentState::Downloading {
+            if let Err(message) = self.acquire_writes() {
+                let _ = self.env.events.send(EngineEvent::Error {
+                    id: self.id,
+                    message,
+                });
+            }
+        } else if let Err(message) = self.release_writes() {
+            let _ = self.env.events.send(EngineEvent::Error {
+                id: self.id,
+                message,
+            });
+        }
+        *lk(&self.stats.state) = next;
+        let _ = self.env.events.send(EngineEvent::StateChanged {
+            id: self.id,
+            state: next,
+        });
+        if complete {
+            self.wake_announcer();
+        }
+        Ok(())
+    }
     /// Будит циклы объявлений, не теряя побудку.
     ///
     /// Одного `notify_waiters()` мало: он не оставляет permit, поэтому побудка
@@ -880,6 +975,9 @@ impl Runtime {
         if !peer.am_choking || !peer.peer_interested {
             return false;
         }
+        if state.optimistic == Some(id) {
+            return true;
+        }
         matches!(unchoke_rank(&state, id), Some(rank) if rank < UNCHOKE_SLOTS)
     }
 
@@ -893,7 +991,35 @@ impl Runtime {
             return false;
         }
         !peer.peer_interested
-            || matches!(unchoke_rank(&state, id), Some(rank) if rank >= UNCHOKE_SLOTS)
+            || (state.optimistic != Some(id)
+                && matches!(unchoke_rank(&state, id), Some(rank) if rank >= UNCHOKE_SLOTS))
+    }
+
+    /// Перевыбирает «пробного» пира раз в [`OPTIMISTIC_INTERVAL`].
+    ///
+    /// Вызывается тикером торрента (500 мс). Генератор свой, на xorshift:
+    /// выбор меняется от раза к разу, а зависимости от `rand` у крейта нет.
+    pub(crate) fn tick_optimistic(&self) {
+        let mut state = lk(&self.state);
+        if state.optimistic_at.elapsed() < OPTIMISTIC_INTERVAL {
+            return;
+        }
+        state.optimistic_at = Instant::now();
+        let mut value = state.rng | 1;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        state.rng = value;
+        let candidates: Vec<u64> = state
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.peer_interested && peer.am_choking)
+            .map(|(id, _)| *id)
+            .filter(|id| matches!(unchoke_rank(&state, *id), Some(rank) if rank >= UNCHOKE_SLOTS))
+            .collect();
+        state.optimistic = candidates
+            .get(value as usize % candidates.len().max(1))
+            .copied();
     }
 
     /// Запоминает, что `Unchoke`/`Choke` пиру уже отправлен.

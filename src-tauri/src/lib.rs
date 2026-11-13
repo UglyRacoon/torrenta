@@ -64,7 +64,7 @@ const DARK_BACKGROUND: Color = Color(0x0F, 0x13, 0x19, 0xFF);
 const LIGHT_BACKGROUND: Color = Color(0xF2, 0xF5, 0xF9, 0xFF);
 
 /// Как часто проверять, изменилась ли сессия, и сохранять её на диск.
-const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Как часто обновлять подсказку трея, даже если текст не изменился
 /// (иконку могли пересоздать, и подсказка потерялась бы).
@@ -141,12 +141,27 @@ pub fn run() {
             commands::quit_app,
             single_instance::take_open_request,
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if let Err(err) = result {
-        eprintln!("[torrenta] не удалось запустить приложение: {err}");
-        std::process::exit(1);
-    }
+    let app = match result {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("[torrenta] не удалось запустить приложение: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    // Штатный выход — последняя точка, где прогресс ещё можно сохранить:
+    // тикер пишет сессию раз в несколько секунд, и без этого откат был бы
+    // на этот интервал (а при выходе через «Выход» — и больше).
+    app.run(|handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            save_session_now(handle);
+        }
+    });
 }
 
 /// Инициализация состояния: пути, настройки, движок, тема, фоновые задачи.
@@ -498,7 +513,11 @@ fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Opti
         return;
     };
 
-    let entries = registry.entries(&engine.manager.snapshot());
+    let torrents = engine.manager.snapshot();
+    let mut entries = registry.entries(&torrents);
+    // Без карты кусков сессия помнит только «что вернуть», а не «сколько уже
+    // скачано»: после перезапуска торрент начинал качать всё заново.
+    session::attach_resume(&mut entries, &engine.manager, &torrents);
     let hash = session::payload_hash(&entries);
     if *last_hash == Some(hash) {
         return;
@@ -506,6 +525,29 @@ fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Opti
     match registry.save(&entries) {
         Ok(()) => *last_hash = Some(hash),
         Err(err) => eprintln!("[torrenta] не удалось сохранить сессию: {err}"),
+    }
+}
+
+/// Сохраняет сессию немедленно, не глядя на интервал и хеш.
+///
+/// Нужно при выходе: последние секунды прогресса (карта кусков и отпечатки
+/// файлов) должны попасть на диск, иначе после перезапуска торрент перекачает
+/// их заново.
+fn save_session_now(app: &AppHandle) {
+    let Some(engine) = app.try_state::<AppEngine>() else {
+        return;
+    };
+    if !engine.settings().restore_session {
+        return;
+    }
+    let Some(registry) = app.try_state::<SessionRegistry>() else {
+        return;
+    };
+    let torrents = engine.manager.snapshot();
+    let mut entries = registry.entries(&torrents);
+    session::attach_resume(&mut entries, &engine.manager, &torrents);
+    if let Err(err) = registry.save(&entries) {
+        eprintln!("[torrenta] не удалось сохранить сессию при выходе: {err}");
     }
 }
 
@@ -577,6 +619,15 @@ fn spawn_engine_event_forwarder(app: AppHandle) {
                     // остальные события интересны лишь интерфейсу.
                     if let EngineEvent::Completed { name, .. } = &event {
                         notify_completed(&app, name);
+                    }
+                    // Magnet-торренты восстанавливаются до появления метаданных:
+                    // карту кусков можно применить только теперь, когда куски
+                    // уже известны. Для файловых торрентов это событие ничего
+                    // не делает — их карта применена ещё в `restore`.
+                    if let EngineEvent::StateChanged { id, .. } = &event {
+                        if let Some(engine) = app.try_state::<AppEngine>() {
+                            session::apply_deferred_resume(engine.inner(), *id);
+                        }
                     }
                 }
                 // Отставание подписчика не критично: актуальные данные придут

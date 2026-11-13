@@ -575,6 +575,22 @@ pub struct TorrentSnapshot {
     pub peers: Vec<PeerView>,
 }
 
+/// Данные быстрого возобновления: какие куски уже проверены на диске.
+///
+/// Нужны, чтобы после перезапуска не проверять весь торрент хэшами и не качать
+/// его заново. Решение «доверять этим данным или перепроверить» принимает
+/// вызывающая сторона (Tauri-слой): движок не знает ни про `session.json`, ни
+/// про mtime файлов, поэтому сам он только применяет карту кусков.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeData {
+    /// Число кусков — защита от применения данных чужого торрента.
+    pub piece_count: u32,
+    /// Размер куска из метаданных.
+    pub piece_length: u32,
+    /// Битовая карта проверенных кусков: старший бит — кусок 0.
+    pub pieces: Vec<u8>,
+}
+
 /// Суммарные показатели по всем торрентам.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalTotals {
@@ -1298,6 +1314,52 @@ impl TorrentHandle {
         lk(&self.runtime).clone()
     }
 
+    /// Карта проверенных кусков: `None`, пока нет метаданных или рантайма.
+    pub(crate) fn resume_data(&self) -> Option<ResumeData> {
+        let meta = rd(&self.meta).clone()?;
+        let runtime = self.runtime_clone()?;
+        Some(ResumeData {
+            piece_count: meta.info.piece_count() as u32,
+            piece_length: meta.info.piece_length,
+            pieces: runtime.have_bitfield().as_bytes().to_vec(),
+        })
+    }
+
+    /// Применяет карту кусков из сессии, не читая диск.
+    ///
+    /// Ошибка вместо паники: карта могла быть сохранена другой версией торрента
+    /// (другие куски) или испортиться при записи файла сессии.
+    pub(crate) fn apply_resume(&self, data: &ResumeData) -> Result<(), String> {
+        let meta = rd(&self.meta)
+            .clone()
+            .ok_or_else(|| "метаданные ещё не получены".to_string())?;
+        let piece_count = meta.info.piece_count();
+        if data.piece_count as usize != piece_count {
+            return Err(format!(
+                "карта возобновления от другого торрента: {} кусков вместо {piece_count}",
+                data.piece_count
+            ));
+        }
+        if data.piece_length != meta.info.piece_length {
+            return Err(format!(
+                "карта возобновления не подходит: кусок {} байт вместо {}",
+                data.piece_length, meta.info.piece_length
+            ));
+        }
+        let expected = piece_count.div_ceil(8);
+        if data.pieces.len() != expected {
+            return Err(format!(
+                "карта возобновления повреждена: {} байт вместо {expected}",
+                data.pieces.len()
+            ));
+        }
+        let Some(runtime) = self.runtime_clone() else {
+            return Err("торрент ещё не запускался: применять карту некуда".to_string());
+        };
+        let have = crate::bitfield::Bitfield::from_bytes(data.pieces.clone(), piece_count);
+        runtime.apply_have(&have, &meta)
+    }
+
     pub(crate) fn effective_state(&self) -> TorrentState {
         // Проверка хэшей важнее паузы: пользователь должен видеть прогресс.
         if self.flags.checking() {
@@ -1443,6 +1505,9 @@ impl TorrentHandle {
     pub(crate) fn tick(&self) {
         self.stats.tick();
         if let Some(runtime) = self.runtime_clone() {
+            // Раз в 30 с сменяем «пробного» пира: без этого новые сиды вне
+            // топ-8 никогда не получают от нас данные и не разчокивают нас.
+            runtime.tick_optimistic();
             runtime.sync_peer_view();
         }
         self.tick_seed_limit();
@@ -2180,6 +2245,34 @@ impl TorrentManager {
         Ok(())
     }
 
+    /// Отдаёт карту проверенных кусков для быстрого возобновления.
+    ///
+    /// `NotReady`, пока нет метаданных (magnet) или рантайма (торрент ещё ни
+    /// разу не запускался): в этом случае сохранять нечего, и после перезапуска
+    /// торрент проверится хэшами.
+    pub fn resume_data(&self, id: u64) -> Result<ResumeData, EngineError> {
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        handle.resume_data().ok_or(EngineError::NotReady)
+    }
+
+    /// Применяет карту кусков, не читая диск.
+    ///
+    /// Вызывать только когда вызывающая сторона убедилась, что файлы на диске
+    /// не менялись с момента сохранения карты (размер и mtime всех файлов).
+    /// Иначе используйте [`TorrentManager::recheck`]: он проверяет SHA-1 и
+    /// восстанавливает карту по факту.
+    ///
+    /// Обмен с пирами на время применения останавливается, недоделанные куски
+    /// выбрасываются, состояние и режим файлов выставляются по новой карте.
+    pub fn apply_resume(&self, id: u64, data: &ResumeData) -> Result<(), EngineError> {
+        self.ensure_background();
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        handle
+            .apply_resume(data)
+            .map_err(EngineError::InvalidInput)?;
+        self.schedule();
+        Ok(())
+    }
     /// Удаляет торрент; при `delete_files` чистит скачанные файлы в каталоге.
     pub async fn remove(&self, id: u64, delete_files: bool) -> Result<(), EngineError> {
         self.ensure_background();

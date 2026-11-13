@@ -1144,3 +1144,54 @@ BEP 3), `tracker::tests::is_usable_peer_rejects_unusable_addresses`,
 `settings::tests::load_migrates_legacy_peer_default` и
 `load_keeps_explicit_peer_limit`. Гейты: `cargo clippy --workspace --all-targets
 -- -D warnings` и `cargo fmt --all -- --check` — чисто.
+## Быстрое возобновление (1.8.1)
+
+Контракт вырос двумя ручками и одним типом — всё аддитивно.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeData {
+    /// Число кусков — защита от применения карты чужого торрента.
+    pub piece_count: u32,
+    /// Размер куска из метаданных.
+    pub piece_length: u32,
+    /// Битовая карта проверенных кусков (старший бит — кусок 0).
+    pub pieces: Vec<u8>,
+}
+
+impl TorrentManager {
+    /// Карта проверенных кусков. `Err(NotReady)` — нет метаданных (magnet) или
+    /// рантайма (торрент ещё ни разу не запускался).
+    pub fn resume_data(&self, id: u64) -> Result<ResumeData, EngineError>;
+
+    /// Применяет карту, не читая диск. `InvalidInput` — карта от другого
+    /// торрента (другие `piece_count`/`piece_length`) или повреждена (длина
+    /// `pieces` не равна `piece_count.div_ceil(8)`).
+    pub fn apply_resume(&self, id: u64, data: &ResumeData) -> Result<(), EngineError>;
+}
+```
+
+Поведение `apply_resume`:
+
+* обмен с пирами на время вызова останавливается; недоделанные буферы кусков и
+  очередь кандидатов выбрасываются — карта заменяет их целиком;
+* `pieces_have` и `have_bytes` пересчитываются по карте, поэтому `progress`,
+  `remaining_bytes` и `left` у трекера сразу становятся правдой;
+* состояние выбирается по факту: всё на месте — `Seeding` (или `Completed` при
+  `seed_after_complete = false`), иначе `Downloading`; пользовательская пауза
+  сильнее и оставляет `Paused`;
+* файлы открываются на запись только для `Downloading`, иначе отпускаются;
+* диска функция не касается: решение «верить карте или проверять SHA-1»
+  принимает вызывающая сторона. В приложении это делает Tauri-слой: сравнивает
+  размер и mtime каждого файла с сохранёнными отпечатками и при расхождении
+  вызывает [`TorrentManager::recheck`].
+
+Ограничения:
+
+* `resume_data` требует живого рантайма: у торрента, который ещё ни разу не
+  запускался, карты нет — после перезапуска он проверится хэшами;
+* карта не хранит время проверки кусков и историю: изменение файла с сохранением
+  размера и mtime (например, `SetFileTime`) движок не заметит — полную гарантию
+  даёт только `recheck`;
+* `apply_resume` не рассылает `Have` пирам: вызов рассчитан на момент
+  восстановления, когда соединений ещё нет.

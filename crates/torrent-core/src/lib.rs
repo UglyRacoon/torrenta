@@ -37,8 +37,8 @@ pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeErr
 pub use bitfield::Bitfield;
 pub use engine::{
     AddOptions, AddSource, Diagnostics, EngineConfig, EngineError, EngineEvent, FilePriority,
-    FileView, GlobalTotals, PreviewFile, TorrentManager, TorrentPreview, TorrentSnapshot,
-    TorrentState,
+    FileView, GlobalTotals, PreviewFile, ResumeData, TorrentManager, TorrentPreview,
+    TorrentSnapshot, TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};
 pub use metainfo::{FileEntry, InfoHash, Metainfo, MetainfoError};
