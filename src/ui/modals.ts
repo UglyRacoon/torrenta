@@ -2,6 +2,7 @@ import { requireEngineApi } from "../api/engine";
 import type {
   AddOptions,
   AssociationDto,
+  ContentLayout,
   SettingsDto,
   TorrentPreview,
   TorrentSource,
@@ -10,8 +11,7 @@ import type {
 } from "../api/types";
 import { SPEED_STEPS } from "../api/types";
 import { fmtBytes, basename } from "../lib/format";
-import { torrentTargetPath } from "../lib/paths";
-import { loadRecentDirs, rememberDownloadDir } from "../lib/recent-dirs";
+import { torrentFolderName } from "../lib/paths";
 import { h, messageOf, setAttr, setText, toggleClass } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { createSelect, type SelectOption } from "./select";
@@ -19,8 +19,16 @@ import { createSelect, type SelectOption } from "./select";
 export interface AddRequest {
   /** Готовый источник (файл/магнит); `null` — диалог начинается с выбора источника. */
   source: TorrentSource | null;
-  /** Каталог загрузки по умолчанию (из настроек). */
+  /** Каталог в поле: последний использованный или каталог по умолчанию. */
   savePath: string;
+  /** История каталогов из настроек, последний — первым. */
+  history: string[];
+  /** Сколько путей помнить (0 — история выключена). */
+  historyLength: number;
+  /** Раскладка файлов по умолчанию из настроек. */
+  contentLayout: ContentLayout;
+  /** Подставлять последний каталог вместо каталога по умолчанию. */
+  rememberLastSavePath: boolean;
 }
 
 export interface AddHandlers {
@@ -411,30 +419,30 @@ export function createModalHost(root: HTMLElement): ModalHost {
 
     let source = request.source;
     let preview: TorrentPreview | null = null;
-    let folder = request.savePath;
     let token = 0;
     let submitBtn: HTMLButtonElement | null = null;
     const selected = new Set<number>();
 
     const errorEl = formError();
 
-    // --- Каталог загрузки: базовый каталог + папка торрента + история ---
+    // --- Каталог загрузки и раскладка файлов (1.10) ---
     //
-    // В поле показывается итоговый путь: каталог загрузки плюс папка с именем
-    // раздачи (когда файлов несколько). История хранит именно базовые каталоги,
-    // а не итоговые пути с папкой торрента — иначе список забивался бы
-    // одноразовыми именами раздач.
-    let baseDir = request.savePath;
-    /** Пользователь правил путь руками — тогда автопапку не подставляем. */
-    let manualPath = false;
-    let recentDirs = loadRecentDirs();
+    // Как в qBittorrent: поле «Папка загрузки» — это базовый каталог, в который
+    // попадают файлы, а куда именно внутри него, решает раскладка («как в
+    // раздаче», «создавать папку», «без папки»). История хранит базовые
+    // каталоги из настроек: последний — первым, повтор перемещает запись в
+    // начало, а не создаёт дубль (`AddNewTorrentDialog::updatePathHistory`).
+    let saveDir = request.savePath;
+    let layout: ContentLayout = request.contentLayout;
+    let rememberLast = request.rememberLastSavePath;
+    let historyDirs = request.history.slice();
     let hideRecentTimer = 0;
 
     const dirInput = h("input", {
       class: "input",
       attrs: {
         type: "text",
-        value: folder,
+        value: saveDir,
         spellcheck: "false",
         autocomplete: "off",
         "aria-label": "Папка загрузки",
@@ -448,27 +456,26 @@ export function createModalHost(root: HTMLElement): ModalHost {
     recentList.hidden = true;
     const combo = h("div", { class: "combo" }, dirInput, recentList);
 
-    /** Итоговый путь по текущему превью и базовому каталогу. */
-    function applyTarget(): void {
-      if (manualPath) {
-        return;
-      }
-      folder = torrentTargetPath(baseDir, preview?.name ?? "", preview?.files.length ?? 0);
-      dirInput.value = folder;
-    }
-
     function hideRecent(): void {
       recentList.hidden = true;
+    }
+
+    function chooseDir(dir: string): void {
+      saveDir = dir;
+      dirInput.value = dir;
+      hideRecent();
+      updateHint();
+      showError(errorEl, null);
     }
 
     function showRecent(): void {
       window.clearTimeout(hideRecentTimer);
       recentList.replaceChildren();
-      if (recentDirs.length === 0) {
+      if (historyDirs.length === 0) {
         hideRecent();
         return;
       }
-      for (const dir of recentDirs) {
+      for (const dir of historyDirs) {
         const item = h(
           "li",
           { class: "combo__item", attrs: { role: "option", tabindex: "-1" } },
@@ -477,11 +484,11 @@ export function createModalHost(root: HTMLElement): ModalHost {
         // Не даём полю потерять фокус до выбора: иначе список закроется раньше
         // клика (mousedown по умолчанию переводит фокус).
         item.addEventListener("mousedown", (event) => event.preventDefault());
-        item.addEventListener("click", () => chooseBaseDir(dir));
+        item.addEventListener("click", () => chooseDir(dir));
         item.addEventListener("keydown", (event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            chooseBaseDir(dir);
+            chooseDir(dir);
           }
         });
         recentList.append(item);
@@ -489,17 +496,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
       recentList.hidden = false;
     }
 
-    function chooseBaseDir(dir: string): void {
-      baseDir = dir;
-      manualPath = false;
-      hideRecent();
-      applyTarget();
-      showError(errorEl, null);
-    }
-
     dirInput.addEventListener("input", () => {
-      manualPath = true;
-      folder = dirInput.value;
+      saveDir = dirInput.value;
+      updateHint();
       showError(errorEl, null);
     });
     dirInput.addEventListener("focus", () => showRecent());
@@ -542,7 +541,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
         .onBrowseDir()
         .then((picked) => {
           if (picked) {
-            chooseBaseDir(picked);
+            chooseDir(picked);
           }
         })
         .catch((reason: unknown) => showError(errorEl, messageOf(reason)))
@@ -551,16 +550,92 @@ export function createModalHost(root: HTMLElement): ModalHost {
         });
     });
     const dirRow = h("div", { class: "field__row" }, combo, browseBtn);
+
+    // Раскладка файлов — тот же выбор, что в qBittorrent: «Original»,
+    // «Subfolder», «NoSubfolder». Значение по умолчанию приходит из настроек.
+    const layoutSelect = createSelect({
+      label: "Раскладка файлов",
+      options: [
+        { value: "original", label: "Как в раздаче" },
+        { value: "subfolder", label: "Создавать папку" },
+        { value: "no_subfolder", label: "Без папки" },
+      ],
+      value: layout,
+      onChange: (value) => {
+        layout = value as ContentLayout;
+        updateHint();
+      },
+      className: "select--field",
+    });
+    modal.onClose(() => layoutSelect.destroy());
+
+    const rememberRow = checkboxRow(
+      "Запоминать последний путь",
+      "Следующее окно добавления откроется с этим каталогом, а не с каталогом по умолчанию.",
+      rememberLast,
+    );
+    rememberRow.input.addEventListener("change", () => {
+      rememberLast = rememberRow.input.checked;
+    });
+
+    /** Добавляет каталог в историю: повтор поднимает запись наверх (1.10). */
+    function rememberDir(dirs: string[], dir: string, limit: number): string[] {
+      if (dir === "" || limit === 0) {
+        return dirs;
+      }
+      const lowered = dir.toLowerCase();
+      const next = dirs.filter((entry) => entry.toLowerCase() !== lowered);
+      next.unshift(dir);
+      return next.slice(0, limit);
+    }
+
+    /** Имя файла без последнего расширения. */
+    function stemOf(name: string): string {
+      const dot = name.lastIndexOf(".");
+      return dot > 0 ? name.slice(0, dot) : name;
+    }
+
+    /** Что произойдёт с файлами при текущей раскладке — человеческим языком. */
+    function hintText(): string {
+      const name = preview?.name?.trim() ?? "";
+      const files = preview?.files.length ?? 0;
+      if (name === "" || files === 0) {
+        return "Файлы попадут в выбранный каталог; папку раздачи добавит движок.";
+      }
+      if (layout === "no_subfolder") {
+        return "Файлы лягут прямо в каталог загрузки, без корневой папки.";
+      }
+      if (layout === "subfolder" || files > 1) {
+        const folderName = layout === "subfolder" && files === 1 ? stemOf(name) : name;
+        return `Файлы попадут в папку «${torrentFolderName(folderName)}» внутри каталога загрузки.`;
+      }
+      return "Один файл ляжет прямо в каталог загрузки.";
+    }
+
+    const hintEl = h("span", { class: "field__hint" });
+    function updateHint(): void {
+      setText(hintEl, hintText());
+    }
+    updateHint();
+
     const folderField = (): HTMLElement =>
       h(
         "div",
-        { class: "field" },
-        h("span", { class: "field__label", text: "Папка загрузки" }),
-        dirRow,
-        h("span", {
-          class: "field__hint",
-          text: "Недавние каталоги — в списке поля. Папка с именем раздачи добавляется сама.",
-        }),
+        { class: "add-path" },
+        h(
+          "div",
+          { class: "field" },
+          h("span", { class: "field__label", text: "Папка загрузки" }),
+          dirRow,
+          hintEl,
+        ),
+        h(
+          "div",
+          { class: "field" },
+          h("span", { class: "field__label", text: "Раскладка файлов" }),
+          layoutSelect.element,
+        ),
+        rememberRow.row,
       );
 
     function setFooter(...nodes: HTMLElement[]): void {
@@ -707,9 +782,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
         return;
       }
       fit();
-      // Название и число файлов известны только теперь: подставляем папку
-      // раздачи, если пользователь не правил путь вручную.
-      applyTarget();
+      // Название и число файлов известны только теперь: подсказка про папку
+      // раздачи зависит от раскладки и становится точной.
+      updateHint();
       selected.clear();
       for (const file of preview.files) {
         selected.add(file.index);
@@ -842,7 +917,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
     function renderFallback(reason: string): void {
       fit();
       // Метаданных нет — имени раздачи тоже нет, поэтому папку не придумываем.
-      applyTarget();
+      updateHint();
       submitBtn = null;
       const download = button("Скачать всё равно", "btn--primary");
       const retry = button("Повторить", "btn--ghost");
@@ -916,18 +991,23 @@ export function createModalHost(root: HTMLElement): ModalHost {
         }
         files = Array.from(selected).sort((left, right) => left - right);
       }
-      const trimmed = folder.trim();
-      const options: AddOptions = { savePath: trimmed === "" ? null : trimmed, files };
+      const trimmed = saveDir.trim();
+      const options: AddOptions = {
+        savePath: trimmed === "" ? null : trimmed,
+        files,
+        contentLayout: layout,
+        rememberLastSavePath: rememberLast,
+      };
       const submit = submitBtn;
       if (!submit) {
         return;
       }
-      const rememberAs = manualPath ? folder.trim() : baseDir.trim();
       run(modal, submit, errorEl, () =>
         handlers.onAdd(source as TorrentSource, options).then(() => {
-          // В историю — именно базовый каталог: папка с именем раздачи
-          // создаётся автоматически и не должна копиться в списке.
-          recentDirs = rememberDownloadDir(rememberAs);
+          // Настройки (история и флаг «запоминать путь») обновляет движок при
+          // добавлении; здесь список правим только для этого же окна — если
+          // пользователь откроет его повторно, история будет актуальной.
+          historyDirs = rememberDir(historyDirs, trimmed, request.historyLength);
         }),
       );
     }
@@ -1117,6 +1197,28 @@ export function createModalHost(root: HTMLElement): ModalHost {
       "При появлении новой версии в сайдбаре загорится значок «Обновление» — установку запускает пользователь.",
       settings.auto_update ?? true,
     );
+    // 1.10: раскладка файлов и длина истории каталогов — как в qBittorrent
+    // (Preferences: «Torrent content layout», «Save path history length»).
+    let chosenLayout: ContentLayout = settings.content_layout ?? "original";
+    const layoutSelect = createSelect({
+      label: "Раскладка файлов новых торрентов",
+      options: [
+        { value: "original", label: "Как в раздаче" },
+        { value: "subfolder", label: "Создавать папку" },
+        { value: "no_subfolder", label: "Без папки" },
+      ],
+      value: chosenLayout,
+      onChange: (value) => {
+        chosenLayout = value as ContentLayout;
+        showError(errorEl, null);
+      },
+    });
+    selects.push(layoutSelect);
+    const historyLength = numberInput(settings.save_path_history_length ?? 10, {
+      min: "0",
+      max: "99",
+      step: "1",
+    });
     const behaviorGroup = h(
       "div",
       { class: "field" },
@@ -1125,6 +1227,16 @@ export function createModalHost(root: HTMLElement): ModalHost {
       notify.row,
       sequential.row,
       autoUpdate.row,
+      h(
+        "div",
+        { class: "field-row" },
+        field("Раскладка файлов новых торрентов", layoutSelect.element),
+        field("Сколько каталогов помнить", historyLength),
+      ),
+      h("p", {
+        class: "field__hint",
+        text: "Раскладка определяет, появится ли папка с именем раздачи. История каталогов — подсказки в поле «Папка загрузки»: 0 выключает их, максимум 99.",
+      }),
     );
 
     // 1.7 (баг-репорт): ассоциация .torrent — переключатель, живая строка состояния

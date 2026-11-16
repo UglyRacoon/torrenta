@@ -36,8 +36,8 @@ pub mod wire;
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};
 pub use bitfield::Bitfield;
 pub use engine::{
-    AddOptions, AddSource, Diagnostics, EngineConfig, EngineError, EngineEvent, FilePriority,
-    FileView, GlobalTotals, PreviewFile, ResumeData, TorrentManager, TorrentPreview,
+    AddOptions, AddSource, ContentLayout, Diagnostics, EngineConfig, EngineError, EngineEvent,
+    FilePriority, FileView, GlobalTotals, PreviewFile, ResumeData, TorrentManager, TorrentPreview,
     TorrentSnapshot, TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};

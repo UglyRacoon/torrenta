@@ -146,6 +146,13 @@ pub struct SessionEntry {
     /// Локальный лимит отдачи, КиБ/с (`0` — без ограничения).
     #[serde(default)]
     pub up_limit_kib: u32,
+    /// Раскладка файлов, выбранная при добавлении (с 1.10).
+    ///
+    /// Без неё восстановление искало бы файлы не там: например, торрент,
+    /// добавленный с «без папки», после перезапуска ожидал бы папку раздачи.
+    /// Старые `session.json` читаются как `Original`.
+    #[serde(default)]
+    pub content_layout: torrent_core::ContentLayout,
     /// Карта проверенных кусков и отпечатки файлов (с 1.8.1).
     ///
     /// `None` — данных нет (старый `session.json`, метаданные не получены,
@@ -834,6 +841,7 @@ impl SessionRegistry {
 
     /// Одна запись сессии; `None` — торрент восстановить не получится.
     fn entry_for(&self, torrent: &TorrentSnapshot) -> Option<SessionEntry> {
+        let content_layout = torrent.content_layout;
         let source = match self.origin(torrent.id) {
             Some(source) => source,
             None => {
@@ -872,6 +880,7 @@ impl SessionRegistry {
             source,
             save_path: torrent.save_path.clone(),
             paused: torrent.state == TorrentState::Paused,
+            content_layout,
             selected_files,
             priorities,
             down_limit_kib: torrent.down_limit_kib,
@@ -955,6 +964,7 @@ async fn apply_restore_action(
             let opts = AddOptions {
                 save_path: restore_save_path(&entry),
                 files: restore_files(&entry),
+                content_layout: Some(entry.content_layout),
             };
             let id = engine
                 .manager
@@ -987,6 +997,7 @@ async fn apply_restore_action(
             let opts = AddOptions {
                 save_path: restore_save_path(&entry),
                 files: restore_files(&entry),
+                content_layout: Some(entry.content_layout),
             };
             let id = engine
                 .manager
@@ -1127,6 +1138,7 @@ mod tests {
         };
         TorrentSnapshot {
             id: 1,
+            content_layout: torrent_core::ContentLayout::Original,
             name: "resume".to_string(),
             info_hash: hash('a'),
             state: TorrentState::Downloading,
@@ -1269,6 +1281,7 @@ mod tests {
                 file: torrent_data_name(info_hash).unwrap_or_default(),
             },
             save_path: "C:\\Загрузки".to_string(),
+            content_layout: torrent_core::ContentLayout::Original,
             paused: false,
             selected_files: Vec::new(),
             priorities: Vec::new(),
@@ -1300,6 +1313,7 @@ mod tests {
     fn snapshot(id: u64, info_hash: &str, state: TorrentState) -> TorrentSnapshot {
         TorrentSnapshot {
             id,
+            content_layout: torrent_core::ContentLayout::Original,
             name: "Тестовый торрент".to_string(),
             info_hash: info_hash.to_string(),
             state,

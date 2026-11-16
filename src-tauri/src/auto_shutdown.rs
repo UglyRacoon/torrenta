@@ -212,6 +212,7 @@ mod tests {
     fn snapshot(state: TorrentState) -> TorrentSnapshot {
         TorrentSnapshot {
             id: 1,
+            content_layout: torrent_core::ContentLayout::Original,
             name: "torrent".to_string(),
             info_hash: "0123456789abcdef".to_string(),
             state,

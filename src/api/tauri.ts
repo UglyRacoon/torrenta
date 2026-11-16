@@ -56,6 +56,8 @@ export async function createTauriApi(): Promise<EngineApi> {
         source: sourceOf(source),
         savePath: options.savePath,
         files: options.files,
+        contentLayout: options.contentLayout,
+        rememberLastSavePath: options.rememberLastSavePath,
       });
       return { id, name: nameOf(source) };
     },

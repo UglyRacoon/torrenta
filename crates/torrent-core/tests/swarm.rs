@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{wait_for, Corruption, MockSeeder, MockTracker, Sample, TrackerReply, PIECE_LENGTH};
-use torrent_core::{EngineConfig, TorrentManager, TorrentState};
+use torrent_core::{ContentLayout, EngineConfig, TorrentManager, TorrentState};
 
 /// Конфиг движка для теста: свой каталог загрузки, случайный порт прослушки.
 fn test_config(download_dir: &Path) -> EngineConfig {
@@ -28,6 +28,9 @@ fn test_config(download_dir: &Path) -> EngineConfig {
         listen_port: 0,
         // DHT ходит в настоящую сеть — в тестах он не нужен и только шумит.
         dht: false,
+        // Тесты сверяют файлы прямо в каталоге загрузки, поэтому корневую
+        // папку раздачи отключаем: раскладка проверяется отдельно (layout.rs).
+        content_layout: ContentLayout::NoSubfolder,
         ..EngineConfig::default()
     }
 }

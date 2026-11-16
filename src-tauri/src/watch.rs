@@ -224,6 +224,7 @@ async fn add_from_file(
                 // Каталог по умолчанию берётся из настроек движка.
                 save_path: None,
                 files: None,
+                content_layout: None,
             },
         )
         .await

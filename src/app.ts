@@ -146,14 +146,30 @@ export function mountApp(): void {
   // --- Добавление торрентов (контракт 4.1) --------------------------------
 
   async function openAdd(source: TorrentSource | null = null): Promise<void> {
-    let savePath = "";
+    // Настройки дают три вещи: каталог по умолчанию (или последний
+    // использованный), историю поля и раскладку файлов — как в qBittorrent.
+    let settings: SettingsDto | null = null;
     try {
-      savePath = (await api().getSettings()).download_dir;
+      settings = await api().getSettings();
     } catch {
-      // Каталог неизвестен — движок возьмёт значение по умолчанию.
+      // Настройки недоступны — движок возьмёт значения по умолчанию.
     }
+    const history = settings?.save_path_history ?? [];
+    const savePath =
+      settings === null
+        ? ""
+        : settings.remember_last_save_path && history.length > 0
+          ? history[0] ?? ""
+          : settings.download_dir;
     modals.openAdd(
-      { source, savePath },
+      {
+        source,
+        savePath,
+        history,
+        historyLength: settings?.save_path_history_length ?? 10,
+        contentLayout: settings?.content_layout ?? "original",
+        rememberLastSavePath: settings?.remember_last_save_path ?? false,
+      },
       {
         onPreview: (src) => api().preview(src),
         onAdd: async (src, options) => {
@@ -191,7 +207,12 @@ export function mountApp(): void {
     const problems: string[] = [];
     for (const source of sources) {
       try {
-        await api().addTorrent(source, { savePath: null, files: null });
+        await api().addTorrent(source, {
+          savePath: null,
+          files: null,
+          contentLayout: "original",
+          rememberLastSavePath: false,
+        });
         added += 1;
       } catch (reason) {
         problems.push(messageOf(reason));

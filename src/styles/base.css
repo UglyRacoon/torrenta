@@ -468,11 +468,8 @@ a:hover {
 }
 
 .combo__list {
-  position: absolute;
-  z-index: 40;
-  top: calc(100% + 4px);
-  right: 0;
-  left: 0;
+  /* Список разворачивается в потоке, а не поверх полей: всплывающий список
+     перекрывал раскладку файлов и «съедал» клик по ней (1.9). */
   max-height: 232px;
   overflow-y: auto;
   margin: 0;

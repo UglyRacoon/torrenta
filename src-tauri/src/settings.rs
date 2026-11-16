@@ -14,7 +14,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use torrent_core::EngineConfig;
+use torrent_core::{ContentLayout, EngineConfig};
 
 /// Имя файла настроек в каталоге конфигурации приложения.
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -35,6 +35,12 @@ pub const DEFAULT_MAX_PEERS: u32 = 200;
 pub const LEGACY_DEFAULT_MAX_PEERS: u32 = 50;
 /// Верхняя граница числа пиров на торрент.
 pub const MAX_PEERS_LIMIT: u32 = 500;
+/// Сколько путей хранит история «Папка загрузки» по умолчанию.
+///
+/// Как у qBittorrent: значение настраивается, по умолчанию 10, предел 99.
+pub const DEFAULT_SAVE_PATH_HISTORY_LENGTH: u32 = 10;
+/// Верхняя граница длины истории путей.
+pub const MAX_SAVE_PATH_HISTORY_LENGTH: u32 = 99;
 /// Верхняя граница одновременно активных загрузок и раздач.
 ///
 /// `0` означает «без ограничения» и тоже допустим — зажимается только верх.
@@ -167,6 +173,18 @@ pub struct SettingsDto {
     /// показывает значок, а установку запускает пользователь. `false` отключает
     /// и фоновую проверку, и значок (ручная проверка в «Диагностике» остаётся).
     pub auto_update: bool,
+    /// Раскладка файлов новых торрентов (1.10): как в qBittorrent.
+    pub content_layout: ContentLayout,
+    /// История каталогов загрузки для диалога добавления (1.10).
+    ///
+    /// Хранится именно базовый каталог загрузки (тот, что выбирает пользователь),
+    /// без папки раздачи: qBittorrent делает так же (`AddNewTorrentDialog/
+    /// SavePathHistory`). Первым идёт последний использованный каталог.
+    pub save_path_history: Vec<String>,
+    /// Сколько путей помнить (0 — история выключена, максимум 99).
+    pub save_path_history_length: u32,
+    /// Подставлять последний каталог вместо каталога загрузки по умолчанию.
+    pub remember_last_save_path: bool,
     /// Запускать приложение сразу в трее, не показывая окно.
     ///
     /// Настройка действует только на старте: если окно не показано, его можно
@@ -272,6 +290,10 @@ impl Default for SettingsDto {
             // файлы открывались бы старым (несуществующим) exe.
             associate_files: true,
             auto_update: true,
+            content_layout: ContentLayout::Original,
+            save_path_history: Vec::new(),
+            save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
+            remember_last_save_path: false,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -308,6 +330,10 @@ impl SettingsDto {
         // `dht_port` и `seed_time_limit_min` зажимать не нужно: их типы (`u16`
         // и `u32`) и есть допустимый диапазон, а `0` — законное «без значения».
         self.theme = normalize_theme(&self.theme);
+        self.save_path_history_length = self
+            .save_path_history_length
+            .min(MAX_SAVE_PATH_HISTORY_LENGTH);
+        self.normalize_save_path_history();
         // Расписание: границы окна — минуты внутри суток, лимиты — те же, что у
         // обычных (1 ГиБ/с), а окно нулевой длины расписанием не считается.
         self.schedule_from_min %= MINUTES_PER_DAY;
@@ -323,6 +349,50 @@ impl SettingsDto {
     pub fn normalized(mut self) -> Self {
         self.normalize();
         self
+    }
+
+    /// Приводит историю каталогов в порядок: обрезает пробелы, убирает пустые
+    /// записи и повторы (без учёта регистра), ограничивает длину.
+    fn normalize_save_path_history(&mut self) {
+        let limit = self.save_path_history_length as usize;
+        let mut seen: Vec<String> = Vec::with_capacity(self.save_path_history.len());
+        let mut cleaned: Vec<String> = Vec::new();
+        for entry in self.save_path_history.drain(..) {
+            let trimmed = entry.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lowered = trimmed.to_lowercase();
+            if seen.contains(&lowered) {
+                continue;
+            }
+            seen.push(lowered);
+            cleaned.push(trimmed);
+            if limit > 0 && cleaned.len() >= limit {
+                break;
+            }
+        }
+        if limit == 0 {
+            cleaned.clear();
+        }
+        self.save_path_history = cleaned;
+    }
+
+    /// Запоминает каталог загрузки в истории: последний — первым.
+    ///
+    /// Повторное использование каталога перемещает его в начало, а не создаёт
+    /// дубль, — так же поступает qBittorrent в `updatePathHistory`.
+    pub fn remember_save_path(&mut self, path: &str) -> bool {
+        let trimmed = path.trim();
+        if trimmed.is_empty() || self.save_path_history_length == 0 {
+            return false;
+        }
+        let before = self.save_path_history.clone();
+        self.save_path_history
+            .retain(|entry| !entry.eq_ignore_ascii_case(trimmed));
+        self.save_path_history.insert(0, trimmed.to_string());
+        self.normalize();
+        self.save_path_history != before
     }
 
     /// Абсолютный путь каталога загрузки (для работы с файловой системой).
@@ -501,6 +571,7 @@ pub fn prepare_watch_dir(raw: &str) -> Result<(), String> {
 pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
     EngineConfig {
         download_dir: dto.download_path(),
+        content_layout: dto.content_layout,
         max_peers_per_torrent: dto.max_peers as usize,
         download_limit_kib: dto.download_limit_kib,
         upload_limit_kib: dto.upload_limit_kib,
@@ -572,6 +643,10 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         max_active_seeds: clamp_active(
             u32::try_from(config.max_active_seeds).unwrap_or(MAX_ACTIVE_LIMIT),
         ),
+        content_layout: config.content_layout,
+        save_path_history: Vec::new(),
+        save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
+        remember_last_save_path: false,
         auto_shutdown,
         autostart: false,
         // Привязка `.torrent` не входит в `EngineConfig`: управляет ею реестр,
@@ -779,7 +854,7 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use torrent_core::EngineConfig;
+    use torrent_core::{ContentLayout, EngineConfig};
 
     /// Уникальный временный каталог для одного теста.
     fn test_dir(tag: &str) -> PathBuf {
@@ -826,6 +901,10 @@ mod tests {
             autostart: true,
             associate_files: true,
             auto_update: true,
+            content_layout: ContentLayout::Original,
+            save_path_history: Vec::new(),
+            save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
+            remember_last_save_path: false,
             start_minimized: true,
             close_to_tray: true,
             notify_on_complete: false,
@@ -896,6 +975,10 @@ mod tests {
             autostart: false,
             associate_files: true,
             auto_update: true,
+            content_layout: ContentLayout::Original,
+            save_path_history: Vec::new(),
+            save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
+            remember_last_save_path: false,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -1636,6 +1719,53 @@ mod tests {
     }
 
     #[test]
+    fn history_keeps_last_paths_without_duplicates() {
+        let mut settings = SettingsDto {
+            save_path_history_length: 3,
+            ..SettingsDto::default()
+        };
+        assert!(settings.remember_save_path("C:\\Загрузки"));
+        assert!(settings.remember_save_path("D:\\Фильмы"));
+        // Повтор поднимает запись наверх, а не создаёт дубль.
+        assert!(settings.remember_save_path("C:\\Загрузки"));
+        assert_eq!(
+            settings.save_path_history,
+            vec!["C:\\Загрузки", "D:\\Фильмы"]
+        );
+        settings.remember_save_path("E:\\Торренты");
+        settings.remember_save_path("F:\\Ещё");
+        // Длина ограничена, последний — первым.
+        assert_eq!(settings.save_path_history.len(), 3);
+        assert_eq!(settings.save_path_history[0], "F:\\Ещё");
+    }
+
+    #[test]
+    fn history_is_disabled_by_zero_length() {
+        let mut settings = SettingsDto {
+            save_path_history: vec!["C:\\Загрузки".to_string()],
+            save_path_history_length: 0,
+            ..SettingsDto::default()
+        };
+        settings.normalize();
+        assert!(settings.save_path_history.is_empty());
+        assert!(!settings.remember_save_path("D:\\Фильмы"));
+        assert!(settings.save_path_history.is_empty());
+    }
+
+    #[test]
+    fn engine_config_carries_content_layout() {
+        let settings = SettingsDto {
+            content_layout: ContentLayout::NoSubfolder,
+            ..SettingsDto::default()
+        };
+        let config = to_engine_config(&settings);
+        assert_eq!(config.content_layout, ContentLayout::NoSubfolder);
+        // Обратное преобразование тоже сохраняет раскладку.
+        let back = from_engine_config(&config, "dark", false);
+        assert_eq!(back.content_layout, ContentLayout::NoSubfolder);
+    }
+
+    #[test]
     fn serialized_settings_have_exactly_the_contract_keys() {
         // Контракт с фронтендом: JSON — плоский объект с snake_case-ключами и
         // без «лишних» полей (лишний ключ — повод для несовпадения версий).
@@ -1649,6 +1779,10 @@ mod tests {
             "auto_shutdown",
             "auto_update",
             "autostart",
+            "content_layout",
+            "remember_last_save_path",
+            "save_path_history",
+            "save_path_history_length",
             "associate_files",
             "close_to_tray",
             "dht",

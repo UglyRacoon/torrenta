@@ -4,6 +4,7 @@ import type {
   AppInfoDto,
   AppPayload,
   AssociationDto,
+  ContentLayout,
   AutoShutdownState,
   DiagnosticsDto,
   FilePriority,
@@ -518,6 +519,35 @@ function stateOf(torrent: TorrentSnapshot): TorrentState {
  * Демо-разбор источника: без сети, но с той же формой ответа, что у Rust.
  * Для магнита имя берётся из dn, для файла — из имени файла.
  */
+/**
+ * Раскладка путей файлов — та же логика, что в движке (1.10).
+ *
+ * Нужна демо-режиму, чтобы список файлов и подписи совпадали с настоящим
+ * поведением: `original` добавляет папку раздачи многофайловому торренту,
+ * `subfolder` — любому, `no_subfolder` не добавляет ничего.
+ */
+function layoutFiles(
+  name: string,
+  files: { path: string; length: number }[],
+  layout: ContentLayout,
+): { path: string; length: number }[] {
+  const multi = files.length > 1;
+  const root =
+    layout === "no_subfolder"
+      ? ""
+      : layout === "subfolder"
+        ? multi
+          ? name
+          : name.replace(/\.[^.]+$/, "")
+        : multi
+          ? name
+          : "";
+  if (root === "") {
+    return files;
+  }
+  return files.map((file) => ({ ...file, path: `${root}/${file.path}` }));
+}
+
 function previewOf(source: TorrentSource): TorrentPreview {
   if (source.kind === "magnet") {
     const link = source.link.trim();
@@ -604,7 +634,16 @@ export async function createMockApi(): Promise<EngineApi> {
     watch_dir: "",
     notify_on_complete: true,
     restore_session: true,
-  auto_update: true,
+    auto_update: true,
+    content_layout: "original",
+    // Демо-история: как будто пользователь уже выбирал каталоги.
+    save_path_history: [
+      "D:\\Фильмы",
+      "E:\\Торренты",
+      "C:\\Users\\Пользователь\\Downloads",
+    ],
+    save_path_history_length: 10,
+    remember_last_save_path: false,
     dht: true,
     pex: true,
     dht_port: 0,
@@ -1266,6 +1305,19 @@ export async function createMockApi(): Promise<EngineApi> {
         preview.trackers.length > 0
           ? preview.trackers
           : ["udp://tracker.opentrackr.org:1337/announce"];
+      // Демо повторяет поведение движка: история и флаг «запоминать путь»
+      // живут в настройках и обновляются при успешном добавлении.
+      const dir = (options.savePath ?? settings.download_dir).trim();
+      if (options.rememberLastSavePath) {
+        settings.remember_last_save_path = true;
+      }
+      if (dir !== "" && settings.save_path_history_length > 0) {
+        const lowered = dir.toLowerCase();
+        settings.save_path_history = [
+          dir,
+          ...settings.save_path_history.filter((entry) => entry.toLowerCase() !== lowered),
+        ].slice(0, settings.save_path_history_length);
+      }
       if (source.kind === "magnet") {
         return addSnapshot(preview.name, "metadata", 0, trackers, {
           savePath: options.savePath,
@@ -1275,10 +1327,10 @@ export async function createMockApi(): Promise<EngineApi> {
       }
       return addSnapshot(preview.name, "downloading", preview.total_bytes, trackers, {
         savePath: options.savePath,
-        files: options.files === null ? preview.files : preview.files.map((file) => ({
+        files: layoutFiles(preview.name, options.files === null ? preview.files : preview.files.map((file) => ({
           path: file.path,
           length: file.length,
-        })),
+        })), options.contentLayout),
         selected: options.files,
       });
     },
@@ -1685,6 +1737,27 @@ export async function createMockApi(): Promise<EngineApi> {
       // уже записанную привязку, как и бэкенд, демо-режим не снимает.
       settings.associate_files = next.associate_files !== false;
       settings.auto_update = next.auto_update !== false;
+      settings.content_layout =
+        next.content_layout === "subfolder" || next.content_layout === "no_subfolder"
+          ? next.content_layout
+          : "original";
+      settings.save_path_history_length = clamp(
+        Math.round(Number(next.save_path_history_length) || 0),
+        0,
+        99,
+      );
+      settings.remember_last_save_path = Boolean(next.remember_last_save_path);
+      settings.save_path_history = (Array.isArray(next.save_path_history)
+        ? next.save_path_history
+        : []
+      )
+        .map((entry) => String(entry).trim())
+        .filter(
+          (entry, index, list) =>
+            entry !== "" &&
+            list.findIndex((other) => other.toLowerCase() === entry.toLowerCase()) === index,
+        )
+        .slice(0, settings.save_path_history_length);
       settings.sequential = Boolean(next.sequential);
       settings.schedule_from_min = dayMinute(Number(next.schedule_from_min) || 0);
       settings.schedule_to_min = dayMinute(Number(next.schedule_to_min) || 0);

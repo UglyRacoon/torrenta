@@ -289,6 +289,38 @@ impl AppEngine {
         Ok(prepared)
     }
 
+    /// Запоминает каталог загрузки в истории диалога добавления (1.10).
+    ///
+    /// Как в qBittorrent (`AddNewTorrentDialog::updatePathHistory`): запись
+    /// добавляется при успешном добавлении торрента, повтор перемещает каталог
+    /// в начало. Сохраняем сразу — история должна переживать перезапуск, даже
+    /// если больше ничего в настройках не менялось. Ошибка записи не должна
+    /// ломать добавление, поэтому возвращается как `Err` для журнала.
+    pub fn remember_save_path(
+        &self,
+        path: &str,
+        remember_last: Option<bool>,
+    ) -> Result<SettingsDto, String> {
+        let mut next = self.settings();
+        let mut changed = next.remember_save_path(path);
+        if let Some(flag) = remember_last {
+            if next.remember_last_save_path != flag {
+                next.remember_last_save_path = flag;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(next);
+        }
+        let prepared = settings::prepare(next, &self.fallback_dir)?;
+        settings::save(&self.settings_path, &prepared)?;
+        match self.settings.write() {
+            Ok(mut guard) => *guard = prepared.clone(),
+            Err(poisoned) => *poisoned.into_inner() = prepared.clone(),
+        }
+        Ok(prepared)
+    }
+
     /// Текущее состояние автовыключения для фронтенда.
     pub fn auto_shutdown_dto(&self) -> AutoShutdownDto {
         AutoShutdownDto {
@@ -391,6 +423,7 @@ mod tests {
     fn torrent(id: u64, state: TorrentState) -> TorrentSnapshot {
         TorrentSnapshot {
             id,
+            content_layout: torrent_core::ContentLayout::Original,
             name: format!("torrent-{id}"),
             info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
             state,

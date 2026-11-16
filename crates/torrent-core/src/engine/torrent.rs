@@ -1937,9 +1937,17 @@ pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(),
             }
         }
     };
-    let storage = Storage::prepare(&handle.save_dir, &meta.info)
+    // Раскладка файлов (1.10): корневая папка раздачи добавляется или убирается
+    // здесь, до создания хранилища. Смещения и хэши кусков не меняются, поэтому
+    // проверка данных и раздача работают как раньше.
+    let paths = super::layout_paths(&meta.info.name, &meta.info.files, handle.content_layout);
+    let mut storage_info = meta.info.clone();
+    for (file, path) in storage_info.files.iter_mut().zip(paths.iter()) {
+        file.path = path.clone();
+    }
+    let storage = Storage::prepare(&handle.save_dir, &storage_info)
         .map_err(|err| format!("не удалось подготовить файлы: {err}"))?;
-    handle.stats.set_meta(&meta);
+    handle.stats.set_meta(&meta, &paths);
     *wr(&handle.selection) = selection.clone();
     handle.stats.set_selection(&selection);
     let runtime = Runtime::new(

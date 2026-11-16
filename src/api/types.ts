@@ -148,6 +148,14 @@ export interface SettingsDto {
   associate_files: boolean;
   /** Автоматически проверять обновления и показывать значок (1.9). */
   auto_update: boolean;
+  /** Раскладка файлов для новых торрентов (1.10). */
+  content_layout: ContentLayout;
+  /** История каталогов загрузки для диалога добавления (1.10). */
+  save_path_history: string[];
+  /** Сколько путей помнить (0 — история выключена, максимум 99). */
+  save_path_history_length: number;
+  /** Подставлять последний каталог вместо каталога по умолчанию. */
+  remember_last_save_path: boolean;
   /** Новые торренты качать последовательно — куски по порядку (1.7). */
   sequential: boolean;
   /** Расписание скорости включено (1.7). */
@@ -307,7 +315,20 @@ export interface AddOptions {
   savePath: string | null;
   /** Индексы выбранных файлов; null — все файлы. */
   files: number[] | null;
+  /** Раскладка файлов внутри каталога загрузки (1.10, как в qBittorrent). */
+  contentLayout: ContentLayout;
+  /** Запомнить путь как последний использованный. */
+  rememberLastSavePath: boolean;
 }
+
+/**
+ * Раскладка файлов торрента внутри каталога загрузки.
+ *
+ * Повторяет `TorrentContentLayout` из qBittorrent: `original` — как в раздаче
+ * (у многофайлового торрента есть папка с его именем), `subfolder` — всегда
+ * отдельная папка, `no_subfolder` — файлы лежат прямо в каталоге загрузки.
+ */
+export type ContentLayout = "original" | "subfolder" | "no_subfolder";
 
 export interface AddResult {
   id: number;

@@ -24,7 +24,8 @@ use common::{
     PIECE_LENGTH,
 };
 use torrent_core::{
-    AddOptions, EngineConfig, EngineError, EngineEvent, FilePriority, TorrentManager, TorrentState,
+    AddOptions, ContentLayout, EngineConfig, EngineError, EngineEvent, FilePriority,
+    TorrentManager, TorrentState,
 };
 
 /// Конфиг движка для теста: свой каталог загрузки, случайный порт прослушки.
@@ -548,7 +549,14 @@ async fn file_priorities_control_download_and_selection() {
     let manager = TorrentManager::new(test_config(&download_dir));
 
     let id = manager
-        .add_file_with(sample.torrent_bytes(&tracker.url()), AddOptions::default())
+        .add_file_with(
+            sample.torrent_bytes(&tracker.url()),
+            // Без корневой папки: тест про приоритеты, а не про раскладку.
+            AddOptions {
+                content_layout: Some(ContentLayout::NoSubfolder),
+                ..AddOptions::default()
+            },
+        )
         .await
         .expect("движок не принял корректный .torrent");
 

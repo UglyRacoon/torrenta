@@ -128,6 +128,16 @@ fn too_large(path: &Path, len: u64) -> String {
 /// Каталог создаётся заранее, чтобы движок не падал на записи в несуществующий
 /// путь; относительный путь отклоняется — иначе данные уедут в рабочий каталог
 /// процесса, который пользователь не выбирал.
+/// Пишет каталог в историю поля «Папка загрузки» (1.10).
+///
+/// Ошибка записи не влияет на добавление торрента: история — удобство, а не
+/// данные пользователя, поэтому она только попадает в журнал.
+fn remember_history(state: &AppEngine, dir: &Path, remember_last: Option<bool>) {
+    if let Err(err) = state.remember_save_path(&dir.to_string_lossy(), remember_last) {
+        eprintln!("[torrenta] не удалось обновить историю каталогов: {err}");
+    }
+}
+
 fn prepare_save_path(save_path: Option<String>) -> Result<Option<PathBuf>, String> {
     let Some(raw) = save_path else {
         return Ok(None);
@@ -212,10 +222,20 @@ pub async fn add_torrent(
     source: String,
     save_path: Option<String>,
     files: Option<Vec<usize>>,
+    content_layout: Option<torrent_core::ContentLayout>,
+    remember_last_save_path: Option<bool>,
 ) -> Result<u64, String> {
+    // Каталог фиксируем до добавления: он же уйдёт в историю поля «Папка
+    // загрузки». Для торрентов без явного пути это каталог загрузки по
+    // умолчанию — как в qBittorrent (`AddNewTorrentDialog::populateSavePaths`).
+    let prepared_path = prepare_save_path(save_path)?;
+    let history_dir = prepared_path
+        .clone()
+        .unwrap_or_else(|| state.manager.config().download_dir);
     let opts = AddOptions {
-        save_path: prepare_save_path(save_path)?,
+        save_path: prepared_path,
         files: normalize_files(files),
+        content_layout,
     };
 
     match classify_source(&source)? {
@@ -230,6 +250,7 @@ pub async fn add_torrent(
             if let Err(err) = session.register_file(id, &info_hash, &data) {
                 eprintln!("[torrenta] не удалось запомнить торрент в сессии (id {id}): {err}");
             }
+            remember_history(&state, &history_dir, remember_last_save_path);
             Ok(id)
         }
         TorrentSource::Magnet(link) => {
@@ -243,6 +264,7 @@ pub async fn add_torrent(
                     "[torrenta] не удалось запомнить magnet-ссылку в сессии (id {id}): {err}"
                 );
             }
+            remember_history(&state, &history_dir, remember_last_save_path);
             Ok(id)
         }
     }

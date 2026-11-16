@@ -486,7 +486,7 @@ pub struct Diagnostics {
 #[derive(Debug, Clone)] pub enum AddSource { File(Vec<u8>), Magnet(String) }
 /// Настройки добавления: папка и индексы выбранных файлов (`None` = все).
 #[derive(Debug, Clone, Default)]
-pub struct AddOptions { pub save_path: Option<PathBuf>, pub files: Option<Vec<usize>> }
+pub struct AddOptions { pub save_path: Option<PathBuf>, pub files: Option<Vec<usize>>, pub content_layout: Option<ContentLayout> }
 /// Файл в предпросмотре торрента до его добавления.
 #[derive(Debug, Clone, Serialize)] pub struct PreviewFile { pub index: usize, pub path: String, pub length: u64 }
 #[derive(Debug, Clone, Serialize)] pub struct TorrentPreview {
@@ -603,6 +603,28 @@ Tauri без новых полей читаются без миграции.
   новым `TorrentManager` в этом же процессе (используется в тестах).
 
 ## Выборочная загрузка, лимиты и предпросмотр (1.1)
+
+**Раскладка файлов (1.9).** `ContentLayout { Original, Subfolder, NoSubfolder }`
+повторяет `TorrentContentLayout` из qBittorrent. Пути из метаинформации движка не
+содержат корневой папки раздачи, поэтому:
+
+* `Original` — многофайловый торрент получает папку `<info.name>`, однофайловый
+  остаётся прямо в каталоге загрузки;
+* `Subfolder` — папка создаётся всегда (у однофайлового — по имени файла без
+  расширения);
+* `NoSubfolder` — корневой папки нет.
+
+Раскладка применяется в `TorrentManager` до создания `Storage`: пути
+пересчитывает `layout_paths(name, files, layout)` (публичная функция, годится для
+тестов), после чего те же пути попадают в `Storage::prepare` и в
+`TorrentSnapshot.files`. Смещения, хэши и проверка кусков не меняются. Имя
+корневой папки чистится `safe_folder_name`: запрещённые в Windows символы и
+управляющие байты заменяются пробелом, хвостовые точки/пробелы срезаются,
+зарезервированные имена (`CON`, `PRN`, …) получают суффикс `-torrent`. Значение
+по умолчанию берётся из `EngineConfig.content_layout` (`Original`).
+
+`TorrentSnapshot.content_layout` возвращает выбранную раскладку — по ней
+Tauri-слой восстанавливает торрент после перезапуска.
 
 **Выбор файлов.** `AddOptions.files` — индексы файлов в порядке `Metainfo`;
 `None` или пустой список означает «все файлы». Индексы вне диапазона и пустой

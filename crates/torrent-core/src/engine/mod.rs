@@ -31,7 +31,7 @@ use tokio::sync::broadcast;
 pub(crate) use torrent::{Env, SharedLimiters};
 
 use crate::magnet::Magnet;
-use crate::metainfo::{InfoHash, Metainfo};
+use crate::metainfo::{FileEntry, InfoHash, Metainfo};
 use crate::peerid;
 use crate::port_map::{MappingProtocol, PortMapping};
 pub(crate) use crate::selection::{effective_limit, Selection};
@@ -315,6 +315,8 @@ pub(crate) async fn read_exact_timeout<R: AsyncReadExt + Unpin>(
 pub struct EngineConfig {
     /// Каталог, куда по умолчанию сохраняются торренты.
     pub download_dir: PathBuf,
+    /// Раскладка файлов по умолчанию для новых торрентов (1.10).
+    pub content_layout: ContentLayout,
     /// Максимум подключённых пиров на торрент.
     ///
     /// qBittorrent по умолчанию держит до 500 соединений на торрент и до 2000
@@ -393,6 +395,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
             download_dir: default_download_dir(),
+            content_layout: ContentLayout::Original,
             max_peers_per_torrent: 200,
             download_limit_kib: 0,
             upload_limit_kib: 0,
@@ -499,6 +502,109 @@ pub enum FilePriority {
     High,
 }
 
+/// Раскладка файлов торрента внутри каталога загрузки.
+///
+/// Повторяет `TorrentContentLayout` из qBittorrent (см.
+/// `src/base/bittorrent/torrentcontentlayout.h`): порядок вариантов и смысл
+/// сохранены.
+///
+/// * [`ContentLayout::Original`] — как в раздаче: у многофайлового торрента есть
+///   корневая папка с именем раздачи, у однофайлового файл лежит прямо в
+///   каталоге загрузки;
+/// * [`ContentLayout::Subfolder`] — всегда отдельная папка: у многофайлового
+///   торрента имя раздачи, у однофайлового — имя файла без расширения;
+/// * [`ContentLayout::NoSubfolder`] — без корневой папки: файлы лежат прямо в
+///   каталоге загрузки, внутренние подпапки раздачи сохраняются.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentLayout {
+    /// Раскладка как в торренте (по умолчанию, как у qBittorrent).
+    #[default]
+    Original,
+    /// Всегда создавать папку под раздачу.
+    Subfolder,
+    /// Не создавать корневую папку.
+    NoSubfolder,
+}
+
+/// Раскладка относительных путей файлов торрента.
+///
+/// На вход идут пути из метаинформации (у многофайлового торрента они уже без
+/// корневой папки раздачи, у однофайлового — просто имя файла). Функция
+/// добавляет корневую папку или убирает её в соответствии с [`ContentLayout`].
+/// Сами байты на диске не меняются: пути нужны хранилищу и интерфейсу.
+pub fn layout_paths(name: &str, files: &[FileEntry], layout: ContentLayout) -> Vec<String> {
+    let multi = files.len() > 1;
+    let root: Option<String> = match layout {
+        ContentLayout::NoSubfolder => None,
+        ContentLayout::Original => multi.then(|| safe_folder_name(name)),
+        ContentLayout::Subfolder => Some(if multi {
+            safe_folder_name(name)
+        } else {
+            safe_folder_name(&file_stem(name))
+        }),
+    };
+    files
+        .iter()
+        .map(|file| match &root {
+            Some(root) if !root.is_empty() => format!("{root}/{}", file.path),
+            _ => file.path.clone(),
+        })
+        .collect()
+}
+
+/// Имя файла без последнего расширения (`movie.mkv` → `movie`).
+fn file_stem(name: &str) -> String {
+    match name.rfind('.') {
+        Some(index) if index > 0 => name[..index].to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Имя папки, допустимое в Windows.
+///
+/// qBittorrent прогоняет такие имена через `Utils::Fs::toValidFileSystemName`;
+/// здесь те же правила в минимальном виде: запрещённые символы и управляющие
+/// байты заменяются пробелом, повторы схлопываются, хвостовые точки и пробелы
+/// срезаются, зарезервированные имена (`CON`, `PRN`, …) получают суффикс.
+fn safe_folder_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_space = false;
+    for ch in name.chars() {
+        let bad =
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+        let ch = if bad { ' ' } else { ch };
+        if ch == ' ' {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        out.push(ch);
+    }
+    let mut cleaned = out.trim().trim_end_matches(['.', ' ']).trim().to_string();
+    if cleaned.chars().count() > 80 {
+        cleaned = cleaned.chars().take(80).collect::<String>();
+        cleaned = cleaned.trim_end_matches(['.', ' ']).trim().to_string();
+    }
+    if cleaned.is_empty() {
+        return "torrent".to_string();
+    }
+    let upper = cleaned.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0');
+    if reserved {
+        format!("{cleaned}-torrent")
+    } else {
+        cleaned
+    }
+}
+
 /// Файл внутри торрента.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileView {
@@ -569,6 +675,8 @@ pub struct TorrentSnapshot {
     /// Последовательная загрузка включена для этого торрента.
     pub sequential: bool,
     pub save_path: String,
+    /// Раскладка файлов, выбранная при добавлении (1.10).
+    pub content_layout: ContentLayout,
     pub added_at: i64,
     pub files: Vec<FileView>,
     pub trackers: Vec<String>,
@@ -670,6 +778,8 @@ pub struct AddOptions {
     pub save_path: Option<PathBuf>,
     /// Индексы выбранных файлов; `None` — все файлы.
     pub files: Option<Vec<usize>>,
+    /// Раскладка файлов; `None` — значение из [`EngineConfig`].
+    pub content_layout: Option<ContentLayout>,
 }
 
 /// Файл в предварительном просмотре торрента.
@@ -1019,7 +1129,7 @@ impl Stats {
     }
 
     /// Заполняет метаданные после разбора `.torrent`.
-    pub(crate) fn set_meta(&self, meta: &Metainfo) {
+    pub(crate) fn set_meta(&self, meta: &Metainfo, paths: &[String]) {
         *wr(&self.name) = meta.info.name.clone();
         self.total_bytes
             .store(meta.info.total_length, Ordering::Relaxed);
@@ -1033,8 +1143,14 @@ impl Stats {
             .info
             .files
             .iter()
-            .map(|file| FileView {
-                path: file.path.clone(),
+            .enumerate()
+            .map(|(index, file)| FileView {
+                // Путь берётся из раскладки (1.10): движок может добавить
+                // корневую папку раздачи или, наоборот, убрать её.
+                path: paths
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| file.path.clone()),
                 length: file.length,
                 downloaded: 0,
                 selected: true,
@@ -1292,6 +1408,8 @@ pub(crate) struct TorrentHandle {
     pub(crate) env: Env,
     pub(crate) added_at: i64,
     pub(crate) save_dir: PathBuf,
+    /// Раскладка файлов, выбранная при добавлении (1.10).
+    pub(crate) content_layout: ContentLayout,
     pub(crate) meta: RwLock<Option<Metainfo>>,
     pub(crate) runtime: Mutex<Option<Arc<torrent::Runtime>>>,
     /// Текущий выбор файлов (нужные куски).
@@ -1606,6 +1724,7 @@ impl TorrentHandle {
         TorrentSnapshot {
             id: self.id,
             name: rd(&self.stats.name).clone(),
+            content_layout: self.content_layout,
             info_hash: self.info_hash.to_hex(),
             state,
             error: rd(&self.stats.error).clone(),
@@ -1800,6 +1919,7 @@ impl TorrentManager {
             AddOptions {
                 save_path,
                 files: None,
+                content_layout: None,
             },
         )
         .await
@@ -1818,8 +1938,9 @@ impl TorrentManager {
             return Err(EngineError::Duplicate(hash.to_hex()));
         }
         let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
+        let layout = opts.content_layout.unwrap_or(self.config().content_layout);
         let name = meta.info.name.clone();
-        let handle = self.make_handle(hash, None, name.clone(), dir, TorrentState::Queued);
+        let handle = self.make_handle(hash, None, name.clone(), dir, TorrentState::Queued, layout);
         *wr(&handle.selection) = selection;
         self.push_handle(handle.clone())?;
         if let Err(message) = torrent::install(&handle, meta) {
@@ -1846,6 +1967,7 @@ impl TorrentManager {
             AddOptions {
                 save_path,
                 files: None,
+                content_layout: None,
             },
         )
         .await
@@ -1867,6 +1989,7 @@ impl TorrentManager {
             return Err(EngineError::Duplicate(hash.to_hex()));
         }
         let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
+        let layout = opts.content_layout.unwrap_or(self.config().content_layout);
         let name = magnet.display_name.clone().unwrap_or_else(|| hash.to_hex());
         let handle = self.make_handle(
             hash,
@@ -1874,6 +1997,7 @@ impl TorrentManager {
             name.clone(),
             dir,
             TorrentState::Metadata,
+            layout,
         );
         *lk(&handle.pending_files) = opts.files;
         self.push_handle(handle.clone())?;
@@ -2378,6 +2502,7 @@ impl TorrentManager {
         name: String,
         save_dir: PathBuf,
         state: TorrentState,
+        content_layout: ContentLayout,
     ) -> Arc<TorrentHandle> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let stats = Arc::new(Stats::new(name, state));
@@ -2405,6 +2530,7 @@ impl TorrentManager {
             },
             added_at: now_unix(),
             save_dir,
+            content_layout,
             meta: RwLock::new(None),
             runtime: Mutex::new(None),
             selection: RwLock::new(Selection::empty()),
@@ -2614,6 +2740,70 @@ async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(path: &str, length: u64, offset: u64) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            length,
+            offset,
+        }
+    }
+
+    #[test]
+    fn layout_original_matches_qbittorrent_semantics() {
+        // Многофайловый торрент: корневая папка с именем раздачи.
+        let files = [file("boot/a.bin", 10, 0), file("root/b.bin", 20, 10)];
+        assert_eq!(
+            layout_paths("Раздача", &files, ContentLayout::Original),
+            vec!["Раздача/boot/a.bin", "Раздача/root/b.bin"]
+        );
+        // Однофайловый: файл лежит прямо в каталоге загрузки.
+        let single = [file("movie.mkv", 100, 0)];
+        assert_eq!(
+            layout_paths("movie.mkv", &single, ContentLayout::Original),
+            vec!["movie.mkv"]
+        );
+    }
+
+    #[test]
+    fn layout_subfolder_always_creates_root() {
+        // Однофайловый: папка называется по имени файла без расширения.
+        let single = [file("movie.mkv", 100, 0)];
+        assert_eq!(
+            layout_paths("movie.mkv", &single, ContentLayout::Subfolder),
+            vec!["movie/movie.mkv"]
+        );
+        // Многофайловый: папка по имени раздачи, даже если внутри уже есть каталоги.
+        let files = [file("boot/a.bin", 10, 0), file("b.bin", 20, 10)];
+        assert_eq!(
+            layout_paths("Раздача", &files, ContentLayout::Subfolder),
+            vec!["Раздача/boot/a.bin", "Раздача/b.bin"]
+        );
+    }
+
+    #[test]
+    fn layout_no_subfolder_keeps_paths_as_is() {
+        let files = [file("boot/a.bin", 10, 0), file("b.bin", 20, 10)];
+        assert_eq!(
+            layout_paths("Раздача", &files, ContentLayout::NoSubfolder),
+            vec!["boot/a.bin", "b.bin"]
+        );
+    }
+
+    #[test]
+    fn layout_sanitizes_folder_name() {
+        let files = [file("a.bin", 1, 0), file("b.bin", 1, 1)];
+        // Запрещённые символы, хвостовая точка и лишние пробелы.
+        assert_eq!(
+            layout_paths("  Кино: сезон 1?. ", &files, ContentLayout::Subfolder)[0],
+            "Кино сезон 1/a.bin"
+        );
+        // Зарезервированное имя Windows получает суффикс.
+        assert_eq!(
+            layout_paths("CON", &files, ContentLayout::Original)[0],
+            "CON-torrent/a.bin"
+        );
+    }
 
     #[test]
     fn config_is_sanitized() {

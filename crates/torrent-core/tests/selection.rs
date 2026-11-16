@@ -86,6 +86,7 @@ async fn add_with_files_limits_wanted_set() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![1]),
+                content_layout: None,
             },
         )
         .await
@@ -137,6 +138,7 @@ async fn empty_or_invalid_selection_is_rejected() {
             AddOptions {
                 save_path: None,
                 files: Some(Vec::new()),
+                content_layout: None,
             },
         )
         .await;
@@ -151,6 +153,7 @@ async fn empty_or_invalid_selection_is_rejected() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![0, 3]),
+                content_layout: None,
             },
         )
         .await;
@@ -211,6 +214,7 @@ async fn partial_selection_completes_without_other_files() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![1]),
+                content_layout: None,
             },
         )
         .await
@@ -289,6 +293,7 @@ async fn selection_change_switches_wanted_set_and_state() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![0]),
+                content_layout: None,
             },
         )
         .await
@@ -378,6 +383,7 @@ async fn tracker_left_counts_wanted_bytes() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![1]),
+                content_layout: None,
             },
         )
         .await
@@ -438,6 +444,7 @@ async fn narrowing_selection_announces_completed_without_waiting_interval() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![0, 1]),
+                content_layout: None,
             },
         )
         .await
@@ -510,6 +517,7 @@ async fn wake_is_not_lost_while_announce_is_in_flight() {
             AddOptions {
                 save_path: None,
                 files: Some(vec![0, 1]),
+                content_layout: None,
             },
         )
         .await
