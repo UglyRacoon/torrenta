@@ -533,6 +533,41 @@ mod tests {
         assert!(none.message.unwrap_or_default().contains("последняя"));
     }
 
+    /// Живая проверка канала обновлений: настоящий GitHub API и настоящий релиз.
+    ///
+    /// `#[ignore]`: тест ходит в сеть. Запуск:
+    /// `cargo test -p torrenta --lib live_github -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "ходит в GitHub API"]
+    async fn live_github_release_is_parsed_and_has_windows_asset() {
+        let client = client().expect("HTTP-клиент обновлений");
+        // 1.7.0 заведомо старше опубликованного релиза: должен найтись установщик.
+        let release = check(&client, "1.7.0")
+            .await
+            .expect("проверка обновлений")
+            .expect("опубликованный релиз новее 1.7.0");
+        println!(
+            "QA-UPDATE version={} tag={} page={} assets={}",
+            release.version,
+            release.tag,
+            release.page_url,
+            release.assets.len()
+        );
+        let asset = release.windows_asset().expect("установщик для Windows");
+        println!(
+            "QA-UPDATE asset={} size={} url={}",
+            asset.name, asset.size, asset.url
+        );
+        assert!(asset.size > 1_000_000, "размер установщика правдоподобен");
+        assert!(
+            asset.url.starts_with("https://github.com/"),
+            "ссылка на GitHub"
+        );
+        // Будущая версия не должна считаться обновлением.
+        let none = check(&client, "99.0.0").await.expect("проверка обновлений");
+        assert!(none.is_none(), "99.0.0 новее любого релиза");
+    }
+
     #[test]
     fn progress_percent_is_optional() {
         let progress = UpdateProgressDto {

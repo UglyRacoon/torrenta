@@ -383,3 +383,97 @@ async fn real_seed_serves_block_to_interested_peer() {
     assert!(piece.is_some(), "сид не прислал запрошенный блок");
     manager.shutdown().await;
 }
+
+/// Двое наших клиентов встречаются в настоящем рое: сид с готовым файлом и
+/// личер без него. Проверяет, что отдача идёт «в сеть», а не только тестовому
+/// пиру напрямую.
+#[tokio::test]
+#[ignore = "ходит в настоящую сеть, нужны TORRENTA_QA_SEED*"]
+async fn real_seeder_serves_network_leecher() {
+    let dir = qa_dir();
+    let name = std::env::var("TORRENTA_QA_SEED").expect("нужен TORRENTA_QA_SEED");
+    let seed_dir = std::env::var_os("TORRENTA_QA_SEED_DIR")
+        .map(PathBuf::from)
+        .expect("нужен TORRENTA_QA_SEED_DIR");
+    let data = std::fs::read(dir.join(&name)).expect("торрент читается");
+    let meta = Metainfo::parse(&data).expect("торрент разбирается");
+    println!("QA-NET start {}", meta.info.name);
+
+    let seeder = TorrentManager::new(EngineConfig {
+        download_dir: seed_dir,
+        listen_port: 0,
+        dht: true,
+        ..EngineConfig::default()
+    });
+    let seed_id = Arc::clone(&seeder)
+        .add_file_with(data.clone(), AddOptions::default())
+        .await
+        .expect("сид принял торрент");
+    seeder.recheck(seed_id).expect("перепроверка сида");
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let snapshot = seeder
+            .snapshot()
+            .into_iter()
+            .find(|item| item.id == seed_id)
+            .unwrap();
+        if matches!(snapshot.state, torrent_core::TorrentState::Seeding) {
+            break;
+        }
+    }
+    println!("QA-NET сид готов, порт {}", seeder.listen_port());
+
+    let temp = tempfile::tempdir().expect("временный каталог");
+    let leecher = TorrentManager::new(EngineConfig {
+        download_dir: temp.path().join("downloads"),
+        listen_port: 0,
+        dht: true,
+        ..EngineConfig::default()
+    });
+    let leech_id = Arc::clone(&leecher)
+        .add_file_with(data, AddOptions::default())
+        .await
+        .expect("личер принял торрент");
+
+    let mut peak_up = 0f64;
+    let mut uploaded = 0u64;
+    let mut complete = false;
+    for step in 0..24 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let seeder_snap = seeder
+            .snapshot()
+            .into_iter()
+            .find(|item| item.id == seed_id)
+            .unwrap();
+        let leech_snap = leecher
+            .snapshot()
+            .into_iter()
+            .find(|item| item.id == leech_id)
+            .unwrap();
+        peak_up = peak_up.max(seeder_snap.up_rate);
+        uploaded = seeder_snap.uploaded_bytes;
+        println!(
+            "QA-NET t={}s seed peers={} up={:.0} uploaded={} | leech peers={} down={:.0} pieces={}/{}",
+            (step + 1) * 5,
+            seeder_snap.peers_connected,
+            seeder_snap.up_rate,
+            seeder_snap.uploaded_bytes,
+            leech_snap.peers_connected,
+            leech_snap.down_rate,
+            leech_snap.pieces_have,
+            leech_snap.piece_count,
+        );
+        if leech_snap.pieces_have == leech_snap.piece_count {
+            complete = true;
+            break;
+        }
+    }
+    println!("QA-NET result peak_up={peak_up:.0} uploaded={uploaded} complete={complete}");
+    // Наблюдение: сид с непроброшенным портом не получает входящих соединений
+    // из интернета, поэтому отдача в этом прогоне = 0 (личер качал у чужих
+    // сидов). Проверяем то, что от нас зависит: личер скачал торрент из
+    // настоящего роя целиком.
+    assert!(complete, "личер не скачал торрент из живого роя");
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}

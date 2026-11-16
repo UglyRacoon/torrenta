@@ -780,6 +780,7 @@ pub async fn connect(addr: SocketAddr, timeout: Duration) -> io::Result<UtpStrea
     socket.send_to(&syn.encode(), addr).await?;
     let deadline = Instant::now() + timeout;
     let mut buffer = [0u8; 1600];
+    let mut last_syn = Instant::now();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -788,13 +789,21 @@ pub async fn connect(addr: SocketAddr, timeout: Duration) -> io::Result<UtpStrea
                 "uTP: пир не ответил на SYN",
             ));
         }
-        let Some(packet) = (tokio::time::timeout(remaining, async {
+        // SYN теряется так же, как данные: без повторов соединение не
+        // установится на канале с потерями.
+        if last_syn.elapsed() >= Duration::from_millis(500) {
+            socket.send_to(&syn.encode(), addr).await?;
+            last_syn = Instant::now();
+        }
+        let received = tokio::time::timeout(remaining.min(Duration::from_millis(500)), async {
             let (read, _) = socket.recv_from(&mut buffer).await?;
             Ok::<_, io::Error>(Packet::decode(&buffer[..read]))
         })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "uTP: пир не ответил на SYN"))?)?
-        else {
+        .await;
+        let Ok(Ok(maybe_packet)) = received else {
+            continue;
+        };
+        let Some(packet) = maybe_packet else {
             continue;
         };
         if packet.kind == ST_RESET {
@@ -930,5 +939,73 @@ mod tests {
         assert_eq!(&answer, b"world");
         client.shutdown().await.ok();
         let _ = tokio::time::timeout(Duration::from_secs(3), wait_accept).await;
+    }
+
+    #[tokio::test]
+    async fn transfers_through_lossy_relay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Слушатель uTP и UDP-релей, который теряет каждый четвёртый пакет в
+        // сторону сервера и каждый десятый в сторону клиента (BEP 29 требует
+        // переотправки — без неё поток не соберётся).
+        let (server_addr, mut incoming) = UtpListener::start("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("слушатель uTP");
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("релей"));
+        let relay_addr = relay.local_addr().expect("адрес релея");
+        let relay_task = relay.clone();
+        tokio::spawn(async move {
+            let mut client: Option<SocketAddr> = None;
+            let mut forward = 0u32;
+            let mut backward = 0u32;
+            let mut buf = [0u8; 1600];
+            while let Ok((read, from)) = relay_task.recv_from(&mut buf).await {
+                if from == server_addr {
+                    backward += 1;
+                    if backward % 10 == 0 {
+                        continue;
+                    }
+                    if let Some(client_addr) = client {
+                        let _ = relay_task.send_to(&buf[..read], client_addr).await;
+                    }
+                } else {
+                    client = Some(from);
+                    forward += 1;
+                    if forward % 4 == 0 {
+                        continue;
+                    }
+                    let _ = relay_task.send_to(&buf[..read], server_addr).await;
+                }
+            }
+        });
+
+        let echo = tokio::spawn(async move {
+            let mut stream = incoming.recv().await.expect("входящее uTP-соединение");
+            let mut data = vec![0u8; 16 * 1024];
+            stream.read_exact(&mut data).await.expect("приём по uTP");
+            stream.write_all(&data).await.expect("эхо по uTP");
+            stream.flush().await.expect("сброс");
+            stream.shutdown().await.ok();
+        });
+
+        let mut client = connect(relay_addr, Duration::from_secs(8))
+            .await
+            .expect("uTP-соединение через релей с потерями");
+        let payload: Vec<u8> = (0..16 * 1024).map(|index| (index % 251) as u8).collect();
+        client
+            .write_all(&payload)
+            .await
+            .expect("запись через потери");
+        let mut answer = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(30), client.read_exact(&mut answer))
+            .await
+            .expect("ответ дошёл через потери")
+            .expect("чтение ответа");
+        assert_eq!(answer, payload, "данные через потери совпадают");
+        client.shutdown().await.ok();
+        tokio::time::timeout(Duration::from_secs(10), echo)
+            .await
+            .expect("эхо-пир завершился")
+            .expect("задача эха");
     }
 }
