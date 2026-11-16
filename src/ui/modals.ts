@@ -435,7 +435,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
     // начало, а не создаёт дубль (`AddNewTorrentDialog::updatePathHistory`).
     let saveDir = request.savePath;
     let layout: ContentLayout = request.contentLayout;
-    let rememberLast = request.rememberLastSavePath;
+    const rememberLast = request.rememberLastSavePath;
     let historyDirs = request.history.slice();
     let hideRecentTimer = 0;
 
@@ -570,14 +570,8 @@ export function createModalHost(root: HTMLElement): ModalHost {
     });
     modal.onClose(() => layoutSelect.destroy());
 
-    const rememberRow = checkboxRow(
-      "Запоминать последний путь",
-      "Следующее окно добавления откроется с этим каталогом, а не с каталогом по умолчанию.",
-      rememberLast,
-    );
-    rememberRow.input.addEventListener("change", () => {
-      rememberLast = rememberRow.input.checked;
-    });
+    // «Запоминать последний путь» теперь живёт только в настройках: в диалоге
+    // добавления эта галочка сбивала с толку (запрос 1.9).
 
     /** Добавляет каталог в историю: повтор поднимает запись наверх (1.10). */
     function rememberDir(dirs: string[], dir: string, limit: number): string[] {
@@ -636,7 +630,6 @@ export function createModalHost(root: HTMLElement): ModalHost {
           h("span", { class: "field__label", text: "Раскладка файлов" }),
           layoutSelect.element,
         ),
-        rememberRow.row,
       );
 
     function setFooter(...nodes: HTMLElement[]): void {
@@ -1435,12 +1428,19 @@ export function createModalHost(root: HTMLElement): ModalHost {
       },
     });
     proxyInput.addEventListener("input", () => showError(errorEl, null));
-    const networkGroup = h(
+    // uTP (BEP 29): второй транспорт поверх UDP — соединения с пирами, у
+    // которых открыт только UDP-порт, и «вежливая» отдача в общий канал.
+    const utp = checkboxRow(
+      "Использовать uTP (UDP-транспорт)",
+      "Соединения по UDP в дополнение к TCP: помогает с пирами, которым TCP недоступен. Требует, чтобы входящий UDP-порт не был занят другой программой.",
+      settings.utp ?? true,
+    );    const networkGroup = h(
       "div",
       { class: "field" },
       h("span", { class: "field__label", text: "Сеть" }),
       dht.row,
       pex.row,
+      utp.row,
       portMapping.row,
       webSeeds.row,
       h("div", { class: "field-row" }, field("Порт DHT", dhtPort), field("Прокси", proxyInput)),
@@ -1521,10 +1521,38 @@ export function createModalHost(root: HTMLElement): ModalHost {
     selects.push(themeSelect);
     const themeField = fieldBlock("Тема оформления", themeSelect.element);
 
+    // «Запоминать последний путь» — только здесь (в диалоге добавления галочку
+    // убрали): настройка решает, с какого каталога открывается диалог.
+    const rememberPath = checkboxRow(
+      "Запоминать последний путь загрузки",
+      "Окно добавления торрента открывается с последним использованным каталогом, а не с каталогом по умолчанию.",
+      settings.remember_last_save_path ?? false,
+    );
+
+    // «Запускать свёрнутым в трей» имеет смысл только при автозапуске: при
+    // обычном запуске программа открывается видимой (запрос 1.9).
+    const applyTrayDependency = (): void => {
+      const enabled = autostart.input.checked;
+      startMinimized.input.disabled = !enabled;
+      startMinimized.row.classList.toggle("is-disabled", !enabled);
+      if (!enabled) {
+        startMinimized.input.checked = false;
+      }
+    };
+    autostart.input.addEventListener("change", applyTrayDependency);
+    applyTrayDependency();
+
     const errorEl = formError();
     modal.body.append(
+      // Порядок блоков — по запросу 1.9: запуск и трей, раздача, поведение,
+      // каталог загрузки, сеть, затем всё остальное.
+      trayGroup,
+      seedGoalGroup,
+      behaviorGroup,
       dirField,
+      rememberPath.row,
       watchField,
+      networkGroup,
       h(
         "div",
         { class: "field-row" },
@@ -1538,12 +1566,8 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Пиров на торрент", maxPeers),
       ),
       scheduleGroup,
-      networkGroup,
-      behaviorGroup,
       assocGroup,
-      seedGoalGroup,
       queueGroup,
-      trayGroup,
       themeField,
       errorEl,
       h("p", { class: "modal__hint", text: "Порт 0 — выбрать свободный автоматически. Лимит 0 — без ограничения." }),
@@ -1720,12 +1744,13 @@ export function createModalHost(root: HTMLElement): ModalHost {
         // сохранение затирало бы эти поля значениями по умолчанию.
         content_layout: chosenLayout,
         encryption: chosenEncryption,
+        utp: utp.input.checked,
         save_path_history_length: Math.max(
           0,
           Math.min(99, Math.round(readNumber(historyLength) || 0)),
         ),
         save_path_history: settings.save_path_history ?? [],
-        remember_last_save_path: settings.remember_last_save_path ?? false,
+        remember_last_save_path: rememberPath.input.checked,
         sequential: sequential.input.checked,
         schedule_enabled: scheduleToggle.input.checked,
         schedule_from_min: scheduleFromValue(),

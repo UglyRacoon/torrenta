@@ -25,6 +25,11 @@ use crate::tracker::{self, AnnounceEvent, AnnounceRequest, PeerAddr};
 
 /// Период кондуктора: как часто проверяем, нужны ли новые пиры.
 const DRIVE_TICK: Duration = Duration::from_millis(400);
+/// Базовая пауза перед повторным подключением к пиру, с которым сессия
+/// закрылась или не открылась.
+const RETRY_BASE: Duration = Duration::from_secs(5);
+/// Максимальная пауза между попытками.
+const RETRY_MAX: Duration = Duration::from_secs(300);
 /// Как часто забираем из DHT найденных пиров.
 const DHT_POLL: Duration = Duration::from_secs(30);
 /// Как часто повторяем `announce_peer` в DHT.
@@ -174,9 +179,25 @@ impl PeerRecord {
 }
 
 /// Пауза перед повторной загрузкой куска, не прошедшего проверку SHA-1.
+/// Задержка перед повтором подключения после `attempts` неудач.
+pub(crate) fn retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.min(6);
+    let factor = 1u32 << shift;
+    (RETRY_BASE * factor).min(RETRY_MAX)
+}
+
 pub(crate) struct PieceCooldown {
     pub(crate) until: Instant,
     pub(crate) strikes: u32,
+}
+
+/// Пир, к которому нужно вернуться после неудачного или закрытого соединения.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryEntry {
+    /// Когда можно пробовать снова.
+    pub(crate) at: Instant,
+    /// Сколько раз уже пробовали (для экспоненциальной паузы).
+    pub(crate) attempts: u32,
 }
 
 /// Изменяемое состояние торрента под одним мьютексом.
@@ -193,6 +214,12 @@ pub(crate) struct RuntimeState {
     pub(crate) connecting: usize,
     /// Куски, отложенные после неудачной проверки хэша: индекс -> срок паузы.
     pub(crate) cooldown: HashMap<u32, PieceCooldown>,
+    /// Адреса на повторное подключение с паузой (1.9).
+    ///
+    /// Раньше закрытая сессия забывалась до следующего объявления трекера:
+    /// при интервале 30 минут отдача «затухала», а после перезапуска
+    /// `requeue_peers` давал всплеск — ровно то, что замечал пользователь.
+    pub(crate) retry: HashMap<SocketAddr, RetryEntry>,
     /// Пир, которому мы разчокиваем «на пробу» вопреки рейтингу.
     ///
     /// Без этого пир вне топ-8 никогда не получит от нас данные, а значит и сам
@@ -435,6 +462,7 @@ impl Runtime {
                 known: HashSet::new(),
                 connecting: 0,
                 cooldown: HashMap::new(),
+                retry: HashMap::new(),
                 optimistic: None,
                 optimistic_at: Instant::now(),
                 rng: {
@@ -780,6 +808,45 @@ impl Runtime {
         out
     }
 
+    /// Пауза перед повтором подключения: экспоненциальная, но не больше
+    /// [`RETRY_MAX`], чтобы мёртвый адрес не долбился каждые 400 мс.
+    fn schedule_retry(&self, addr: SocketAddr) {
+        let mut state = lk(&self.state);
+        let attempts = state
+            .retry
+            .get(&addr)
+            .map(|entry| entry.attempts + 1)
+            .unwrap_or(0);
+        state.retry.insert(
+            addr,
+            RetryEntry {
+                at: Instant::now() + retry_delay(attempts),
+                attempts,
+            },
+        );
+    }
+
+    /// Возвращает в очередь адреса, у которых истекла пауза.
+    pub(crate) fn promote_retries(&self) {
+        let mut state = lk(&self.state);
+        let now = Instant::now();
+        let due: Vec<SocketAddr> = state
+            .retry
+            .iter()
+            .filter(|(_, entry)| entry.at <= now)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in due {
+            state.retry.remove(&addr);
+            let active = state.peers.values().any(|peer| peer.addr == addr);
+            if !active && !state.pending.contains(&addr) && state.pending.len() < PENDING_LIMIT {
+                // В начало очереди: именно этот пир недавно был жив и может
+                // снова отдавать или принимать данные.
+                state.pending.push_front(addr);
+            }
+        }
+    }
+
     pub(crate) fn take_candidate(&self) -> Option<SocketAddr> {
         let mut state = lk(&self.state);
         let addr = state.pending.pop_front()?;
@@ -793,6 +860,8 @@ impl Runtime {
         let mut state = lk(&self.state);
         state.connecting = state.connecting.saturating_sub(1);
         state.seen.remove(&addr);
+        drop(state);
+        self.schedule_retry(addr);
     }
 
     /// Возвращает в очередь подключения известные адреса, с которыми сейчас
@@ -843,6 +912,10 @@ impl Runtime {
             // Адрес снова доступен для подключения: сессия закрылась штатно
             // (пауза, смена торрента), и трекер может предложить его повторно.
             state.seen.remove(&peer.addr);
+            let addr = peer.addr;
+            drop(state);
+            self.schedule_retry(addr);
+            let mut state = lk(&self.state);
             if let Some(index) = peer.owned_piece {
                 release_piece(&mut state, index);
             }
@@ -1598,6 +1671,7 @@ impl Runtime {
             if self.flags.paused() {
                 continue;
             }
+            self.promote_retries();
             let max = self.max_peers();
             let (active, connecting) = {
                 let state = lk(&self.state);
@@ -2067,6 +2141,15 @@ async fn metadata_task(handle: Arc<TorrentHandle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        assert_eq!(retry_delay(0), Duration::from_secs(5));
+        assert_eq!(retry_delay(1), Duration::from_secs(10));
+        assert_eq!(retry_delay(3), Duration::from_secs(40));
+        assert_eq!(retry_delay(6), Duration::from_secs(300));
+        assert_eq!(retry_delay(20), Duration::from_secs(300));
+    }
 
     #[test]
     fn piece_buffer_splits_into_blocks() {

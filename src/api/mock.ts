@@ -637,6 +637,7 @@ export async function createMockApi(): Promise<EngineApi> {
     auto_update: true,
     content_layout: "original",
     encryption: "preferred",
+    utp: true,
     // Демо-история: как будто пользователь уже выбирал каталоги.
     save_path_history: [
       "D:\\Фильмы",
@@ -1746,6 +1747,7 @@ export async function createMockApi(): Promise<EngineApi> {
         next.encryption === "required" || next.encryption === "disabled"
           ? next.encryption
           : "preferred";
+      settings.utp = next.utp !== false;
       settings.save_path_history_length = clamp(
         Math.round(Number(next.save_path_history_length) || 0),
         0,

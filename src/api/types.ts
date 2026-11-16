@@ -152,6 +152,8 @@ export interface SettingsDto {
   content_layout: ContentLayout;
   /** Шифрование соединений с пирами (1.9). */
   encryption: EncryptionMode;
+  /** Использовать uTP (BEP 29) как второй транспорт (1.9). */
+  utp: boolean;
   /** История каталогов загрузки для диалога добавления (1.10). */
   save_path_history: string[];
   /** Сколько путей помнить (0 — история выключена, максимум 99). */

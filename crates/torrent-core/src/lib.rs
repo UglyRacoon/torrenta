@@ -32,6 +32,8 @@ pub mod proxy;
 pub(crate) mod selection;
 pub mod storage;
 pub mod tracker;
+#[doc(hidden)]
+pub mod utp;
 pub mod web_seed;
 pub mod wire;
 

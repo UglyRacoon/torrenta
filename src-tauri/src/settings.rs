@@ -177,6 +177,8 @@ pub struct SettingsDto {
     pub content_layout: ContentLayout,
     /// Шифрование соединений с пирами: выключено, предпочтительно, обязательно (1.9).
     pub encryption: EncryptionMode,
+    /// Использовать uTP (BEP 29) как второй транспорт (1.9).
+    pub utp: bool,
     /// История каталогов загрузки для диалога добавления (1.10).
     ///
     /// Хранится именно базовый каталог загрузки (тот, что выбирает пользователь),
@@ -294,6 +296,7 @@ impl Default for SettingsDto {
             auto_update: true,
             content_layout: ContentLayout::Original,
             encryption: EncryptionMode::Preferred,
+            utp: true,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -333,6 +336,11 @@ impl SettingsDto {
         // `dht_port` и `seed_time_limit_min` зажимать не нужно: их типы (`u16`
         // и `u32`) и есть допустимый диапазон, а `0` — законное «без значения».
         self.theme = normalize_theme(&self.theme);
+        // «Свёрнутым в трей» без автозапуска бессмысленно: обычный запуск
+        // обязан показывать окно, поэтому флаг сбрасывается (запрос 1.9).
+        if !self.autostart {
+            self.start_minimized = false;
+        }
         self.save_path_history_length = self
             .save_path_history_length
             .min(MAX_SAVE_PATH_HISTORY_LENGTH);
@@ -576,6 +584,7 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
         download_dir: dto.download_path(),
         content_layout: dto.content_layout,
         encryption: dto.encryption,
+        utp: dto.utp,
         max_peers_per_torrent: dto.max_peers as usize,
         download_limit_kib: dto.download_limit_kib,
         upload_limit_kib: dto.upload_limit_kib,
@@ -649,6 +658,7 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         ),
         content_layout: config.content_layout,
         encryption: config.encryption,
+        utp: config.utp,
         save_path_history: Vec::new(),
         save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
         remember_last_save_path: false,
@@ -908,6 +918,7 @@ mod tests {
             auto_update: true,
             content_layout: ContentLayout::Original,
             encryption: EncryptionMode::Preferred,
+            utp: true,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -983,6 +994,7 @@ mod tests {
             auto_update: true,
             content_layout: ContentLayout::Original,
             encryption: EncryptionMode::Preferred,
+            utp: true,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -1791,6 +1803,7 @@ mod tests {
             "remember_last_save_path",
             "save_path_history",
             "save_path_history_length",
+            "utp",
             "associate_files",
             "close_to_tray",
             "dht",

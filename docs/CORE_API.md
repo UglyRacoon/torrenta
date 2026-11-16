@@ -1250,3 +1250,17 @@ pub const PROVIDE_RC4: u32 = 0x02;
 uTP (BEP 29) не реализован. Рукопожатие проверено на спецификации Vuze v1.0 и на
 обмене между экземплярами движка; перекрёстная проверка с libtorrent потребует
 отдельного прогона на реальной раздаче.
+## uTP как транспорт (1.9)
+
+`EngineConfig.utp: bool` (по умолчанию `true`). Входящие соединения — UDP на том
+же порту, что TCP; тип определяется по первым 20 байтам. Исходящие: TCP, при
+неудаче — `torrent_core::utp::connect(addr, timeout)`. Поток реализует
+`AsyncRead`/`AsyncWrite`, поэтому `peer::run` и MSE работают поверх любого
+транспорта без изменений.
+
+## Счётчики обмена в сессии (1.9)
+
+`SessionEntry.uploaded_bytes`/`downloaded_bytes` (serde default 0) пишутся в
+`session.json` из снимка торрента и восстанавливаются
+`TorrentManager::set_transfer_totals(id, uploaded, downloaded)` при возврате
+сессии — коэффициент раздачи не обнуляется после перезапуска.

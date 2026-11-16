@@ -664,13 +664,28 @@ pub async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
 /// `known` — info-hash всех раздач, которые мы обслуживаем: по ним находится
 /// `SKEY`. Если ни один не подошёл, соединение отклоняется.
 pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     known: &[InfoHash],
     provide: u32,
     require_rc4: bool,
 ) -> Result<Handshake<S>, String> {
+    accept_with_prefix(stream, known, provide, require_rc4, Vec::new()).await
+}
+
+/// То же, но первые байты уже прочитаны вызывающей стороной.
+///
+/// Нужно для uTP: там нельзя «подсмотреть» начало потока, как у TCP-сокета,
+/// поэтому тип соединения определяется по первым 20 байтам, и они передаются
+/// сюда, чтобы рукопожатие увидело поток с самого начала.
+pub async fn accept_with_prefix<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    known: &[InfoHash],
+    provide: u32,
+    require_rc4: bool,
+    prefix: Vec<u8>,
+) -> Result<Handshake<S>, String> {
     // Шаг 1: Ya и паддинг до HASH('req1', S).
-    let mut buf = Vec::with_capacity(1024);
+    let mut buf = prefix;
     read_until(&mut stream, &mut buf, DH_BYTES, READ_TIMEOUT).await?;
     let mut remote_public = [0u8; DH_BYTES];
     remote_public.copy_from_slice(&buf[..DH_BYTES]);

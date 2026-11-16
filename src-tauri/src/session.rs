@@ -146,6 +146,15 @@ pub struct SessionEntry {
     /// Локальный лимит отдачи, КиБ/с (`0` — без ограничения).
     #[serde(default)]
     pub up_limit_kib: u32,
+    /// Всего отдано по торренту во всех сессиях, байты (с 1.9).
+    ///
+    /// Счётчики движка живут в памяти, поэтому без сохранения в `session.json`
+    /// коэффициент раздачи после перезапуска обнулялся.
+    #[serde(default)]
+    pub uploaded_bytes: u64,
+    /// Всего скачано по торренту во всех сессиях, байты (с 1.9).
+    #[serde(default)]
+    pub downloaded_bytes: u64,
     /// Раскладка файлов, выбранная при добавлении (с 1.10).
     ///
     /// Без неё восстановление искало бы файлы не там: например, торрент,
@@ -879,6 +888,8 @@ impl SessionRegistry {
             name: torrent.name.clone(),
             source,
             save_path: torrent.save_path.clone(),
+            uploaded_bytes: torrent.uploaded_bytes,
+            downloaded_bytes: torrent.downloaded_bytes,
             paused: torrent.state == TorrentState::Paused,
             content_layout,
             selected_files,
@@ -981,6 +992,18 @@ async fn apply_restore_action(
             // Останавливаем обмен до применения карты: иначе движок успеет
             // начать качать заново, пока мы сверяем отпечатки файлов.
             pause_quietly(engine, id, &entry.name);
+            // Счётчики обмена восстанавливаем до возобновления: коэффициент
+            // раздачи должен переживать перезапуск клиента (1.9).
+            if let Err(err) =
+                engine
+                    .manager
+                    .set_transfer_totals(id, entry.uploaded_bytes, entry.downloaded_bytes)
+            {
+                eprintln!(
+                    "[torrenta] сессия: не удалось вернуть счётчики «{}»: {err}",
+                    entry.name.trim()
+                );
+            }
             apply_entry_details(engine, id, &entry);
             restore_progress(engine, id, &entry);
             if !entry.paused {
@@ -1019,6 +1042,18 @@ async fn apply_restore_action(
             // У magnet до метаданных ни карту применить, ни хэши проверить
             // нельзя: запоминаем и вернёмся к этому после получения метаданных.
             pause_quietly(engine, id, &entry.name);
+            // Счётчики обмена восстанавливаем до возобновления: коэффициент
+            // раздачи должен переживать перезапуск клиента (1.9).
+            if let Err(err) =
+                engine
+                    .manager
+                    .set_transfer_totals(id, entry.uploaded_bytes, entry.downloaded_bytes)
+            {
+                eprintln!(
+                    "[torrenta] сессия: не удалось вернуть счётчики «{}»: {err}",
+                    entry.name.trim()
+                );
+            }
             apply_entry_details(engine, id, &entry);
             let resume = entry.resume.clone().filter(resume_files_match);
             defer_resume(id, resume, entry.paused);
@@ -1281,6 +1316,8 @@ mod tests {
                 file: torrent_data_name(info_hash).unwrap_or_default(),
             },
             save_path: "C:\\Загрузки".to_string(),
+            uploaded_bytes: 0,
+            downloaded_bytes: 0,
             content_layout: torrent_core::ContentLayout::Original,
             paused: false,
             selected_files: Vec::new(),

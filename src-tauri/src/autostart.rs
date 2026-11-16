@@ -19,6 +19,10 @@ use std::path::Path;
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 /// Имя значения в ветке автозапуска.
 pub const VALUE_NAME: &str = "Torrenta";
+/// Аргумент командной строки, которым Windows запускает приложение из
+/// автозагрузки. Нужен, чтобы «Запускать свёрнутым в трей» действовало только
+/// при входе в систему, а не при обычном запуске.
+pub const AUTOSTART_FLAG: &str = "--autostart";
 /// Утилита для работы с реестром.
 #[cfg(windows)]
 const REG_EXE: &str = "reg.exe";
@@ -46,6 +50,19 @@ pub fn add_args(exe: &Path) -> Vec<String> {
     add_args_for(VALUE_NAME, exe)
 }
 
+/// `true`, если приложение запущено из автозагрузки Windows.
+///
+/// Обычный запуск (ярлык, проводник) флага не имеет, поэтому «Запускать
+/// свёрнутым в трей» не прячет окно без спроса.
+pub fn launched_by_autostart() -> bool {
+    has_autostart_flag(std::env::args())
+}
+
+/// Проверяет флаг в произвольном списке аргументов (вынесено для тестов).
+fn has_autostart_flag<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|arg| arg == AUTOSTART_FLAG)
+}
+
 /// Аргументы `reg.exe`, выключающие автозапуск.
 pub fn delete_args() -> Vec<String> {
     delete_args_for(VALUE_NAME)
@@ -61,7 +78,7 @@ fn add_args_for(value: &str, exe: &Path) -> Vec<String> {
         "/t".to_string(),
         "REG_SZ".to_string(),
         "/d".to_string(),
-        quote_exe(exe),
+        format!("{} {AUTOSTART_FLAG}", quote_exe(exe)),
         "/f".to_string(),
     ]
 }
@@ -251,7 +268,7 @@ mod tests {
             "/t",
             "REG_SZ",
             "/d",
-            r#""C:\Program Files\Torrenta\torrenta.exe""#,
+            r#""C:\Program Files\Torrenta\torrenta.exe" --autostart"#,
             "/f",
         ]
         .map(String::from);
@@ -309,15 +326,15 @@ mod tests {
         let exe = std::env::current_exe().expect("путь к тестовому exe");
         assert_eq!(
             probe_exists(),
-            Some(quote_exe(&exe)),
-            "в реестр должен попасть путь к текущему exe"
+            Some(format!("{} {AUTOSTART_FLAG}", quote_exe(&exe))),
+            "в реестр должен попасть путь к текущему exe и флаг автозапуска"
         );
 
         // Повторное включение идемпотентно: `reg.exe add /f` перезаписывает значение.
         apply_named(PROBE_VALUE, true).expect("повторное включение не должно падать");
         assert_eq!(
             probe_exists(),
-            Some(quote_exe(&exe)),
+            Some(format!("{} {AUTOSTART_FLAG}", quote_exe(&exe))),
             "значение не должно задвоиться"
         );
 

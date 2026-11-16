@@ -287,7 +287,11 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
 
     // Главное окно из конфигурации создаётся скрытым. Показываем его, если это не
     // запуск в трее; без иконки в трее показываем всегда, иначе окно не найти.
-    if !start_minimized || !tray_ready {
+    // «Запускать свёрнутым в трей» действует только при входе в Windows:
+    // обычный запуск (ярлык, проводник) всегда показывает окно, иначе галочка
+    // выглядела бы как «программа не открылась» (запрос 1.9).
+    let from_autostart = autostart::launched_by_autostart();
+    if !(start_minimized && from_autostart) || !tray_ready {
         tray::show_main(&handle);
     }
 

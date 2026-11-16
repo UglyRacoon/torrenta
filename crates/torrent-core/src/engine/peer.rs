@@ -92,7 +92,7 @@ pub(crate) struct MetadataFetch {
 /// При включённом прокси TCP-соединение открывается через него (SOCKS5 или
 /// HTTP CONNECT): иначе пиры видели бы настоящий адрес клиента.
 pub(crate) async fn connect(runtime: Arc<Runtime>, addr: SocketAddr) {
-    let (mode, proxy) = {
+    let (mode, proxy, utp) = {
         let config = rd(&runtime.env.config);
         (
             config.encryption,
@@ -100,14 +100,14 @@ pub(crate) async fn connect(runtime: Arc<Runtime>, addr: SocketAddr) {
                 .proxy
                 .as_deref()
                 .and_then(|spec| crate::proxy::ProxyConfig::parse(spec).ok()),
+            config.utp,
         )
     };
     if !matches!(mode, EncryptionMode::Disabled) {
-        let Some(stream) = open_stream(proxy.as_ref(), addr).await else {
+        let Some(stream) = open_base(proxy.as_ref(), addr, utp).await else {
             runtime.candidate_failed(addr);
             return;
         };
-        let _ = stream.set_nodelay(true);
         let info_hash = runtime.meta.info_hash;
         match mse::initiate(stream, &info_hash, mode.provide()).await {
             Ok(handshake) => {
@@ -128,14 +128,34 @@ pub(crate) async fn connect(runtime: Arc<Runtime>, addr: SocketAddr) {
             }
         }
     }
-    let Some(stream) = open_stream(proxy.as_ref(), addr).await else {
+    let Some(stream) = open_base(proxy.as_ref(), addr, utp).await else {
         runtime.candidate_failed(addr);
         return;
     };
-    let _ = stream.set_nodelay(true);
     if let Err(message) = run(runtime.clone(), addr, stream, None).await {
         let _ = message;
     }
+}
+
+/// Транспорт пира: TCP или uTP. Остальной код работает с потоком одинаково.
+trait PeerTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerTransport for T {}
+
+/// Открывает соединение: сначала TCP, при неудаче — uTP (BEP 29).
+async fn open_base(
+    proxy: Option<&crate::proxy::ProxyConfig>,
+    addr: SocketAddr,
+    utp: bool,
+) -> Option<Box<dyn PeerTransport>> {
+    if let Some(stream) = open_stream(proxy, addr).await {
+        return Some(Box::new(stream));
+    }
+    if utp {
+        if let Ok(stream) = crate::utp::connect(addr, Duration::from_secs(6)).await {
+            return Some(Box::new(stream));
+        }
+    }
+    None
 }
 
 /// Открывает TCP-соединение (напрямую или через прокси) с таймаутом.

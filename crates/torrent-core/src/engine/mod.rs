@@ -319,6 +319,8 @@ pub struct EngineConfig {
     pub content_layout: ContentLayout,
     /// Шифрование соединений с пирами (1.9).
     pub encryption: EncryptionMode,
+    /// Использовать uTP (BEP 29) как второй транспорт (1.9).
+    pub utp: bool,
     /// Максимум подключённых пиров на торрент.
     ///
     /// qBittorrent по умолчанию держит до 500 соединений на торрент и до 2000
@@ -399,6 +401,7 @@ impl Default for EngineConfig {
             download_dir: default_download_dir(),
             content_layout: ContentLayout::Original,
             encryption: EncryptionMode::Preferred,
+            utp: true,
             max_peers_per_torrent: 200,
             download_limit_kib: 0,
             upload_limit_kib: 0,
@@ -2168,6 +2171,23 @@ impl TorrentManager {
         Ok(())
     }
 
+    /// Записывает суммарные счётчики обмена, восстановленные из сессии (1.9).
+    ///
+    /// Без этого после перезапуска отданное и скачанное начинали с нуля:
+    /// коэффициент раздачи обнулялся, а статистика торрента выглядела так,
+    /// будто трафик исчез.
+    pub fn set_transfer_totals(
+        &self,
+        id: u64,
+        uploaded: u64,
+        downloaded: u64,
+    ) -> Result<(), EngineError> {
+        let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
+        handle.stats.uploaded.store(uploaded, Ordering::Relaxed);
+        handle.stats.downloaded.store(downloaded, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Сводка состояния движка для окна диагностики.
     pub fn diagnostics(&self) -> Diagnostics {
         let config = self.config();
@@ -2722,6 +2742,24 @@ async fn accept_loop(inner: Arc<Inner>) {
         Ok(listener) => listener,
         Err(_) => return,
     };
+    // uTP слушает тот же порт, что TCP: трекер отдаёт один адрес, и клиенты
+    // вправе прийти по любому транспорту (BEP 29). Если UDP-порт занят или
+    // uTP выключен, торренты продолжают работать по TCP.
+    if rd(&inner.config).utp && inner.listen_port != 0 {
+        let utp_inner = inner.clone();
+        tokio::spawn(async move {
+            let bind = SocketAddr::from(([0, 0, 0, 0], utp_inner.listen_port));
+            match crate::utp::UtpListener::start(bind).await {
+                Ok((_addr, mut incoming)) => {
+                    while let Some(stream) = incoming.recv().await {
+                        let inner = utp_inner.clone();
+                        tokio::spawn(async move { handle_utp_incoming(inner, stream).await });
+                    }
+                }
+                Err(err) => eprintln!("[torrenta] uTP не запустился: {err}"),
+            }
+        });
+    }
     loop {
         if inner.shutdown.load(Ordering::Relaxed) {
             break;
@@ -2807,6 +2845,63 @@ async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketA
     dispatch_incoming(inner, addr, stream, remote).await;
 }
 
+/// Входящее uTP-соединение: те же правила, что для TCP, но поток нельзя
+/// «подсмотреть», поэтому первые 20 байт читаются и передаются в разбор.
+async fn handle_utp_incoming(inner: Arc<Inner>, mut stream: crate::utp::UtpStream) {
+    let addr = stream.peer_addr();
+    let mut head = [0u8; 20];
+    if read_exact_timeout(&mut stream, &mut head, Duration::from_secs(10))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let plain = head[0] == 19 && &head[1..20] == b"BitTorrent protocol";
+    if plain {
+        let mut buf = [0u8; 68];
+        buf[..20].copy_from_slice(&head);
+        if read_exact_timeout(&mut stream, &mut buf[20..], Duration::from_secs(10))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let remote = match Handshake::parse(&buf) {
+            Ok(remote) => remote,
+            Err(_) => return,
+        };
+        dispatch_incoming(inner, addr, stream, remote).await;
+        return;
+    }
+    let (provide, require) = {
+        let mode = rd(&inner.config).encryption;
+        (mode.provide(), mode.required())
+    };
+    let known: Vec<InfoHash> = rd(&inner.handles)
+        .iter()
+        .map(|handle| handle.info_hash)
+        .collect();
+    let handshake =
+        match crate::mse::accept_with_prefix(stream, &known, provide, require, head.to_vec()).await
+        {
+            Ok(handshake) => handshake,
+            Err(_) => return,
+        };
+    let mut stream = handshake.stream;
+    let mut buf = [0u8; 68];
+    if read_exact_timeout(&mut stream, &mut buf, Duration::from_secs(10))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let remote = match Handshake::parse(&buf) {
+        Ok(remote) => remote,
+        Err(_) => return,
+    };
+    dispatch_incoming(inner, addr, stream, remote).await;
+}
+
 /// Передаёт соединение торренту по info-hash из handshake.
 async fn dispatch_incoming<S>(inner: Arc<Inner>, addr: SocketAddr, stream: S, remote: Handshake)
 where
@@ -2839,6 +2934,15 @@ mod tests {
             length,
             offset,
         }
+    }
+
+    #[test]
+    fn transfer_totals_stored_in_stats() {
+        let stats = Arc::new(Stats::new("totals".to_string(), TorrentState::Seeding));
+        stats.uploaded.store(1_048_576, Ordering::Relaxed);
+        stats.downloaded.store(4_194_304, Ordering::Relaxed);
+        assert_eq!(stats.uploaded.load(Ordering::Relaxed), 1_048_576);
+        assert_eq!(stats.downloaded.load(Ordering::Relaxed), 4_194_304);
     }
 
     #[test]

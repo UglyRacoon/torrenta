@@ -574,9 +574,11 @@
   transition: opacity var(--dur-fast) var(--ease);
 }
 
+/* Кнопки видит только та строка, на которой курсор (или фокус с клавиатуры):
+   выделенная строка сама по себе их не показывает — иначе они «горят» на всех
+   выбранных торрентах сразу (запрос 1.9). */
 .torrent:hover .torrent__actions,
-.torrent:focus-within .torrent__actions,
-.torrent[aria-selected="true"] .torrent__actions {
+.torrent:focus-within .torrent__actions {
   opacity: 1;
 }
 
