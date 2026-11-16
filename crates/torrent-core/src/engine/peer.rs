@@ -375,7 +375,9 @@ where
             }
             pump_requests(runtime, id, writer, out).await?;
         }
-        Message::Interested => runtime.set_peer_interested(id, true),
+        Message::Interested => {
+            runtime.set_peer_interested(id, true);
+        }
         Message::NotInterested => runtime.set_peer_interested(id, false),
         Message::Have(index) => runtime.on_have(id, index),
         Message::Bitfield(bitfield) => runtime.on_bitfield(id, bitfield),
@@ -386,6 +388,7 @@ where
         } => {
             // Отказ в отдаче (кусок не скачан, пир не разблокирован) — не ошибка
             // протокола: запрос просто игнорируется, соединение остаётся живым.
+
             if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
                 send(writer, &Message::Piece { index, begin, data }).await?;
@@ -588,6 +591,7 @@ async fn tick<W: AsyncWrite + Unpin>(
     // Отдача по tit-for-tat. Пока мы явно не сказали `Unchoke`, пир не имеет
     // права просить у нас блоки, и для него мы — бесполезный собеседник:
     // именно поэтому наш клиент раньше отдавал ноль и получал худшую очередь.
+
     if runtime.should_unchoke(id) {
         send(writer, &Message::Unchoke).await?;
         runtime.set_am_choking(id, false);

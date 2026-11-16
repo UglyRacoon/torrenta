@@ -1308,6 +1308,28 @@ mod tests {
         assert!(entries[0].resume.is_none());
     }
 
+    #[test]
+    fn session_entry_keeps_transfer_totals() {
+        let mut record = entry("0123456789abcdef0123456789abcdef01234567");
+        record.uploaded_bytes = 5_000_000;
+        record.downloaded_bytes = 1_000_000;
+        let text = serde_json::to_string(&SessionState {
+            torrents: vec![record],
+        })
+        .expect("сериализация");
+        let parsed = parse_session_json(&text).expect("разбор сессии");
+        assert_eq!(parsed[0].uploaded_bytes, 5_000_000);
+        assert_eq!(parsed[0].downloaded_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn old_session_without_totals_reads_as_zero() {
+        let json = r#"{"torrents":[{"info_hash":"0123456789abcdef0123456789abcdef01234567","name":"t","source":{"kind":"magnet","link":"magnet:?xt=urn:btih:0123"},"save_path":"C:\\q"}]}"#;
+        let parsed = parse_session_json(json).expect("старый JSON читается");
+        assert_eq!(parsed[0].uploaded_bytes, 0);
+        assert_eq!(parsed[0].downloaded_bytes, 0);
+    }
+
     fn entry(info_hash: &str) -> SessionEntry {
         SessionEntry {
             info_hash: info_hash.to_string(),
