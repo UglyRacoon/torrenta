@@ -150,6 +150,8 @@ export interface SettingsDto {
   auto_update: boolean;
   /** Раскладка файлов для новых торрентов (1.10). */
   content_layout: ContentLayout;
+  /** Шифрование соединений с пирами (1.9). */
+  encryption: EncryptionMode;
   /** История каталогов загрузки для диалога добавления (1.10). */
   save_path_history: string[];
   /** Сколько путей помнить (0 — история выключена, максимум 99). */
@@ -329,6 +331,15 @@ export interface AddOptions {
  * отдельная папка, `no_subfolder` — файлы лежат прямо в каталоге загрузки.
  */
 export type ContentLayout = "original" | "subfolder" | "no_subfolder";
+
+/**
+ * Шифрование соединений с пирами (MSE/PE).
+ *
+ * `preferred` — сначала пробуем шифрование, при неудаче откатываемся на
+ * открытое соединение (так работает qBittorrent по умолчанию);
+ * `required` — только шифрованные; `disabled` — только открытые.
+ */
+export type EncryptionMode = "disabled" | "preferred" | "required";
 
 export interface AddResult {
   id: number;

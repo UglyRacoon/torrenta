@@ -3,6 +3,7 @@ import type {
   AddOptions,
   AssociationDto,
   ContentLayout,
+  EncryptionMode,
   SettingsDto,
   TorrentPreview,
   TorrentSource,
@@ -1219,6 +1220,23 @@ export function createModalHost(root: HTMLElement): ModalHost {
       max: "99",
       step: "1",
     });
+    // Шифрование соединений (1.9): как в qBittorrent — «предпочтительно» по
+    // умолчанию, с откатом на открытое соединение.
+    let chosenEncryption: EncryptionMode = settings.encryption ?? "preferred";
+    const encryptionSelect = createSelect({
+      label: "Шифрование соединений",
+      options: [
+        { value: "preferred", label: "Предпочтительно (с откатом)" },
+        { value: "required", label: "Обязательно" },
+        { value: "disabled", label: "Выключено" },
+      ],
+      value: chosenEncryption,
+      onChange: (value) => {
+        chosenEncryption = value as EncryptionMode;
+        showError(errorEl, null);
+      },
+    });
+    selects.push(encryptionSelect);
     const behaviorGroup = h(
       "div",
       { class: "field" },
@@ -1233,6 +1251,11 @@ export function createModalHost(root: HTMLElement): ModalHost {
         field("Раскладка файлов новых торрентов", layoutSelect.element),
         field("Сколько каталогов помнить", historyLength),
       ),
+      h("div", { class: "field-row" }, field("Шифрование соединений", encryptionSelect.element)),
+      h("p", {
+        class: "field__hint",
+        text: "Шифрование (MSE/PE) маскирует трафик BitTorrent от простого распознавания и помогает соединяться с пирами, которым оно нужно. «Предпочтительно» пробует шифрование и откатывается на открытое соединение, если пир его не поддерживает.",
+      }),
       h("p", {
         class: "field__hint",
         text: "Раскладка определяет, появится ли папка с именем раздачи. История каталогов — подсказки в поле «Папка загрузки»: 0 выключает их, максимум 99.",
@@ -1693,6 +1716,16 @@ export function createModalHost(root: HTMLElement): ModalHost {
         seed_time_limit_min: Math.round(readNumber(seedTime)),
         // 1.7: последовательная загрузка по умолчанию и окно расписания.
         associate_files: associate.input.checked,
+        // 1.9: раскладка файлов, режим шифрования и история каталогов — без них
+        // сохранение затирало бы эти поля значениями по умолчанию.
+        content_layout: chosenLayout,
+        encryption: chosenEncryption,
+        save_path_history_length: Math.max(
+          0,
+          Math.min(99, Math.round(readNumber(historyLength) || 0)),
+        ),
+        save_path_history: settings.save_path_history ?? [],
+        remember_last_save_path: settings.remember_last_save_path ?? false,
         sequential: sequential.input.checked,
         schedule_enabled: scheduleToggle.input.checked,
         schedule_from_min: scheduleFromValue(),

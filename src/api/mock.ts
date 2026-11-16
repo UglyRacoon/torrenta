@@ -636,6 +636,7 @@ export async function createMockApi(): Promise<EngineApi> {
     restore_session: true,
     auto_update: true,
     content_layout: "original",
+    encryption: "preferred",
     // Демо-история: как будто пользователь уже выбирал каталоги.
     save_path_history: [
       "D:\\Фильмы",
@@ -1741,6 +1742,10 @@ export async function createMockApi(): Promise<EngineApi> {
         next.content_layout === "subfolder" || next.content_layout === "no_subfolder"
           ? next.content_layout
           : "original";
+      settings.encryption =
+        next.encryption === "required" || next.encryption === "disabled"
+          ? next.encryption
+          : "preferred";
       settings.save_path_history_length = clamp(
         Math.round(Number(next.save_path_history_length) || 0),
         0,

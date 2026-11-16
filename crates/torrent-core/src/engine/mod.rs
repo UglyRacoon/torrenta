@@ -317,6 +317,8 @@ pub struct EngineConfig {
     pub download_dir: PathBuf,
     /// Раскладка файлов по умолчанию для новых торрентов (1.10).
     pub content_layout: ContentLayout,
+    /// Шифрование соединений с пирами (1.9).
+    pub encryption: EncryptionMode,
     /// Максимум подключённых пиров на торрент.
     ///
     /// qBittorrent по умолчанию держит до 500 соединений на торрент и до 2000
@@ -396,6 +398,7 @@ impl Default for EngineConfig {
         EngineConfig {
             download_dir: default_download_dir(),
             content_layout: ContentLayout::Original,
+            encryption: EncryptionMode::Preferred,
             max_peers_per_torrent: 200,
             download_limit_kib: 0,
             upload_limit_kib: 0,
@@ -602,6 +605,39 @@ fn safe_folder_name(name: &str) -> String {
         format!("{cleaned}-torrent")
     } else {
         cleaned
+    }
+}
+
+/// Режим шифрования соединений с пирами (MSE/PE).
+///
+/// Повторяет настройку «Шифрование» из qBittorrent: `Disabled` — только
+/// открытые соединения, `Preferred` — сначала пробуем шифрование, при неудаче
+/// откатываемся на открытое, `Required` — только шифрованные соединения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionMode {
+    /// Шифрование выключено.
+    Disabled,
+    /// Предпочитать шифрование, но принимать и открытые соединения.
+    #[default]
+    Preferred,
+    /// Только шифрованные соединения.
+    Required,
+}
+
+impl EncryptionMode {
+    /// Предлагаем ли RC4 при исходящем рукопожатии.
+    pub(crate) fn provide(self) -> u32 {
+        match self {
+            EncryptionMode::Disabled => 0,
+            EncryptionMode::Preferred => crate::mse::PROVIDE_PLAINTEXT | crate::mse::PROVIDE_RC4,
+            EncryptionMode::Required => crate::mse::PROVIDE_RC4,
+        }
+    }
+
+    /// Требуется ли шифрование обязательно.
+    pub(crate) fn required(self) -> bool {
+        matches!(self, EncryptionMode::Required)
     }
 }
 
@@ -2709,6 +2745,54 @@ async fn accept_loop(inner: Arc<Inner>) {
 }
 
 async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketAddr) {
+    let _ = stream.set_nodelay(true);
+    // Определяем протокол по первым байтам, не забирая их из сокета: открытый
+    // BitTorrent начинается с 0x13 "BitTorrent protocol", а MSE — со случайного
+    // DH-ключа, поэтому различить их можно только по полному префиксу.
+    let mut peek_buf = [0u8; 20];
+    let mut peeked = 0usize;
+    for _ in 0..200 {
+        match tokio::time::timeout(Duration::from_millis(50), stream.peek(&mut peek_buf)).await {
+            Ok(Ok(count)) if count >= 20 => {
+                peeked = count;
+                break;
+            }
+            Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
+            _ => break,
+        }
+    }
+    let plain = peeked >= 20 && peek_buf[0] == 19 && &peek_buf[1..20] == b"BitTorrent protocol";
+    if plain {
+        let mut buf = [0u8; 68];
+        if read_exact_timeout(&mut stream, &mut buf, Duration::from_secs(10))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let remote = match Handshake::parse(&buf) {
+            Ok(remote) => remote,
+            Err(_) => return,
+        };
+        dispatch_incoming(inner, addr, stream, remote).await;
+        return;
+    }
+
+    // Всё остальное считаем MSE/PE (как режим 3 из спецификации: любое
+    // входящее соединение — попытка шифрованного рукопожатия).
+    let (provide, require) = {
+        let mode = rd(&inner.config).encryption;
+        (mode.provide(), mode.required())
+    };
+    let known: Vec<InfoHash> = rd(&inner.handles)
+        .iter()
+        .map(|handle| handle.info_hash)
+        .collect();
+    let handshake = match crate::mse::accept(stream, &known, provide, require).await {
+        Ok(handshake) => handshake,
+        Err(_) => return,
+    };
+    let mut stream = handshake.stream;
     let mut buf = [0u8; 68];
     if read_exact_timeout(&mut stream, &mut buf, Duration::from_secs(10))
         .await
@@ -2720,6 +2804,14 @@ async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketA
         Ok(remote) => remote,
         Err(_) => return,
     };
+    dispatch_incoming(inner, addr, stream, remote).await;
+}
+
+/// Передаёт соединение торренту по info-hash из handshake.
+async fn dispatch_incoming<S>(inner: Arc<Inner>, addr: SocketAddr, stream: S, remote: Handshake)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let runtime = {
         let handles: Vec<Arc<TorrentHandle>> = rd(&inner.handles).clone();
         handles

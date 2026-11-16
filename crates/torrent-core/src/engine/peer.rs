@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use super::torrent::Runtime;
-use super::{rd, read_exact_timeout};
+use super::{rd, read_exact_timeout, EncryptionMode};
 use crate::bencode::{self, Value};
 use crate::metainfo::InfoHash;
+use crate::mse;
 use crate::wire::{Handshake, Message, HANDSHAKE_LEN};
 
 /// Таймаут установки TCP-соединения.
@@ -92,46 +92,87 @@ pub(crate) struct MetadataFetch {
 /// При включённом прокси TCP-соединение открывается через него (SOCKS5 или
 /// HTTP CONNECT): иначе пиры видели бы настоящий адрес клиента.
 pub(crate) async fn connect(runtime: Arc<Runtime>, addr: SocketAddr) {
-    let proxy = rd(&runtime.env.config)
-        .proxy
-        .as_deref()
-        .and_then(|spec| crate::proxy::ProxyConfig::parse(spec).ok());
-    let result = match &proxy {
-        Some(proxy) => {
-            tokio::time::timeout(CONNECT_TIMEOUT, crate::proxy::connect(proxy, addr)).await
-        }
-        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await,
+    let (mode, proxy) = {
+        let config = rd(&runtime.env.config);
+        (
+            config.encryption,
+            config
+                .proxy
+                .as_deref()
+                .and_then(|spec| crate::proxy::ProxyConfig::parse(spec).ok()),
+        )
     };
-    let stream = match result {
-        Ok(Ok(stream)) => stream,
-        _ => {
+    if !matches!(mode, EncryptionMode::Disabled) {
+        let Some(stream) = open_stream(proxy.as_ref(), addr).await else {
             runtime.candidate_failed(addr);
             return;
+        };
+        let _ = stream.set_nodelay(true);
+        let info_hash = runtime.meta.info_hash;
+        match mse::initiate(stream, &info_hash, mode.provide()).await {
+            Ok(handshake) => {
+                if let Err(message) = run(runtime.clone(), addr, handshake.stream, None).await {
+                    let _ = message;
+                }
+                return;
+            }
+            Err(message) => {
+                if mode.required() {
+                    let _ = message;
+                    runtime.candidate_failed(addr);
+                    return;
+                }
+                // «Предпочитать шифрование»: пир мог не поддержать MSE —
+                // открываем обычное соединение заново (первое уже испорчено
+                // частичным рукопожатием).
+            }
         }
+    }
+    let Some(stream) = open_stream(proxy.as_ref(), addr).await else {
+        runtime.candidate_failed(addr);
+        return;
     };
+    let _ = stream.set_nodelay(true);
     if let Err(message) = run(runtime.clone(), addr, stream, None).await {
         let _ = message;
     }
 }
 
-/// Входящее соединение: handshake уже прочитан при маршрутизации.
-pub(crate) async fn accept(
-    runtime: Arc<Runtime>,
+/// Открывает TCP-соединение (напрямую или через прокси) с таймаутом.
+async fn open_stream(
+    proxy: Option<&crate::proxy::ProxyConfig>,
     addr: SocketAddr,
-    stream: TcpStream,
-    remote: Handshake,
-) {
+) -> Option<TcpStream> {
+    let result = match proxy {
+        Some(proxy) => {
+            tokio::time::timeout(CONNECT_TIMEOUT, crate::proxy::connect(proxy, addr)).await
+        }
+        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await,
+    };
+    match result {
+        Ok(Ok(stream)) => Some(stream),
+        _ => None,
+    }
+}
+
+/// Входящее соединение: handshake уже прочитан при маршрутизации.
+pub(crate) async fn accept<S>(runtime: Arc<Runtime>, addr: SocketAddr, stream: S, remote: Handshake)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let _ = run(runtime, addr, stream, Some(remote)).await;
 }
 
-async fn run(
+async fn run<S>(
     runtime: Arc<Runtime>,
     addr: SocketAddr,
-    stream: TcpStream,
+    stream: S,
     remote: Option<Handshake>,
-) -> Result<(), String> {
-    let _ = stream.set_nodelay(true);
-    let (mut reader, mut writer) = stream.into_split();
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let ours = Handshake::with_extensions(runtime.meta.info_hash, runtime.env.peer_id);
     writer
         .write_all(&ours.encode())
@@ -242,14 +283,17 @@ impl Outgoing {
     }
 }
 
-async fn session_loop(
+async fn session_loop<W>(
     runtime: &Arc<Runtime>,
     id: u64,
     messages: &mut mpsc::Receiver<Result<Message, String>>,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     extended: bool,
     pex: &mut PexSession,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut have_rx = runtime.have_tx.subscribe();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -284,15 +328,18 @@ async fn session_loop(
     }
 }
 
-async fn handle_message(
+async fn handle_message<W>(
     runtime: &Arc<Runtime>,
     id: u64,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     message: Message,
     extended: bool,
     out: &mut Outgoing,
     pex: &mut PexSession,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
     match message {
         Message::KeepAlive => {}
         Message::Choke => runtime.set_peer_choking(id, true),
@@ -366,9 +413,9 @@ async fn handle_message(
 }
 
 /// Отвечает на запрос метаданных по BEP 9.
-async fn serve_metadata(
+async fn serve_metadata<W: AsyncWrite + Unpin>(
     runtime: &Arc<Runtime>,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     payload: &[u8],
 ) -> Result<(), String> {
     let (value, _) = match bencode::decode(payload) {
@@ -440,12 +487,15 @@ fn on_pex(runtime: &Arc<Runtime>, payload: &[u8]) {
 }
 
 /// Отправляет пиру дифф списка известных нам адресов.
-async fn send_pex(
+async fn send_pex<W>(
     runtime: &Arc<Runtime>,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     pex: &mut PexSession,
     out: &mut Outgoing,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
     let Some(peer_id) = pex.peer_id else {
         return Ok(());
     };
@@ -494,10 +544,10 @@ async fn send_pex(
 }
 
 /// Периодические действия: интерес, отдача, запросы блоков, keep-alive.
-async fn tick(
+async fn tick<W: AsyncWrite + Unpin>(
     runtime: &Arc<Runtime>,
     id: u64,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     out: &mut Outgoing,
 ) -> Result<(), String> {
     let complete = runtime.is_complete();
@@ -541,10 +591,10 @@ async fn tick(
 /// и после `Unchoke`. Раньше запросы выдавались исключительно по тику, и потолок
 /// выходил жёстким: 32 запроса по 16 КБ каждые 250 мс ≈ 2 МБ/с на соединение,
 /// сколько бы ни было свободно в канале. Возвращает `true`, если что-то ушло.
-async fn pump_requests(
+async fn pump_requests<W: AsyncWrite + Unpin>(
     runtime: &Arc<Runtime>,
     id: u64,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut W,
     out: &mut Outgoing,
 ) -> Result<bool, String> {
     let window = runtime.peer_window(id);
@@ -572,14 +622,17 @@ async fn pump_requests(
 }
 
 /// Отправляет сообщение и сбрасывает буфер.
-async fn send(writer: &mut OwnedWriteHalf, message: &Message) -> Result<(), String> {
+async fn send<W: AsyncWrite + Unpin>(writer: &mut W, message: &Message) -> Result<(), String> {
     writer
         .write_all(&message.encode())
         .await
         .map_err(|err| format!("запись: {err}"))
 }
 
-async fn read_message(reader: &mut OwnedReadHalf, timeout: Duration) -> Result<Message, String> {
+async fn read_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<Message, String> {
     let mut head = [0u8; 4];
     read_exact_timeout(reader, &mut head, timeout)
         .await
@@ -744,8 +797,8 @@ pub(crate) async fn fetch_metadata(
     Ok(data)
 }
 
-async fn request_metadata(
-    writer: &mut OwnedWriteHalf,
+async fn request_metadata<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     their_ut: u8,
     index: usize,
 ) -> Result<(), String> {

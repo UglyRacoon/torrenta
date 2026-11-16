@@ -98,3 +98,35 @@ test.describe("Настройки", () => {
     await expect(dialog).toBeHidden();
   });
 });
+
+/**
+ * Шифрование соединений (1.9): три режима, выбор сохраняется и показывается
+ * после повторного открытия настроек.
+ */
+test("1.9: режим шифрования соединений сохраняется", async ({ page }) => {
+  await openApp(page);
+  await page.getByRole("button", { name: "Настройки" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Настройки" });
+  await expect(dialog).toBeVisible();
+
+  const select = dialog.getByRole("button", { name: /Шифрование соединений/ });
+  await expect(select).toBeVisible();
+  await expect(select).toContainText("Предпочтительно");
+  // Через клавиатуру: автопрокрутка к пункту закрывает выпадающий список
+  // (компонент закрывается на любой прокрутке, чтобы не «улетать» от кнопки).
+  await select.scrollIntoViewIfNeeded();
+  await select.press("ArrowDown");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  await expect(select).toContainText("Обязательно");
+
+  await dialog.getByRole("button", { name: "Сохранить" }).click();
+  await expect(dialog).toBeHidden();
+
+  await page.getByRole("button", { name: "Настройки" }).first().click();
+  const reopened = page.getByRole("dialog", { name: "Настройки" });
+  await expect(reopened.getByRole("button", { name: /Шифрование соединений/ })).toContainText(
+    "Обязательно",
+  );
+  await page.keyboard.press("Escape");
+});

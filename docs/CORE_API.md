@@ -1222,3 +1222,31 @@ impl TorrentManager {
   даёт только `recheck`;
 * `apply_resume` не рассылает `Have` пирам: вызов рассчитан на момент
   восстановления, когда соединений ещё нет.
+## Шифрование соединений MSE/PE (1.9)
+
+`EngineConfig.encryption` — `EncryptionMode` (`disabled`, `preferred`, `required`).
+Исходящее соединение в режиме `preferred` сначала выполняет рукопожатие MSE и
+только при неудаче открывает **новое** TCP-соединение без шифрования; `required`
+открытых соединений не делает. Входящее соединение классифицируется по первым
+байтам: `\x13BitTorrent protocol` — обычный peer wire, иначе — `mse::accept` по
+списку info-hash активных раздач.
+
+Низкоуровневый API `torrent_core::mse`:
+
+```rust
+pub struct Handshake<S> { pub stream: MseStream<S>, pub rc4: bool }
+pub async fn initiate<S>(stream: S, info_hash: &InfoHash, provide: u32) -> Result<Handshake<S>, String>;
+pub async fn accept<S>(stream: S, known: &[InfoHash], provide: u32, require_rc4: bool) -> Result<Handshake<S>, String>;
+pub const PROVIDE_PLAINTEXT: u32 = 0x01;
+pub const PROVIDE_RC4: u32 = 0x02;
+```
+
+`MseStream` реализует `AsyncRead`/`AsyncWrite`: RC4-поток непрерывный, частичные
+записи буферизуются, чтобы байты не шифровались дважды. После `accept` первые
+байты payload инициатора (`IA`) могут быть уже прочитаны — они отдаются
+читателю прозрачно.
+
+Ограничения: флаги трекера `supportcrypto`/`requirecrypto` не отправляются,
+uTP (BEP 29) не реализован. Рукопожатие проверено на спецификации Vuze v1.0 и на
+обмене между экземплярами движка; перекрёстная проверка с libtorrent потребует
+отдельного прогона на реальной раздаче.

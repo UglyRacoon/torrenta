@@ -22,6 +22,8 @@ pub mod dht;
 pub mod engine;
 pub mod magnet;
 pub mod metainfo;
+#[doc(hidden)]
+pub mod mse;
 pub mod peerid;
 pub mod pex;
 pub mod picker;
@@ -36,9 +38,9 @@ pub mod wire;
 pub use bencode::{decode as bencode_decode, encode as bencode_encode, BencodeError, Value};
 pub use bitfield::Bitfield;
 pub use engine::{
-    AddOptions, AddSource, ContentLayout, Diagnostics, EngineConfig, EngineError, EngineEvent,
-    FilePriority, FileView, GlobalTotals, PreviewFile, ResumeData, TorrentManager, TorrentPreview,
-    TorrentSnapshot, TorrentState,
+    AddOptions, AddSource, ContentLayout, Diagnostics, EncryptionMode, EngineConfig, EngineError,
+    EngineEvent, FilePriority, FileView, GlobalTotals, PreviewFile, ResumeData, TorrentManager,
+    TorrentPreview, TorrentSnapshot, TorrentState,
 };
 pub use magnet::{Magnet, MagnetError};
 pub use metainfo::{FileEntry, InfoHash, Metainfo, MetainfoError};

@@ -54,6 +54,8 @@ export function createSelect(options: SelectOptions): SelectControl {
   let current = options.value;
   let open = false;
   let activeIndex = -1;
+  /// Когда меню открылось: нужно, чтобы отличать скролл от `focus()`.
+  let openedAt = 0;
   let menu: HTMLElement | null = null;
   let items: HTMLElement[] = [];
 
@@ -184,6 +186,12 @@ export function createSelect(options: SelectOptions): SelectControl {
     if (target instanceof Node && menu?.contains(target)) {
       return;
     }
+    // Сразу после открытия браузер может прокрутить контейнер к кнопке
+    // (следствие `focus()`); это не «пользователь ушёл прокруткой», поэтому
+    // такой скролл меню не закрывает (1.9).
+    if (Date.now() - openedAt < 250) {
+      return;
+    }
     close();
   }
 
@@ -216,6 +224,7 @@ export function createSelect(options: SelectOptions): SelectControl {
       document.body.append(menu);
     }
     open = true;
+    openedAt = Date.now();
     activeIndex = Math.max(0, list.findIndex((option) => option.value === current));
     renderMenu();
     menu.hidden = false;

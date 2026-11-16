@@ -14,7 +14,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use torrent_core::{ContentLayout, EngineConfig};
+use torrent_core::{ContentLayout, EncryptionMode, EngineConfig};
 
 /// Имя файла настроек в каталоге конфигурации приложения.
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -175,6 +175,8 @@ pub struct SettingsDto {
     pub auto_update: bool,
     /// Раскладка файлов новых торрентов (1.10): как в qBittorrent.
     pub content_layout: ContentLayout,
+    /// Шифрование соединений с пирами: выключено, предпочтительно, обязательно (1.9).
+    pub encryption: EncryptionMode,
     /// История каталогов загрузки для диалога добавления (1.10).
     ///
     /// Хранится именно базовый каталог загрузки (тот, что выбирает пользователь),
@@ -291,6 +293,7 @@ impl Default for SettingsDto {
             associate_files: true,
             auto_update: true,
             content_layout: ContentLayout::Original,
+            encryption: EncryptionMode::Preferred,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -572,6 +575,7 @@ pub fn to_engine_config(dto: &SettingsDto) -> EngineConfig {
     EngineConfig {
         download_dir: dto.download_path(),
         content_layout: dto.content_layout,
+        encryption: dto.encryption,
         max_peers_per_torrent: dto.max_peers as usize,
         download_limit_kib: dto.download_limit_kib,
         upload_limit_kib: dto.upload_limit_kib,
@@ -644,6 +648,7 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
             u32::try_from(config.max_active_seeds).unwrap_or(MAX_ACTIVE_LIMIT),
         ),
         content_layout: config.content_layout,
+        encryption: config.encryption,
         save_path_history: Vec::new(),
         save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
         remember_last_save_path: false,
@@ -854,7 +859,7 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use torrent_core::{ContentLayout, EngineConfig};
+    use torrent_core::{ContentLayout, EncryptionMode, EngineConfig};
 
     /// Уникальный временный каталог для одного теста.
     fn test_dir(tag: &str) -> PathBuf {
@@ -902,6 +907,7 @@ mod tests {
             associate_files: true,
             auto_update: true,
             content_layout: ContentLayout::Original,
+            encryption: EncryptionMode::Preferred,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -976,6 +982,7 @@ mod tests {
             associate_files: true,
             auto_update: true,
             content_layout: ContentLayout::Original,
+            encryption: EncryptionMode::Preferred,
             save_path_history: Vec::new(),
             save_path_history_length: DEFAULT_SAVE_PATH_HISTORY_LENGTH,
             remember_last_save_path: false,
@@ -1780,6 +1787,7 @@ mod tests {
             "auto_update",
             "autostart",
             "content_layout",
+            "encryption",
             "remember_last_save_path",
             "save_path_history",
             "save_path_history_length",
