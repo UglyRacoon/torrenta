@@ -456,6 +456,58 @@ a:hover {
   font-size: 11px;
 }
 
+/* Поле с выпадающим списком недавних каталогов загрузки. */
+.combo {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.combo .input {
+  width: 100%;
+}
+
+.combo__list {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  max-height: 232px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-floating);
+}
+
+.combo__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.combo__item:hover,
+.combo__item:focus-visible {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  outline: none;
+}
+
+.combo__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .field__row .input {
   flex: 1;
   /* Поле не должно расталкивать кнопки в узком окне (1.5). */

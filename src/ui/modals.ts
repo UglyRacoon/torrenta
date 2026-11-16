@@ -1,7 +1,17 @@
 import { requireEngineApi } from "../api/engine";
-import type { AddOptions, AssociationDto, SettingsDto, TorrentPreview, TorrentSource } from "../api/types";
+import type {
+  AddOptions,
+  AssociationDto,
+  SettingsDto,
+  TorrentPreview,
+  TorrentSource,
+  UpdateProgressDto,
+  UpdateStateDto,
+} from "../api/types";
 import { SPEED_STEPS } from "../api/types";
 import { fmtBytes, basename } from "../lib/format";
+import { torrentTargetPath } from "../lib/paths";
+import { loadRecentDirs, rememberDownloadDir } from "../lib/recent-dirs";
 import { h, messageOf, setAttr, setText, toggleClass } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { createSelect, type SelectOption } from "./select";
@@ -31,6 +41,16 @@ export interface SettingsHandlers {
   onPickWatchDir(): Promise<string | null>;
 }
 
+/** Действия окна «Обновление Torrenta». */
+export interface UpdateHandlers {
+  /** Скачать и установить; промис завершается, когда приложение закрывается. */
+  onInstall(): Promise<void>;
+  /** Открыть страницу релиза в браузере. */
+  onOpenPage(url: string): void;
+  /** Подписка на прогресс скачивания; возвращает функцию отписки. */
+  subscribeProgress(listener: (progress: UpdateProgressDto) => void): Promise<() => void>;
+}
+
 export interface ModalHost {
   isOpen(): boolean;
   closeAll(): void;
@@ -38,6 +58,8 @@ export interface ModalHost {
   openSettings(settings: SettingsDto, handlers: SettingsHandlers): void;
   /** Редактор трекеров торрента (1.7): список URL, добавление, удаление, сохранение. */
   openTrackerEditor(id: number): void;
+  /** Окно обновления (1.9): что нового, размер и установка с прогрессом. */
+  openUpdate(state: UpdateStateDto, handlers: UpdateHandlers): void;
   confirmRemove(name: string, onConfirm: (deleteFiles: boolean) => Promise<void>): void;
 }
 
@@ -396,15 +418,123 @@ export function createModalHost(root: HTMLElement): ModalHost {
 
     const errorEl = formError();
 
-    // --- Каталог загрузки: общий узел для превью и запасного режима ---
+    // --- Каталог загрузки: базовый каталог + папка торрента + история ---
+    //
+    // В поле показывается итоговый путь: каталог загрузки плюс папка с именем
+    // раздачи (когда файлов несколько). История хранит именно базовые каталоги,
+    // а не итоговые пути с папкой торрента — иначе список забивался бы
+    // одноразовыми именами раздач.
+    let baseDir = request.savePath;
+    /** Пользователь правил путь руками — тогда автопапку не подставляем. */
+    let manualPath = false;
+    let recentDirs = loadRecentDirs();
+    let hideRecentTimer = 0;
+
     const dirInput = h("input", {
       class: "input",
-      attrs: { type: "text", value: folder, spellcheck: "false", autocomplete: "off" },
+      attrs: {
+        type: "text",
+        value: folder,
+        spellcheck: "false",
+        autocomplete: "off",
+        "aria-label": "Папка загрузки",
+        "aria-autocomplete": "list",
+      },
     });
+    const recentList = h("ul", {
+      class: "combo__list",
+      attrs: { role: "listbox", "aria-label": "Недавние папки загрузки" },
+    });
+    recentList.hidden = true;
+    const combo = h("div", { class: "combo" }, dirInput, recentList);
+
+    /** Итоговый путь по текущему превью и базовому каталогу. */
+    function applyTarget(): void {
+      if (manualPath) {
+        return;
+      }
+      folder = torrentTargetPath(baseDir, preview?.name ?? "", preview?.files.length ?? 0);
+      dirInput.value = folder;
+    }
+
+    function hideRecent(): void {
+      recentList.hidden = true;
+    }
+
+    function showRecent(): void {
+      window.clearTimeout(hideRecentTimer);
+      recentList.replaceChildren();
+      if (recentDirs.length === 0) {
+        hideRecent();
+        return;
+      }
+      for (const dir of recentDirs) {
+        const item = h(
+          "li",
+          { class: "combo__item", attrs: { role: "option", tabindex: "-1" } },
+          h("span", { class: "combo__path", text: dir }),
+        );
+        // Не даём полю потерять фокус до выбора: иначе список закроется раньше
+        // клика (mousedown по умолчанию переводит фокус).
+        item.addEventListener("mousedown", (event) => event.preventDefault());
+        item.addEventListener("click", () => chooseBaseDir(dir));
+        item.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            chooseBaseDir(dir);
+          }
+        });
+        recentList.append(item);
+      }
+      recentList.hidden = false;
+    }
+
+    function chooseBaseDir(dir: string): void {
+      baseDir = dir;
+      manualPath = false;
+      hideRecent();
+      applyTarget();
+      showError(errorEl, null);
+    }
+
     dirInput.addEventListener("input", () => {
+      manualPath = true;
       folder = dirInput.value;
       showError(errorEl, null);
     });
+    dirInput.addEventListener("focus", () => showRecent());
+    dirInput.addEventListener("click", () => showRecent());
+    dirInput.addEventListener("blur", () => {
+      // Небольшая задержка: клик по пункту списка должен успеть сработать.
+      hideRecentTimer = window.setTimeout(hideRecent, 120);
+    });
+    dirInput.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" && !recentList.hidden) {
+        event.preventDefault();
+        const first = recentList.querySelector<HTMLElement>(".combo__item");
+        first?.focus();
+      } else if (event.key === "Escape") {
+        hideRecent();
+      }
+    });
+    recentList.addEventListener("keydown", (event) => {
+      const items = Array.from(recentList.querySelectorAll<HTMLElement>(".combo__item"));
+      const index = items.indexOf(document.activeElement as HTMLElement);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        const next = (index + delta + items.length) % items.length;
+        items[next]?.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        hideRecent();
+        dirInput.focus();
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        (document.activeElement as HTMLElement | null)?.click();
+      }
+    });
+
     const browseBtn = button("Обзор…", "btn--ghost field__button");
     browseBtn.addEventListener("click", () => {
       dirInput.disabled = true;
@@ -412,8 +542,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
         .onBrowseDir()
         .then((picked) => {
           if (picked) {
-            folder = picked;
-            dirInput.value = picked;
+            chooseBaseDir(picked);
           }
         })
         .catch((reason: unknown) => showError(errorEl, messageOf(reason)))
@@ -421,13 +550,17 @@ export function createModalHost(root: HTMLElement): ModalHost {
           dirInput.disabled = false;
         });
     });
-    const dirRow = h("div", { class: "field__row" }, dirInput, browseBtn);
+    const dirRow = h("div", { class: "field__row" }, combo, browseBtn);
     const folderField = (): HTMLElement =>
       h(
         "div",
         { class: "field" },
         h("span", { class: "field__label", text: "Папка загрузки" }),
         dirRow,
+        h("span", {
+          class: "field__hint",
+          text: "Недавние каталоги — в списке поля. Папка с именем раздачи добавляется сама.",
+        }),
       );
 
     function setFooter(...nodes: HTMLElement[]): void {
@@ -574,6 +707,9 @@ export function createModalHost(root: HTMLElement): ModalHost {
         return;
       }
       fit();
+      // Название и число файлов известны только теперь: подставляем папку
+      // раздачи, если пользователь не правил путь вручную.
+      applyTarget();
       selected.clear();
       for (const file of preview.files) {
         selected.add(file.index);
@@ -705,6 +841,8 @@ export function createModalHost(root: HTMLElement): ModalHost {
     // --- Состояние 4: метаданные не получены, но скачать целиком можно ---
     function renderFallback(reason: string): void {
       fit();
+      // Метаданных нет — имени раздачи тоже нет, поэтому папку не придумываем.
+      applyTarget();
       submitBtn = null;
       const download = button("Скачать всё равно", "btn--primary");
       const retry = button("Повторить", "btn--ghost");
@@ -784,7 +922,14 @@ export function createModalHost(root: HTMLElement): ModalHost {
       if (!submit) {
         return;
       }
-      run(modal, submit, errorEl, () => handlers.onAdd(source as TorrentSource, options));
+      const rememberAs = manualPath ? folder.trim() : baseDir.trim();
+      run(modal, submit, errorEl, () =>
+        handlers.onAdd(source as TorrentSource, options).then(() => {
+          // В историю — именно базовый каталог: папка с именем раздачи
+          // создаётся автоматически и не должна копиться в списке.
+          recentDirs = rememberDownloadDir(rememberAs);
+        }),
+      );
     }
 
     // Enter — скачать (контракт 4.1), когда фокус не в поле ввода.
@@ -965,6 +1110,13 @@ export function createModalHost(root: HTMLElement): ModalHost {
       "Куски качаются по порядку: файл можно открывать, не дожидаясь конца загрузки.",
       settings.sequential ?? false,
     );
+    // 1.9: автоматическая проверка обновлений. Доступна только в Windows-сборке:
+    // в демо-режиме браузера проверять нечего.
+    const autoUpdate = checkboxRow(
+      "Проверять обновления автоматически",
+      "При появлении новой версии в сайдбаре загорится значок «Обновление» — установку запускает пользователь.",
+      settings.auto_update ?? true,
+    );
     const behaviorGroup = h(
       "div",
       { class: "field" },
@@ -972,6 +1124,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
       seed.row,
       notify.row,
       sequential.row,
+      autoUpdate.row,
     );
 
     // 1.7 (баг-репорт): ассоциация .torrent — переключатель, живая строка состояния
@@ -1604,6 +1757,128 @@ export function createModalHost(root: HTMLElement): ModalHost {
       });
   }
 
+  /** Окно «Обновление Torrenta» (1.9): что нового и установка с прогрессом. */
+  function openUpdate(state: UpdateStateDto, handlers: UpdateHandlers): void {
+    closeAll();
+    const modal = openRoot({ title: "Обновление Torrenta", className: "modal--update" });
+    const errorEl = formError();
+    const version = state.available ?? "";
+    const sizeText = state.asset_size > 0 ? ` · ${fmtBytes(state.asset_size)}` : "";
+
+    const notes = h("p", { class: "update__notes" });
+    const notesText = (state.notes ?? "").trim();
+    notes.textContent =
+      notesText === ""
+        ? "Описание изменений доступно на странице релиза."
+        : notesText.length > 600
+          ? `${notesText.slice(0, 600).trim()}…`
+          : notesText;
+
+    const progressFill = h("i", { class: "update__bar-fill" });
+    const progressBar = h(
+      "div",
+      {
+        class: "update__bar",
+        attrs: { role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100" },
+      },
+      progressFill,
+    );
+    const progressText = h("p", { class: "update__progress-text num", attrs: { role: "status" } });
+    const progress = h(
+      "div",
+      { class: "update__progress" },
+      progressBar,
+      progressText,
+    );
+    progress.hidden = true;
+
+    const install = button("Скачать и установить", "btn--primary");
+    const page = state.page_url ? button("Что нового", "btn--ghost") : null;
+    const later = button("Позже", "btn--ghost");
+
+    let unsubscribe: (() => void) | null = null;
+    modal.onClose(() => unsubscribe?.());
+
+    install.addEventListener("click", () => {
+      install.disabled = true;
+      if (page) {
+        page.disabled = true;
+      }
+      later.disabled = true;
+      progress.hidden = false;
+      progressFill.style.width = "0%";
+      setAttr(progressBar, "aria-valuenow", "0");
+      setText(progressText, "Готовим скачивание…");
+      showError(errorEl, null);
+      void handlers.onInstall().catch((reason: unknown) => {
+        showError(errorEl, messageOf(reason));
+        install.disabled = false;
+        if (page) {
+          page.disabled = false;
+        }
+        later.disabled = false;
+      });
+    });
+
+    void handlers
+      .subscribeProgress((event) => {
+        const percent =
+          event.percent ?? (event.total > 0 ? (event.received / event.total) * 100 : null);
+        if (percent === null) {
+          setText(progressText, `Скачано ${fmtBytes(event.received)}`);
+          return;
+        }
+        const value = Math.max(0, Math.min(100, percent));
+        progressFill.style.width = `${value.toFixed(1)}%`;
+        setAttr(progressBar, "aria-valuenow", String(Math.round(value)));
+        setText(
+          progressText,
+          event.total > 0
+            ? `Скачано ${fmtBytes(event.received)} из ${fmtBytes(event.total)} · ${Math.round(value)}%`
+            : `Скачано ${fmtBytes(event.received)}`,
+        );
+      })
+      .then((off) => {
+        unsubscribe = off;
+      })
+      .catch(() => {
+        // Прогресс — удобство, а не условие установки: без него окно работает.
+      });
+
+    later.addEventListener("click", () => modal.close());
+    page?.addEventListener("click", () => {
+      if (state.page_url) {
+        handlers.onOpenPage(state.page_url);
+      }
+    });
+
+    modal.body.replaceChildren(
+      h(
+        "div",
+        { class: "update" },
+        h(
+          "p",
+          { class: "update__versions num" },
+          h("span", { text: `Сейчас ${state.current_version}` }),
+          h("span", { class: "update__arrow", text: "→" }),
+          h("span", { class: "update__next", text: version }),
+          sizeText === "" ? null : h("span", { class: "update__size", text: sizeText }),
+        ),
+        h("h3", { class: "update__title", text: "Что нового" }),
+        notes,
+        progress,
+      ),
+      errorEl,
+    );
+
+    const footer: HTMLElement[] = [later];
+    if (page) {
+      footer.push(page);
+    }
+    footer.push(install);
+    modal.footer.replaceChildren(...footer);
+    install.focus();
+  }
   function confirmRemove(name: string, onConfirm: (deleteFiles: boolean) => Promise<void>): void {
     closeAll();
     const modal = openRoot({ title: "Удалить торрент?", className: "modal--confirm" });
@@ -1654,6 +1929,7 @@ export function createModalHost(root: HTMLElement): ModalHost {
     openAdd,
     openSettings,
     openTrackerEditor,
+    openUpdate,
     confirmRemove,
   };
 }

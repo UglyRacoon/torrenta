@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, State};
 use tauri_plugin_dialog::{DialogExt as _, FilePath};
 use tauri_plugin_opener as opener;
-use tauri_plugin_updater::UpdaterExt as _;
 use torrent_core::engine::{AddOptions, TorrentManager, TorrentPreview};
 
 use crate::association::{self, AssociationSlot, AssociationState, UNSUPPORTED_PLATFORM};
@@ -26,6 +25,7 @@ use crate::auto_shutdown::{AutoShutdownDto, AutoShutdownEvent, AUTO_SHUTDOWN_EVE
 use crate::session::SessionRegistry;
 use crate::settings::{self, SettingsDto};
 use crate::state::{engine_error_text, AppEngine, AppStateDto};
+use crate::update;
 
 /// Максимальный размер .torrent-файла, который принимает бэкенд.
 pub const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
@@ -632,11 +632,6 @@ fn allowed_external(url: &str) -> bool {
         || lowered.starts_with("mailto:")
 }
 
-/// Текст для интерфейса, когда обновления не настроены.
-///
-/// Формулировка честная: ключа подписи нет, поэтому проверять обновления нечем.
-const UPDATE_NOT_CONFIGURED: &str = "обновления не настроены: нет ключа подписи";
-
 /// Диагностика движка (команда `engine_diagnostics`).
 ///
 /// Поля один в один повторяют `torrent_core::Diagnostics` и остаются
@@ -727,18 +722,9 @@ pub struct PortableInfoDto {
     pub data_dir: String,
 }
 
-/// Состояние обновлений (команда `check_update`).
-#[derive(Debug, Clone, Serialize)]
-pub struct UpdateStateDto {
-    /// Настроена ли проверка (задан ключ подписи).
-    pub configured: bool,
-    /// Текущая версия приложения.
-    pub current_version: String,
-    /// Версия доступного обновления.
-    pub available: Option<String>,
-    /// Пояснение для интерфейса.
-    pub message: Option<String>,
-}
+/// Состояние обновлений и прогресс скачивания живут в модуле [`crate::update`]:
+/// их отдаёт и команда, и фоновый наблюдатель, поэтому один тип на двоих.
+pub use crate::update::{UpdateProgressDto, UpdateStateDto};
 
 /// Состояние привязки `.torrent`-файлов (команды `association_status` и
 /// `repair_association`).
@@ -920,72 +906,69 @@ fn store_association(slot: &AssociationSlot, next: AssociationState) {
     }
 }
 
-/// Проверяет наличие обновления.
+/// Проверяет наличие обновления в GitHub Releases.
 ///
-/// Пока в `tauri.conf.json` нет ключа подписи, обновления считаются
-/// ненастроенными: плагин выключен (`active: false`), и честный ответ —
-/// `configured: false` с пояснением, а не «обновлений нет».
+/// Плагин `tauri-plugin-updater` требовал подписанного манифеста и ключа, а у
+/// проекта его нет, поэтому канал простой: версия из последнего релиза GitHub.
+/// Найденный релиз кэшируется — кнопка «Установить» не должна ходить в сеть
+/// повторно и показывать другую версию, чем та, что видел пользователь.
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<UpdateStateDto, String> {
     let current_version = app.package_info().version.to_string();
-    if !pubkey_configured(updater_pubkey(&app).as_deref()) {
-        return Ok(update_not_configured(&current_version));
-    }
-
-    let updater = match app.updater() {
-        Ok(updater) => updater,
-        // Ключ задан, но адреса обновлений — нет (`endpoints: []`). Это не
-        // ошибка сети: честнее вернуть состояние с пояснением, чем ронять команду.
-        Err(err) => {
-            return Ok(UpdateStateDto {
-                configured: true,
-                message: Some(format!("обновления настроены не полностью: {err}")),
-                current_version,
-                available: None,
-            });
-        }
-    };
-    let update = updater
-        .check()
-        .await
-        .map_err(|err| format!("не удалось проверить обновления: {err}"))?;
-
-    let available = update.as_ref().map(|update| update.version.clone());
-    Ok(UpdateStateDto {
-        configured: true,
-        current_version,
-        message: Some(match &available {
-            Some(version) => format!("доступно обновление {version}"),
-            None => "обновлений нет".to_string(),
-        }),
-        available,
-    })
+    let client = update::client()?;
+    let release = update::check(&client, &current_version).await?;
+    update::remember(release.clone());
+    Ok(update::state_for(&current_version, release.as_ref()))
 }
 
-/// Ключ подписи обновлений из конфигурации (`plugins.updater.pubkey`).
-fn updater_pubkey(app: &AppHandle) -> Option<String> {
-    let updater = app.config().plugins.0.get("updater")?;
-    Some(updater.get("pubkey")?.as_str()?.to_string())
-}
-
-/// Задан ли ключ подписи: пустая строка и пробелы ключом не считаются.
-fn pubkey_configured(pubkey: Option<&str>) -> bool {
-    pubkey.is_some_and(|key| !key.trim().is_empty())
-}
-
-/// Ответ `check_update`, когда обновления не настроены.
+/// Скачивает и устанавливает обновление, затем завершает приложение.
 ///
-/// Вынесено из команды: `AppHandle` в тестах не создать, а текст сообщения
-/// фронтенд показывает как есть.
-fn update_not_configured(current_version: &str) -> UpdateStateDto {
-    UpdateStateDto {
-        configured: false,
-        current_version: current_version.to_string(),
-        available: None,
-        message: Some(UPDATE_NOT_CONFIGURED.to_string()),
-    }
-}
+/// Установщик скачивается во временный каталог, запускается скриптом, который
+/// ждёт выхода Torrenta (иначе он не сможет перезаписать собственный exe),
+/// ставит обновление в тихом режиме и снова открывает приложение. Прогресс
+/// скачивания уходит в интерфейс событием [`update::UPDATE_PROGRESS_EVENT`].
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    let current_version = app.package_info().version.to_string();
+    let client = update::client()?;
+    // Кэш может быть пустым (пользователь нажал «Установить» до проверки) —
+    // тогда проверяем заново, это один запрос.
+    let release = match update::cached() {
+        Some(release) => release,
+        None => update::check(&client, &current_version)
+            .await?
+            .ok_or_else(|| "обновлений нет: установлена последняя версия".to_string())?,
+    };
+    let asset = release
+        .windows_asset()
+        .ok_or_else(|| "в релизе нет установщика для Windows".to_string())?
+        .clone();
+    let destination = update::download_dir().join(&asset.name);
+    let progress_app = app.clone();
+    update::download(&client, &asset.url, &destination, move |received, total| {
+        let percent = if total > 0 {
+            Some((received as f64 / total as f64) * 100.0)
+        } else {
+            None
+        };
+        let payload = update::UpdateProgressDto {
+            received,
+            total,
+            percent,
+        };
+        if let Err(err) = progress_app.emit(update::UPDATE_PROGRESS_EVENT, &payload) {
+            eprintln!("[torrenta] не удалось отправить прогресс обновления: {err}");
+        }
+    })
+    .await?;
 
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("не удалось определить путь приложения: {err}"))?;
+    update::install_and_restart(&destination, &exe, std::process::id())?;
+    // Выходим сразу: установщик ждёт именно завершения этого процесса.
+    app.exit(0);
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,26 +1267,6 @@ mod tests {
                 torrent_core::engine::FilePriority::Normal,
                 torrent_core::engine::FilePriority::High,
             ]
-        );
-    }
-
-    #[test]
-    fn check_update_reports_missing_pubkey() {
-        // Ключа нет вовсе, он пуст или состоит из пробелов — обновления не настроены.
-        assert!(!pubkey_configured(None));
-        assert!(!pubkey_configured(Some("")));
-        assert!(!pubkey_configured(Some("   \t ")));
-        assert!(pubkey_configured(Some("MCowBQYDK2VwAyEA")));
-        assert!(pubkey_configured(Some("  MCowBQYDK2VwAyEA  ")));
-
-        let dto = update_not_configured("1.7.0");
-        assert!(!dto.configured);
-        assert_eq!(dto.current_version, "1.7.0");
-        assert_eq!(dto.available, None);
-        let message = dto.message.expect("пояснение для интерфейса");
-        assert!(
-            message.contains("нет ключа подписи"),
-            "неожиданный текст сообщения: {message}"
         );
     }
 

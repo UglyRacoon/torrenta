@@ -694,3 +694,15 @@ html.is-resizing {
     padding: 0 4px;
   }
 }
+
+/* 1.9: значок «Обновление» появляется только при доступной версии и говорит
+   акцентным цветом — это единственное действие в футере, которое стоит сделать
+   сейчас, а не «настроить потом». */
+.side-action--update {
+  color: var(--color-accent);
+}
+
+.side-action--update:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-soft-ink);
+}

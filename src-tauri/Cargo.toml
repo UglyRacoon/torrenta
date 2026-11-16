@@ -25,6 +25,8 @@ tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Проверка обновлений и скачивание установщика с GitHub Releases.
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"

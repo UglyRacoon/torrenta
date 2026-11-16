@@ -26,12 +26,21 @@ export interface SidebarOptions {
   onToggleTheme(): void;
   onOpenSettings(): void;
   onToggleAll(): void;
+  /** Открыть окно обновления (1.9): кнопка появляется, когда версия доступна. */
+  onOpenUpdate(): void;
   /** Полное завершение приложения (1.4): кнопка «Выход» в футере. */
   onQuit(): void;
 }
 
 export interface Sidebar {
   update(state: AppState): void;
+  /**
+   * Показывает кнопку «Обновление» с версией или прячет её.
+   *
+   * `null` — обновлений нет (или проверка выключена): кнопка не занимает место
+   * в футере и не отвлекает.
+   */
+  setUpdate(version: string | null): void;
 }
 
 function readStoredWidth(): number | null {
@@ -150,6 +159,14 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     h("span", { class: "side-action__label", text: "Диагностика" }),
   );
 
+  // 1.9: кнопка «Обновление» — только когда доступна новая версия.
+  const updateLabel = h("span", { class: "side-action__label", text: "Обновление" });
+  const updateButton = h("button", {
+    class: "side-action side-action--update",
+    attrs: { type: "button", title: "Доступно обновление", hidden: "true" },
+  });
+  updateButton.append(h("span", { class: "side-action__icon" }, icon("download", 16)), updateLabel);
+
   // 1.4: выход из приложения. Цвета — только существующие токены (см. layout.css),
   // чтобы не расходиться с проверкой контраста.
   const quitButton = h("button", {
@@ -167,6 +184,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     themeButton,
     settingsButton,
     diagnosticsButton,
+    updateButton,
     quitButton,
   );
 
@@ -189,6 +207,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
   settingsButton.addEventListener("click", () => options.onOpenSettings());
   diagnosticsButton.addEventListener("click", () => openDiagnostics());
   quitButton.addEventListener("click", () => options.onQuit());
+  updateButton.addEventListener("click", () => options.onOpenUpdate());
   allButton.addEventListener("click", () => options.onToggleAll());
   bindDiagnosticsHotkey();
 
@@ -224,6 +243,7 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
     setAttr(settingsButton, "aria-label", isCompact ? "Настройки" : null);
     setAttr(diagnosticsButton, "aria-label", isCompact ? "Диагностика" : null);
     setAttr(quitButton, "aria-label", isCompact ? "Выход" : null);
+    setAttr(updateButton, "aria-label", isCompact ? "Обновление" : null);
     setAttr(allButton, "aria-label", allButton.dataset.label ?? "Пауза/возобновление");
   }
 
@@ -365,6 +385,18 @@ export function createSidebar(mount: HTMLElement, options: SidebarOptions): Side
       const anyPaused = torrents.some((torrent) => torrent.state === "paused");
       setAllMode(anyActive ? "pause" : anyPaused ? "resume" : "idle");
       setTheme(state.theme);
+    },
+    setUpdate(version) {
+      const available = version !== null && version.trim() !== "";
+      updateButton.hidden = !available;
+      if (!available) {
+        setText(updateLabel, "Обновление");
+        setAttr(updateButton, "title", "Доступно обновление");
+        return;
+      }
+      const text = `Обновление ${version.trim()}`;
+      setText(updateLabel, text);
+      setAttr(updateButton, "title", text);
     },
   };
 }

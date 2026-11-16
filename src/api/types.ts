@@ -146,6 +146,8 @@ export interface SettingsDto {
   seed_time_limit_min: number;
   /** Связывать файлы .torrent с Torrenta и чинить привязку при старте (1.7, §4.5). */
   associate_files: boolean;
+  /** Автоматически проверять обновления и показывать значок (1.9). */
+  auto_update: boolean;
   /** Новые торренты качать последовательно — куски по порядку (1.7). */
   sequential: boolean;
   /** Расписание скорости включено (1.7). */
@@ -220,8 +222,11 @@ export interface PortableInfoDto {
 }
 
 /**
- * Состояние проверки обновлений (1.7).
- * `configured = false` — сборка без ключа подписи, проверять нечего.
+ * Состояние проверки обновлений.
+ *
+ * С 1.9 канал — GitHub Releases: приложение сравнивает свою версию с последним
+ * релизом и, если появилась новая, предлагает скачать установщик оттуда же.
+ * `configured` остался для совместимости и сейчас всегда `true`.
  */
 export interface UpdateStateDto {
   configured: boolean;
@@ -229,6 +234,22 @@ export interface UpdateStateDto {
   /** Версия, которая доступна для скачивания; null — обновлений нет. */
   available: string | null;
   message: string | null;
+  /** Страница релиза в браузере. */
+  page_url: string | null;
+  /** Прямая ссылка на установщик (только github.com). */
+  asset_url: string | null;
+  /** Размер установщика в байтах (0 — неизвестен). */
+  asset_size: number;
+  /** Краткое описание релиза. */
+  notes: string | null;
+}
+
+/** Прогресс скачивания установщика обновления (1.9). */
+export interface UpdateProgressDto {
+  received: number;
+  total: number;
+  /** Процент 0..100; null — размер неизвестен. */
+  percent: number | null;
 }
 
 export interface AppInfoDto {

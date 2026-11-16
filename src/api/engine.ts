@@ -11,6 +11,7 @@ import type {
   SettingsDto,
   TorrentPreview,
   TorrentSource,
+  UpdateProgressDto,
   UpdateStateDto,
 } from "./types";
 
@@ -51,8 +52,14 @@ export interface EngineApi {
   engineDiagnostics(): Promise<DiagnosticsDto>;
   /** Портативный режим и каталог данных (1.7). */
   portableInfo(): Promise<PortableInfoDto>;
-  /** Проверка обновлений (1.7); без ключа подписи — configured = false. */
+  /** Проверка обновлений через GitHub Releases (1.9). */
   checkUpdate(): Promise<UpdateStateDto>;
+  /** Скачать и установить обновление; приложение перезапустится (1.9). */
+  installUpdate(): Promise<void>;
+  /** Событие «появилось обновление» от фоновой проверки (1.9). */
+  subscribeUpdateAvailable(listener: (state: UpdateStateDto) => void): Promise<() => void>;
+  /** Прогресс скачивания установщика (1.9). */
+  subscribeUpdateProgress(listener: (progress: UpdateProgressDto) => void): Promise<() => void>;
   /** Кто сейчас открывает `.torrent` (1.7, §4.5). */
   associationStatus(): Promise<AssociationDto>;
   /** Перезаписать привязку `.torrent` на текущий exe и вернуть новое состояние. */

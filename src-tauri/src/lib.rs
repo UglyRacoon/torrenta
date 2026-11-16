@@ -35,9 +35,11 @@ pub mod settings;
 pub mod single_instance;
 pub mod state;
 pub mod tray;
+pub mod update;
 pub mod watch;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::utils::config::Color;
@@ -65,6 +67,23 @@ const LIGHT_BACKGROUND: Color = Color(0xF2, 0xF5, 0xF9, 0xFF);
 
 /// Как часто проверять, изменилась ли сессия, и сохранять её на диск.
 const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Первая фоновая проверка обновлений после старта: не мешаем восстановлению
+/// сессии и первому кадру интерфейса.
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(10);
+/// Период фоновой проверки обновлений.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Разрыв между тиками, после которого считаем, что компьютер спал.
+///
+/// Обычный тик — 500 мс, поэтому 15 секунд тишины означают сон, гибернацию или
+/// заморозку процесса. После такого разрыва кэши «что уже отправлено» надо
+/// сбросить, иначе первый кадр после пробуждения может не уйти в интерфейс.
+const SLEEP_GAP: Duration = Duration::from_secs(15);
+/// «Хеш ещё не считан» для [`SESSION_LAST_HASH`].
+const SESSION_HASH_UNKNOWN: u64 = u64::MAX;
+/// Идёт ли сейчас запись сессии (одна за раз, см. [`save_session`]).
+static SESSION_SAVE_BUSY: AtomicBool = AtomicBool::new(false);
+/// Хеш последней записанной полезной нагрузки сессии.
+static SESSION_LAST_HASH: AtomicU64 = AtomicU64::new(SESSION_HASH_UNKNOWN);
 
 /// Как часто обновлять подсказку трея, даже если текст не изменился
 /// (иконку могли пересоздать, и подсказка потерялась бы).
@@ -138,6 +157,7 @@ pub fn run() {
             commands::repair_association,
             commands::portable_info,
             commands::check_update,
+            commands::install_update,
             commands::quit_app,
             single_instance::take_open_request,
         ])
@@ -288,6 +308,9 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
     // старт, а торренты просто появляются в списке по мере готовности.
     // Сохраняет сессию сам тикер состояния (см. `save_session`).
     spawn_session_restore(handle.clone());
+    // Обновления проверяются в фоне: при включённой настройке и появлении новой
+    // версии интерфейс получает событие и показывает значок.
+    spawn_update_checker(handle.clone());
     // Папка наблюдения живёт отдельной задачей: настройка читается на каждом
     // шаге, поэтому её можно включать и выключать без перезапуска.
     watch::spawn(handle);
@@ -379,11 +402,27 @@ fn spawn_state_ticker(app: AppHandle) {
         let mut last_tooltip_at: Option<Instant> = None;
         // Сессия сохраняется тем же тикером, что и состояние: отдельный таймер
         // не нужен, а запись на диск идёт только при изменении состава списка.
-        let mut last_session_hash: Option<u64> = None;
         let mut last_session_save: Option<Instant> = None;
+        // Момент прошлого тика: после сна компьютера разрыв в десятки секунд
+        // надо заметить и не тащить в UI устаревшие «дельты».
+        let mut last_tick_at = Instant::now();
 
         loop {
             tokio::time::sleep(TICK_INTERVAL).await;
+            let now = Instant::now();
+            let gap = now.duration_since(last_tick_at);
+            last_tick_at = now;
+            // Проснулись после сна/гибернации: таймеры и сокеты успели
+            // «протухнуть». Пропускаем этот тик и сбрасываем кэши изменений,
+            // чтобы следующие события ушли в интерфейс, даже если данные
+            // формально совпадают с прошлым кадром.
+            if gap > SLEEP_GAP {
+                last_significant = None;
+                last_dynamic = None;
+                last_significant_emit = None;
+                last_tooltip_at = None;
+                continue;
+            }
 
             // Блокировка состояния живёт только до конца выражения: между ней и
             // следующим `.await` ничего не удерживается, поэтому future — `Send`.
@@ -393,7 +432,7 @@ fn spawn_state_ticker(app: AppHandle) {
             };
 
             update_tray_tooltip(&app, &payload, &mut last_tooltip, &mut last_tooltip_at);
-            save_session(&app, &mut last_session_hash, &mut last_session_save);
+            save_session(&app, &mut last_session_save);
 
             let fingerprint = payload.fingerprints();
             let dynamic_changed = last_dynamic != Some(fingerprint.dynamic);
@@ -451,6 +490,47 @@ fn update_tray_tooltip(
     *last_at = Some(Instant::now());
 }
 
+/// Фоновая проверка обновлений.
+///
+/// Работает только при включённой настройке `auto_update`. Ничего не скачивает:
+/// при появлении новой версии отправляет [`update::UPDATE_AVAILABLE_EVENT`],
+/// решение об установке принимает пользователь. Ошибки сети не считаются
+/// ошибкой приложения и только пишутся в журнал.
+fn spawn_update_checker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(UPDATE_FIRST_CHECK).await;
+        loop {
+            let auto = app
+                .try_state::<AppEngine>()
+                .map(|engine| engine.settings().auto_update)
+                .unwrap_or(false);
+            if auto {
+                let current = app.package_info().version.to_string();
+                match update::client() {
+                    Ok(client) => match update::check(&client, &current).await {
+                        Ok(release) => {
+                            // Кэш нужен кнопке «Установить»: она не должна
+                            // заново проверять версию и показывать другую.
+                            update::remember(release.clone());
+                            let state = update::state_for(&current, release.as_ref());
+                            if state.available.is_some() {
+                                if let Err(err) = app.emit(update::UPDATE_AVAILABLE_EVENT, &state) {
+                                    eprintln!(
+                                        "[torrenta] не удалось отправить событие обновления: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!("[torrenta] проверка обновлений: {err}"),
+                    },
+                    Err(err) => eprintln!("[torrenta] проверка обновлений: {err}"),
+                }
+            }
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 /// Восстанавливает торренты из `session.json` в фоне.
 ///
 /// Флаг `restore_session` читается один раз при старте: пользователь мог
@@ -488,7 +568,7 @@ fn spawn_session_restore(app: AppHandle) {
 /// приложение писало бы на диск каждые полсекунды. При выключенном
 /// `restore_session` не сохраняется ничего — иначе файл остался бы от прошлой
 /// настройки и «тихий» запуск не сработал бы.
-fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Option<Instant>) {
+fn save_session(app: &AppHandle, last_at: &mut Option<Instant>) {
     let due = match last_at {
         Some(at) => at.elapsed() >= SESSION_SAVE_INTERVAL,
         None => true,
@@ -500,13 +580,35 @@ fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Opti
     // файл) журнал заполнялся бы на каждом тике.
     *last_at = Some(Instant::now());
 
+    // Одна запись за раз. Если диск медленный (или компьютер только что вышел
+    // из сна), предыдущая запись может ещё идти; вторая копия того же снимка
+    // только добавила бы очередь на диске.
+    if SESSION_SAVE_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let handle = app.clone();
+    // Сбор отпечатков файлов — это stat по каждому файлу каждого торрента, то
+    // есть блокирующая работа. В асинхронном пуле она отнимала бы воркер у
+    // команд интерфейса (отсюда и ощущение «программа зависла» на большом
+    // торренте), поэтому переносим в блокирующий пул.
+    tauri::async_runtime::spawn_blocking(move || {
+        save_session_blocking(&handle, false);
+        SESSION_SAVE_BUSY.store(false, Ordering::Release);
+    });
+}
+
+/// Пишет сессию на диск. Выполняется в блокирующем пуле.
+///
+/// `force` — писать, даже если полезная нагрузка не менялась (выход из
+/// приложения: последние секунды прогресса важнее экономии записи).
+fn save_session_blocking(app: &AppHandle, force: bool) {
     let Some(engine) = app.try_state::<AppEngine>() else {
         return;
     };
     if !engine.settings().restore_session {
         // Сбрасываем хеш: после включения настройки сессия сохранится сразу,
         // даже если она не менялась.
-        *last_hash = None;
+        SESSION_LAST_HASH.store(SESSION_HASH_UNKNOWN, Ordering::Relaxed);
         return;
     }
     let Some(registry) = app.try_state::<SessionRegistry>() else {
@@ -519,11 +621,14 @@ fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Opti
     // скачано»: после перезапуска торрент начинал качать всё заново.
     session::attach_resume(&mut entries, &engine.manager, &torrents);
     let hash = session::payload_hash(&entries);
-    if *last_hash == Some(hash) {
+    if !force && SESSION_LAST_HASH.load(Ordering::Relaxed) == hash {
         return;
     }
     match registry.save(&entries) {
-        Ok(()) => *last_hash = Some(hash),
+        Ok(()) => SESSION_LAST_HASH.store(hash, Ordering::Relaxed),
+        Err(err) if force => {
+            eprintln!("[torrenta] не удалось сохранить сессию при выходе: {err}");
+        }
         Err(err) => eprintln!("[torrenta] не удалось сохранить сессию: {err}"),
     }
 }
@@ -534,21 +639,7 @@ fn save_session(app: &AppHandle, last_hash: &mut Option<u64>, last_at: &mut Opti
 /// файлов) должны попасть на диск, иначе после перезапуска торрент перекачает
 /// их заново.
 fn save_session_now(app: &AppHandle) {
-    let Some(engine) = app.try_state::<AppEngine>() else {
-        return;
-    };
-    if !engine.settings().restore_session {
-        return;
-    }
-    let Some(registry) = app.try_state::<SessionRegistry>() else {
-        return;
-    };
-    let torrents = engine.manager.snapshot();
-    let mut entries = registry.entries(&torrents);
-    session::attach_resume(&mut entries, &engine.manager, &torrents);
-    if let Err(err) = registry.save(&entries) {
-        eprintln!("[torrenta] не удалось сохранить сессию при выходе: {err}");
-    }
+    save_session_blocking(app, true);
 }
 
 /// Показывает уведомление Windows о завершённой загрузке.

@@ -604,6 +604,7 @@ export async function createMockApi(): Promise<EngineApi> {
     watch_dir: "",
     notify_on_complete: true,
     restore_session: true,
+  auto_update: true,
     dht: true,
     pex: true,
     dht_port: 0,
@@ -1385,14 +1386,26 @@ export async function createMockApi(): Promise<EngineApi> {
 
     checkUpdate: async (): Promise<UpdateStateDto> => {
       await delay(260);
-      // Демо-сборка без ключа подписи: проверять нечего, обновления не настроены (2.4).
+      // Демо-режим не ходит в сеть: показываем «установлена последняя версия».
       return {
-        configured: false,
+        configured: true,
         current_version: app.version,
         available: null,
-        message: "обновления не настроены: нет ключа подписи",
+        message: "установлена последняя версия",
+        page_url: null,
+        asset_url: null,
+        asset_size: 0,
+        notes: null,
       };
     },
+
+    installUpdate: async (): Promise<void> => {
+      await delay(120);
+      throw new Error("в демонстрационной сборке установка обновлений недоступна");
+    },
+
+    subscribeUpdateAvailable: async (): Promise<() => void> => () => {},
+    subscribeUpdateProgress: async (): Promise<() => void> => () => {},
 
     // 1.7 (баг-репорт): .torrent открывает наша сборка — и «Починить» это подтверждает.
     associationStatus: async (): Promise<AssociationDto> => {
@@ -1671,6 +1684,7 @@ export async function createMockApi(): Promise<EngineApi> {
       // 1.7 (баг-репорт): выключатель лишь запрещает самовосстановление привязки —
       // уже записанную привязку, как и бэкенд, демо-режим не снимает.
       settings.associate_files = next.associate_files !== false;
+      settings.auto_update = next.auto_update !== false;
       settings.sequential = Boolean(next.sequential);
       settings.schedule_from_min = dayMinute(Number(next.schedule_from_min) || 0);
       settings.schedule_to_min = dayMinute(Number(next.schedule_to_min) || 0);

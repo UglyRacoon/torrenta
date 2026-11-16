@@ -10,7 +10,7 @@ description = "Движок торрент-клиента Torrenta: bencode, м�
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "gzip"] }
+reqwest = { workspace = true }
 sha1 = "0.10"
 rand = "0.8"
 percent-encoding = "2"

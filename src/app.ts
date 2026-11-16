@@ -9,6 +9,7 @@ import type {
   TorrentSnapshot,
   TorrentSource,
   TorrentState,
+  UpdateStateDto,
 } from "./api/types";
 import { NO_LIMIT, SPEED_STEPS } from "./api/types";
 import { messageOf } from "./lib/dom";
@@ -117,6 +118,10 @@ export function mountApp(): void {
   let unsubscribe: (() => void) | null = null;
   let unsubscribeAuto: (() => void) | null = null;
   let unsubscribeOpen: (() => void) | null = null;
+  let unsubscribeUpdate: (() => void) | null = null;
+  let unsubscribeUpdateProgress: (() => void) | null = null;
+  /** Последнее состояние проверки обновлений: из него берётся номер версии. */
+  let updateState: UpdateStateDto | null = null;
   let stopDrop: (() => void) | null = null;
   let tornDown = false;
   let autoState: AutoShutdownState = { enabled: false, pending_seconds: null };
@@ -246,6 +251,57 @@ export function mountApp(): void {
   }
 
   // --- Настройки и тема ---------------------------------------------------
+
+  /** Запоминает состояние обновления и показывает/прячет значок в сайдбаре. */
+  function applyUpdateState(next: UpdateStateDto): void {
+    updateState = next;
+    sidebar.setUpdate(next.available);
+  }
+
+  /**
+   * Проверяет обновления, если авто-проверка включена.
+   *
+   * Фоновый цикл в Rust делает то же самое, но с задержкой на старте; здесь
+   * проверка нужна, чтобы значок появился сразу после запуска. Ошибки сети
+   * не показываем: обновления — не критичная функция.
+   */
+  function refreshUpdateCheck(autoUpdate: boolean): void {
+    if (!autoUpdate) {
+      updateState = null;
+      sidebar.setUpdate(null);
+      return;
+    }
+    void api()
+      .checkUpdate()
+      .then(applyUpdateState)
+      .catch(() => {
+        // Нет сети или GitHub недоступен — значок просто не появится.
+      });
+  }
+
+  /** Окно «Обновление Torrenta» с кнопкой установки и прогрессом. */
+  function openUpdateDialog(): void {
+    const current = updateState;
+    const engineApi = engine;
+    if (!current || current.available === null || !engineApi) {
+      return;
+    }
+    if (unsubscribeUpdateProgress) {
+      unsubscribeUpdateProgress();
+      unsubscribeUpdateProgress = null;
+    }
+    modals.openUpdate(current, {
+      onInstall: () => engineApi.installUpdate(),
+      onOpenPage: (url) => void engineApi.openExternal(url),
+      subscribeProgress: async (listener) => {
+        unsubscribeUpdateProgress = await engineApi.subscribeUpdateProgress(listener);
+        return () => {
+          unsubscribeUpdateProgress?.();
+          unsubscribeUpdateProgress = null;
+        };
+      },
+    });
+  }
 
   async function openSettings(): Promise<void> {
     try {
@@ -485,6 +541,7 @@ export function mountApp(): void {
     onFilter: (filter: FilterKey) => store.patch({ filter }),
     onToggleTheme: toggleTheme,
     onOpenSettings: () => void openSettings(),
+    onOpenUpdate: () => openUpdateDialog(),
     onToggleAll: () => void toggleAll(),
     onQuit: () => void quitApp(),
   });
@@ -666,6 +723,18 @@ export function mountApp(): void {
       // Источник, переданный при первом запуске, мог появиться до подписки —
       // событие к этому моменту уже ушло в пустоту, поэтому забираем сразу.
       void consumeOpenRequest();
+      // 1.9: обновления. Подписка на событие фоновой проверки плюс одна проверка
+      // сразу при старте, чтобы значок не ждал десяти секунд.
+      if (unsubscribeUpdate) {
+        unsubscribeUpdate();
+        unsubscribeUpdate = null;
+      }
+      unsubscribeUpdate = await engineApi.subscribeUpdateAvailable((next) => {
+        if (!tornDown) {
+          applyUpdateState(next);
+        }
+      });
+      refreshUpdateCheck(payload.settings.auto_update ?? true);
       if (!stopDrop) {
         stopDrop = engineApi.bindFileDrop({
           onEnter: () => {
@@ -696,6 +765,8 @@ export function mountApp(): void {
     unsubscribe?.();
     unsubscribeAuto?.();
     unsubscribeOpen?.();
+    unsubscribeUpdate?.();
+    unsubscribeUpdateProgress?.();
     stopDrop?.();
   });
 

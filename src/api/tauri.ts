@@ -11,6 +11,7 @@ import type {
   SettingsDto,
   TorrentPreview,
   TorrentSource,
+  UpdateProgressDto,
   UpdateStateDto,
 } from "./types";
 import type { EngineApi, FileDropHandlers } from "./engine";
@@ -77,6 +78,21 @@ export async function createTauriApi(): Promise<EngineApi> {
     engineDiagnostics: () => invoke<DiagnosticsDto>("engine_diagnostics"),
     portableInfo: () => invoke<PortableInfoDto>("portable_info"),
     checkUpdate: () => invoke<UpdateStateDto>("check_update"),
+    // 1.9: скачивание и установка обновления. Прогресс и событие «появилось
+    // обновление» приходят отдельными событиями — их слушает интерфейс.
+    installUpdate: () => invoke<void>("install_update"),
+    subscribeUpdateAvailable: async (listener) => {
+      const unlisten = await listen<UpdateStateDto>("engine://update-available", (event) => {
+        listener(event.payload);
+      });
+      return unlisten;
+    },
+    subscribeUpdateProgress: async (listener) => {
+      const unlisten = await listen<UpdateProgressDto>("engine://update-progress", (event) => {
+        listener(event.payload);
+      });
+      return unlisten;
+    },
     // 1.7 (баг-репорт): кто открывает .torrent и починка привязки.
     associationStatus: () => invoke<AssociationDto>("association_status"),
     repairAssociation: () => invoke<AssociationDto>("repair_association"),

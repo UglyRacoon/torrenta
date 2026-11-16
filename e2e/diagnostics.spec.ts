@@ -21,8 +21,11 @@ test.describe("Диагностика", () => {
     await expect(dialog).toBeVisible();
     await expect(dialog.getByText(/DHT/i).first()).toBeVisible();
     await expect(dialog.getByText(/Обновлени/i).first()).toBeVisible();
-    // Ключ подписи не настроен — экран обязан сказать это словами.
-    await expect(dialog.getByText(/не настроен/i).first()).toBeVisible();
+    // Строка обновлений говорит словами одно из трёх: доступна новая версия,
+    // установлена последняя или проверка недоступна.
+    await expect(
+      dialog.getByText(/доступна \d|последняя версия|проверить не удалось/i).first(),
+    ).toBeVisible();
 
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();

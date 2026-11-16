@@ -161,6 +161,12 @@ pub struct SettingsDto {
     /// сломана пустым `ProgId` (см. [`crate::association`]). Живой чужой
     /// обработчик — например, qBittorrent — при этом не перехватывается.
     pub associate_files: bool,
+    /// Проверять обновления в GitHub Releases автоматически.
+    ///
+    /// Проверка не скачивает ничего сама: при появлении новой версии интерфейс
+    /// показывает значок, а установку запускает пользователь. `false` отключает
+    /// и фоновую проверку, и значок (ручная проверка в «Диагностике» остаётся).
+    pub auto_update: bool,
     /// Запускать приложение сразу в трее, не показывая окно.
     ///
     /// Настройка действует только на старте: если окно не показано, его можно
@@ -265,6 +271,7 @@ impl Default for SettingsDto {
             // Привязка `.torrent` включается по умолчанию: иначе после обновления
             // файлы открывались бы старым (несуществующим) exe.
             associate_files: true,
+            auto_update: true,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -570,6 +577,7 @@ pub fn from_engine_config(config: &EngineConfig, theme: &str, auto_shutdown: boo
         // Привязка `.torrent` не входит в `EngineConfig`: управляет ею реестр,
         // поэтому обратное преобразование отдаёт значение по умолчанию.
         associate_files: true,
+        auto_update: true,
         start_minimized: false,
         close_to_tray: false,
         // Настройки уведомлений, наблюдения за папкой и восстановления сессии
@@ -817,6 +825,7 @@ mod tests {
             auto_shutdown: true,
             autostart: true,
             associate_files: true,
+            auto_update: true,
             start_minimized: true,
             close_to_tray: true,
             notify_on_complete: false,
@@ -886,6 +895,7 @@ mod tests {
             auto_shutdown: true,
             autostart: false,
             associate_files: true,
+            auto_update: true,
             start_minimized: false,
             close_to_tray: false,
             notify_on_complete: true,
@@ -1637,6 +1647,7 @@ mod tests {
 
         let mut expected = vec![
             "auto_shutdown",
+            "auto_update",
             "autostart",
             "associate_files",
             "close_to_tray",
