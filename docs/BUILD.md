@@ -485,7 +485,7 @@ npm run test:e2e
 
 Ориентиры на 1.9.0, чтобы понимать, что «зелёный» вывод — норма, а не совпадение:
 
-- `cargo test --workspace` → **480 passed, 0 failed, 6 ignored**: 247 тестов в библиотеке `torrent-core` (246 passed и 1 ignored — UPnP, см. 5.16), 61 интеграционный в 13 бинарях каталога `crates\torrent-core\tests` (10 + 3 + 3 + 2 + 2 + 1 + 4 + 5 + 4 + 8 + 10 + 4 + 5) и 179 в `torrenta`. Итого 487 тестовых функций (5 наборов `real_qa.rs` и `live_github` ходят в сеть и помечены `#[ignore]`);
+- `cargo test --workspace` → **483 passed, 0 failed, 7 ignored**: 247 тестов в библиотеке `torrent-core` (246 passed и 1 ignored — UPnP, см. 5.16), 64 интеграционных в 14 бинарях каталога `crates\torrent-core\tests` (10 + 3 + 3 + 2 + 2 + 1 + 4 + 5 + 4 + 8 + 3 + 10 + 4 + 5) и 179 в `torrenta`. Итого 490 тестовых функций (5 наборов `real_qa.rs` и `live_github` ходят в сеть и помечены `#[ignore]`);
 - `npm run check:contrast` → **68 из 68** (34 пары в каждой из двух тем);
 - `npx playwright test` → **22 passed, 0 skipped** примерно за 40 секунд (холодный прогон) и ~10 секунд при прогретом `vite preview`.
 

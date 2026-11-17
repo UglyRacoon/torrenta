@@ -180,9 +180,16 @@ function compareField(a: TorrentSnapshot, b: TorrentSnapshot, field: SortField):
     case "speed":
       return a.down_rate + a.up_rate - (b.down_rate + b.up_rate);
     case "ratio": {
-      // Ещё ничего не скачано — рейтинг неизвестен, такие всегда в конце.
-      const left = a.downloaded_bytes > 0 ? a.seed_ratio : Number.NEGATIVE_INFINITY;
-      const right = b.downloaded_bytes > 0 ? b.seed_ratio : Number.NEGATIVE_INFINITY;
+      // Считаем коэффициент бесконечным, если данные уже были на диске:
+      // скачано 0, но отдача идёт. Ничего не отдано и не скачано — в конец.
+      const rank = (torrent: TorrentSnapshot): number => {
+        if (torrent.downloaded_bytes > 0) {
+          return torrent.seed_ratio ?? Number.POSITIVE_INFINITY;
+        }
+        return torrent.uploaded_bytes > 0 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+      };
+      const left = rank(a);
+      const right = rank(b);
       if (left === right) {
         return 0;
       }
@@ -337,7 +344,11 @@ function metaMainText(torrent: TorrentSnapshot): string {
 }
 
 /** Ratio из снимка (1.6): движок уже поделил отдано на скачано. */
-function seedRatioText(ratio: number): string {
+function seedRatioText(ratio: number | null): string {
+  // `null` — данные уже были на диске, скачано 0 байт: коэффициент бесконечен.
+  if (ratio === null) {
+    return "×∞";
+  }
   // Два знака и десятичная запятая — как у остальных чисел интерфейса.
   const safe = Number.isFinite(ratio) && ratio > 0 ? ratio : 0;
   return `×${safe.toFixed(2).replace(".", ",")}`;

@@ -389,7 +389,13 @@ where
             // Отказ в отдаче (кусок не скачан, пир не разблокирован) — не ошибка
             // протокола: запрос просто игнорируется, соединение остаётся живым.
 
-            if let Ok(data) = runtime.upload(index, begin, length) {
+            if !runtime.can_upload_now() {
+                // Лимит отдачи исчерпан: закрываем пиру кран (Choke), а не
+                // молчим на запрос — иначе он повторяет его по кругу.
+                send(writer, &Message::Choke).await?;
+                runtime.set_am_choking(id, true);
+                out.wrote();
+            } else if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
                 send(writer, &Message::Piece { index, begin, data }).await?;
                 out.wrote();
@@ -592,7 +598,9 @@ async fn tick<W: AsyncWrite + Unpin>(
     // права просить у нас блоки, и для него мы — бесполезный собеседник:
     // именно поэтому наш клиент раньше отдавал ноль и получал худшую очередь.
 
-    if runtime.should_unchoke(id) {
+    // Разчокиваем только когда в ведре отдачи есть место: иначе пир начнёт
+    // просить блоки, получит молчание и будет повторять запросы.
+    if runtime.should_unchoke(id) && runtime.can_upload_now() {
         send(writer, &Message::Unchoke).await?;
         runtime.set_am_choking(id, false);
         out.wrote();

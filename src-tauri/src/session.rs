@@ -1196,7 +1196,7 @@ mod tests {
             down_limit_kib: 0,
             up_limit_kib: 0,
             eta_seconds: None,
-            seed_ratio: 0.0,
+            seed_ratio: Some(0.0),
             seed_limit_reached: false,
             sequential: false,
             save_path: root.to_string_lossy().into_owned(),
@@ -1397,7 +1397,7 @@ mod tests {
             eta_seconds: None,
             // P2: счётчик ratio и признак лимита раздачи к тесту отношения не
             // имеют — берём значения по умолчанию.
-            seed_ratio: 0.0,
+            seed_ratio: Some(0.0),
             seed_limit_reached: false,
             save_path: "C:\\Загрузки".to_string(),
             added_at: 0,

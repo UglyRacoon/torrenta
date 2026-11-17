@@ -321,13 +321,22 @@ async fn pause_and_resume_continue_download_without_new_announce() {
     );
     assert_file_matches(&download_dir, "resume.bin", &sample.data);
 
-    // Ключевое доказательство: торрент докачался без нового объявления трекера
-    // (интервал мока 600 с покрывает весь тест) и на новом соединении.
-    assert_eq!(
-        tracker.announce_count(),
-        1,
-        "загрузка не должна требовать нового объявления трекера, получено объявлений: {}",
-        tracker.announce_count()
+    // С 1.9.1 пауза обязана снимать нас с учёта трекера (event=stopped), а
+    // resume — возвращать (started). Прежнее требование «докачалось без нового
+    // объявления» проверяем по сути: reconnect ниже идёт по уже известному
+    // адресу сидера, а не по свежему ответу трекера (интервал мока 600 с).
+    let events: Vec<String> = tracker
+        .log()
+        .iter()
+        .filter_map(|entry| entry.event.clone())
+        .collect();
+    assert!(
+        events.iter().any(|event| event == "started"),
+        "первый announce должен быть started: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event == "stopped"),
+        "пауза должна отправлять event=stopped: {events:?}"
     );
     // Переподключение к сидеру после resume: движок обязан взять адрес из своего
     // списка известных, а не ждать ответа трекера (интервал мока — 600 с).

@@ -68,6 +68,12 @@ test.describe("QA 1.9: правки интерфейса", () => {
       );
       previous = at;
     }
+    // Окно должно открываться с самого верха: фокус на первом текстовом поле
+    // раньше прокручивал его к «Каталогу загрузки».
+    const scrollTop = await dialog
+      .locator(".modal__body")
+      .evaluate((node) => (node as HTMLElement).scrollTop);
+    expect(scrollTop, "настройки открываются сверху").toBe(0);
     // «Запоминать последний путь загрузки» живёт в настройках.
     await expect(dialog.getByText("Запоминать последний путь загрузки")).toBeVisible();
     await page.screenshot({ path: "qa/screens/settings-order.png" });

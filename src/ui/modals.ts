@@ -1770,7 +1770,10 @@ export function createModalHost(root: HTMLElement): ModalHost {
     };
     modal.onClose(destroySelects);
 
-    focusFirst(modal, "input[type=text]");
+    // Настройки длинные: фокус на первом текстовом поле прокручивал окно к
+    // «Каталогу загрузки» (4-й блок), и открывались они не с «Запуска и трей».
+    // Оставляем фокус на диалоге и фиксируем прокрутку сверху.
+    modal.body.scrollTop = 0;
   }
 
   /**

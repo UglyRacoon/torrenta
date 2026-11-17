@@ -179,6 +179,21 @@ impl PeerRecord {
 }
 
 /// Пауза перед повторной загрузкой куска, не прошедшего проверку SHA-1.
+/// Выполняет синхронную работу с диском, не блокируя реактор.
+///
+/// Файлы читаются и пишутся обычным `std::fs` под мьютексом. В
+/// многопоточном рантайме такая работа уходит в `block_in_place`: остальные
+/// задачи (сеть, таймеры) продолжают идти, а не ждут диск.
+fn disk<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Задержка перед повтором подключения после `attempts` неудач.
 pub(crate) fn retry_delay(attempts: u32) -> Duration {
     let shift = attempts.min(6);
@@ -189,6 +204,17 @@ pub(crate) fn retry_delay(attempts: u32) -> Duration {
 pub(crate) struct PieceCooldown {
     pub(crate) until: Instant,
     pub(crate) strikes: u32,
+}
+
+/// Кусок, который веб-сид отдаёт по частям из-за лимита скорости.
+struct PartialPiece {
+    index: u32,
+    /// Смещение куска в файле.
+    offset: u64,
+    /// Собранные байты: запись на диск и хэш — только когда кусок целиком.
+    data: Vec<u8>,
+    /// Сколько байт уже получено.
+    filled: usize,
 }
 
 /// Пир, к которому нужно вернуться после неудачного или закрытого соединения.
@@ -220,6 +246,11 @@ pub(crate) struct RuntimeState {
     /// при интервале 30 минут отдача «затухала», а после перезапуска
     /// `requeue_peers` давал всплеск — ровно то, что замечал пользователь.
     pub(crate) retry: HashMap<SocketAddr, RetryEntry>,
+    /// Адреса, забаненные за повторно испорченные куски (D15): до этого
+    /// времени не подключаемся и не принимаем их в очередь.
+    pub(crate) banned: HashMap<SocketAddr, Instant>,
+    /// Сколько испорченных кусков пришло с адреса (бан после второго).
+    pub(crate) bad_pieces: HashMap<SocketAddr, u32>,
     /// Пир, которому мы разчокиваем «на пробу» вопреки рейтингу.
     ///
     /// Без этого пир вне топ-8 никогда не получит от нас данные, а значит и сам
@@ -463,6 +494,8 @@ impl Runtime {
                 connecting: 0,
                 cooldown: HashMap::new(),
                 retry: HashMap::new(),
+                banned: HashMap::new(),
+                bad_pieces: HashMap::new(),
                 optimistic: None,
                 optimistic_at: Instant::now(),
                 rng: {
@@ -575,10 +608,10 @@ impl Runtime {
             }
             let size = self.meta.info.piece_size(index) as usize;
             let offset = self.meta.info.piece_offset(index);
-            let read = {
+            let read = disk(|| {
                 let storage = lk(&self.storage);
                 storage.read_at(offset, size)
-            };
+            });
             let valid = match read {
                 // Длина должна совпасть: недлинное чтение означает дыру в файлах.
                 Ok(data) if data.len() == size => {
@@ -772,6 +805,14 @@ impl Runtime {
                 state.known.clear();
             }
             state.known.insert(addr);
+            // Забаненный адрес не возвращаем в очередь, пока бан не истёк.
+            if state
+                .banned
+                .get(&addr)
+                .is_some_and(|until| *until > Instant::now())
+            {
+                continue;
+            }
             if state.seen.insert(addr) {
                 state.pending.push_back(addr);
             }
@@ -830,6 +871,7 @@ impl Runtime {
     pub(crate) fn promote_retries(&self) {
         let mut state = lk(&self.state);
         let now = Instant::now();
+        state.banned.retain(|_, until| *until > now);
         let due: Vec<SocketAddr> = state
             .retry
             .iter()
@@ -839,7 +881,12 @@ impl Runtime {
         for addr in due {
             state.retry.remove(&addr);
             let active = state.peers.values().any(|peer| peer.addr == addr);
-            if !active && !state.pending.contains(&addr) && state.pending.len() < PENDING_LIMIT {
+            let banned = state.banned.contains_key(&addr);
+            if !active
+                && !banned
+                && !state.pending.contains(&addr)
+                && state.pending.len() < PENDING_LIMIT
+            {
                 // В начало очереди: именно этот пир недавно был жив и может
                 // снова отдавать или принимать данные.
                 state.pending.push_front(addr);
@@ -1354,13 +1401,31 @@ impl Runtime {
                 entry.strikes = entry.strikes.saturating_add(1);
                 let pause = 1500u64.saturating_mul(entry.strikes as u64).min(10_000);
                 entry.until = Instant::now() + Duration::from_millis(pause);
+                // Вредный пир: второй испорченный кусок с того же адреса —
+                // бан на 10 минут и разрыв сессии. Паузы куска мало: пир
+                // портит его снова и снова.
+                let owner = state
+                    .peers
+                    .iter()
+                    .find(|(_, peer)| peer.owned_piece == Some(index))
+                    .map(|(id, peer)| (*id, peer.addr));
+                if let Some((peer_id, addr)) = owner {
+                    let strikes = state.bad_pieces.entry(addr).or_insert(0);
+                    *strikes = strikes.saturating_add(1);
+                    if *strikes >= 2 {
+                        state
+                            .banned
+                            .insert(addr, Instant::now() + Duration::from_secs(600));
+                        state.peers.remove(&peer_id);
+                    }
+                }
             }
         }
         if !valid {
             return Ok(false);
         }
         let offset = self.meta.info.piece_offset(index as usize);
-        {
+        disk(|| -> Result<(), String> {
             let mut storage = lk(&self.storage);
             if storage.writes_released() {
                 // Файлы успели закрыть на запись (пауза, завершение, перепроверка):
@@ -1372,7 +1437,8 @@ impl Runtime {
             storage
                 .write_at(offset, data)
                 .map_err(|err| format!("не удалось записать кусок {index}: {err}"))?;
-        }
+            Ok(())
+        })?;
         // Счётчик скачанного растёт только за проверенные куски: иначе при
         // повторных загрузках он уходит далеко за размер торрента.
         self.stats
@@ -1540,10 +1606,34 @@ impl Runtime {
             return Err("превышен лимит отдачи".to_string());
         }
         let offset = self.meta.info.piece_offset(index as usize) + begin as u64;
-        let storage = lk(&self.storage);
-        storage
-            .read_at(offset, length as usize)
-            .map_err(|err| format!("не удалось прочитать кусок {index}: {err}"))
+        disk(|| {
+            let storage = lk(&self.storage);
+            storage
+                .read_at(offset, length as usize)
+                .map_err(|err| format!("не удалось прочитать кусок {index}: {err}"))
+        })
+    }
+
+    /// Есть ли в ведре отдачи место хотя бы на один блок.
+    ///
+    /// Нужно пиру: если лимит исчерпан, честнее разчокнуть его позже, чем
+    /// молча глотать запросы и заставлять повторять их в цикле.
+    pub(crate) fn can_upload_now(&self) -> bool {
+        let global = self.env.now.up_kib();
+        let local = rd(&self.env.limits).up_kib;
+        if global == 0 && local == 0 {
+            return true;
+        }
+        let block = BLOCK_SIZE as f64;
+        let per_second = effective_limit(global, local) as f64 * 1024.0 / block;
+        if local != 0 && lk(&self.up_limiter).available(per_second, 64.0) < 1.0 {
+            return false;
+        }
+        if global == 0 {
+            return true;
+        }
+        let global_per_second = global as f64 * 1024.0 / block;
+        lk(&self.env.shared.up).available(global_per_second, 64.0) >= 1.0
     }
 
     fn allow_upload(&self, length: usize) -> bool {
@@ -1746,8 +1836,10 @@ impl Runtime {
         let mut proxy = rd(&self.env.config).proxy.clone();
         let mut seeds = self.web_seeds(proxy.as_deref());
         let mut next_seed = 0usize;
+        let mut partial: Option<PartialPiece> = None;
         loop {
             if self.stopping() {
+                self.drop_partial(&mut partial);
                 return;
             }
             let (enabled, proxy_now) = {
@@ -1765,40 +1857,63 @@ impl Runtime {
                 next_seed = 0;
             }
             if seeds.is_empty() {
+                self.drop_partial(&mut partial);
                 return;
             }
             if self.flags.paused() {
+                // На паузе недокачанный кусок отпускаем: его данные ещё не
+                // проверены и на диск не попали.
+                self.drop_partial(&mut partial);
                 tokio::time::sleep(WEB_SEED_IDLE).await;
                 continue;
             }
             // Лимит скорости загрузки общий для пиров и веб-сидов: если ведро
             // пустое, ждём, а не качаем мимо лимита.
             let block = BLOCK_SIZE as usize;
-            let piece_blocks = (self.meta.info.piece_length as usize).div_ceil(block);
-            if self.seed_download_budget(piece_blocks) == 0 {
+            // Лимит выдаёт не больше 64 блоков за раз, а кусок обычно больше
+            // (до 4 МиБ). Поэтому кусок собирается из нескольких Range-запросов:
+            // просить целый кусок по частичному гранту — обход лимита.
+            if partial.is_none() {
+                let Some(index) = self.claim_seed_piece() else {
+                    if self.is_complete() {
+                        return;
+                    }
+                    tokio::time::sleep(WEB_SEED_IDLE).await;
+                    continue;
+                };
+                let Some((offset, len)) = self.piece_window(index) else {
+                    lk(&self.state).picker.release(index as usize);
+                    tokio::time::sleep(WEB_SEED_IDLE).await;
+                    continue;
+                };
+                partial = Some(PartialPiece {
+                    index,
+                    offset,
+                    data: vec![0u8; len as usize],
+                    filled: 0,
+                });
+            }
+            let piece = partial.as_mut().expect("кусок только что создан");
+            let remaining_blocks = (piece.data.len() - piece.filled).div_ceil(block);
+            let budget = self.seed_download_budget(remaining_blocks);
+            if budget == 0 {
                 tokio::time::sleep(WEB_SEED_IDLE).await;
                 continue;
             }
-            let Some(index) = self.claim_seed_piece() else {
-                if self.is_complete() {
-                    return;
-                }
-                tokio::time::sleep(WEB_SEED_IDLE).await;
-                continue;
-            };
-            let Some((offset, len)) = self.piece_window(index) else {
-                lk(&self.state).picker.release(index as usize);
-                tokio::time::sleep(WEB_SEED_IDLE).await;
-                continue;
-            };
+            let chunk = (budget * block).min(piece.data.len() - piece.filled);
             let seed = &seeds[next_seed % seeds.len()];
-            let fetched =
-                tokio::time::timeout(WEB_SEED_DEADLINE, seed.fetch_range(offset, len)).await;
+            let fetched = tokio::time::timeout(
+                WEB_SEED_DEADLINE,
+                seed.fetch_range(piece.offset + piece.filled as u64, chunk as u32),
+            )
+            .await;
             let data = match fetched {
-                Ok(Ok(data)) if data.len() == len as usize => data,
-                // Сервер не отдал кусок целиком: возвращаем его в пул и
-                // пробуем следующий — возможно, он отзывчивее.
+                Ok(Ok(data)) if data.len() == chunk => data,
+                // Сервер не отдал запрошенный кусок Range целиком: отпускаем
+                // кусок в пул и пробуем следующий — возможно, он отзывчивее.
                 _ => {
+                    let index = piece.index;
+                    partial = None;
                     lk(&self.state).picker.release(index as usize);
                     next_seed = next_seed.wrapping_add(1);
                     tokio::time::sleep(WEB_SEED_RETRY).await;
@@ -1811,6 +1926,16 @@ impl Runtime {
             self.stats
                 .wire_down
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            piece.data[piece.filled..piece.filled + data.len()].copy_from_slice(&data);
+            piece.filled += data.len();
+            if piece.filled < piece.data.len() {
+                // Кусок собран не полностью: остаток заберём на следующем витке,
+                // когда в ведре лимита появятся токены.
+                continue;
+            }
+            let index = piece.index;
+            let data = std::mem::take(&mut piece.data);
+            partial = None;
             match self.complete_piece(index, &data) {
                 Ok(true) => {}
                 // Хэш не сошёлся: кусок уже отложен планировщиком с паузой.
@@ -1823,6 +1948,13 @@ impl Runtime {
                     tokio::time::sleep(WEB_SEED_RETRY).await;
                 }
             }
+        }
+    }
+
+    /// Отпускает недокачанный кусок обратно в планировщик.
+    fn drop_partial(&self, partial: &mut Option<PartialPiece>) {
+        if let Some(piece) = partial.take() {
+            lk(&self.state).picker.release(piece.index as usize);
         }
     }
 
@@ -1876,20 +2008,56 @@ impl Runtime {
         Some((offset, len))
     }
 
+    /// Сообщает трекеру, что мы уходим (`event=stopped`).
+    ///
+    /// Пауза, удаление и закрытие клиента раньше просто засыпали: трекер
+    /// продолжал числить нас пиром до собственного таймаута.
+    async fn announce_stopped(&self, url: &str) {
+        let request = AnnounceRequest {
+            info_hash: self.meta.info_hash,
+            peer_id: self.env.peer_id,
+            port: self.env.port,
+            uploaded: self.stats.uploaded.load(Ordering::Relaxed),
+            downloaded: self.stats.downloaded.load(Ordering::Relaxed),
+            left: self.wanted_left(),
+            event: Some(AnnounceEvent::Stopped),
+            num_want: Some(0),
+            key: None,
+        };
+        let http = self.env.http.get();
+        let _ = tracker::announce(&http, url, &request, Duration::from_secs(5)).await;
+    }
+
     async fn tracker_loop(self: Arc<Self>, url: String) {
         let mut first = true;
         let mut failures: u32 = 0;
+        let mut stopped = false;
         loop {
             if self.stopping() {
+                if !stopped {
+                    self.announce_stopped(&url).await;
+                }
                 break;
             }
             // Адрес могли убрать из списка вручную — цикл больше не нужен.
             if !rd(&self.stats.trackers).contains(&url) {
+                if !stopped {
+                    self.announce_stopped(&url).await;
+                }
                 break;
             }
             if self.flags.paused() {
+                if !stopped {
+                    self.announce_stopped(&url).await;
+                    stopped = true;
+                }
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 continue;
+            }
+            if stopped {
+                // Вернулись в работу: трекер снова должен видеть нас активными.
+                first = true;
+                stopped = false;
             }
             // `left` и признак завершения — по нужным файлам: трекер ждёт
             // остаток именно того, что пользователь выбрал скачать.

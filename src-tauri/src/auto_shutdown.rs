@@ -231,7 +231,7 @@ mod tests {
             eta_seconds: None,
             // P2: счётчик ratio и признак лимита раздачи к тесту отношения не
             // имеют — берём значения по умолчанию.
-            seed_ratio: 0.0,
+            seed_ratio: Some(0.0),
             seed_limit_reached: false,
             wanted_bytes: 1024,
             remaining_bytes: 0,

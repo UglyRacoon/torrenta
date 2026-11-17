@@ -132,7 +132,11 @@ impl AppStateDto {
             torrent.eta_seconds.hash(&mut dynamic);
             // Ratio растёт почти каждый тик, как и скорости: без него счётчик в
             // интерфейсе «замирал» бы до следующего значимого изменения.
-            torrent.seed_ratio.to_bits().hash(&mut dynamic);
+            torrent
+                .seed_ratio
+                .unwrap_or(f64::INFINITY)
+                .to_bits()
+                .hash(&mut dynamic);
         }
 
         StateFingerprint {
@@ -442,7 +446,7 @@ mod tests {
             eta_seconds: None,
             // P2: счётчик ratio и признак «лимит раздачи достигнут» приходят из
             // движка, у нового торрента они нулевые.
-            seed_ratio: 0.0,
+            seed_ratio: Some(0.0),
             seed_limit_reached: false,
             wanted_bytes: 1024,
             remaining_bytes: 1024,
@@ -537,7 +541,7 @@ mod tests {
         // счётчик в интерфейсе не обновлялся бы.
         let a = state_with(vec![torrent(1, TorrentState::Seeding)]);
         let mut b = a.clone();
-        b.torrents[0].seed_ratio = 1.25;
+        b.torrents[0].seed_ratio = Some(1.25);
         assert_eq!(a.fingerprints().significant, b.fingerprints().significant);
         assert_ne!(a.fingerprints().dynamic, b.fingerprints().dynamic);
 

@@ -90,7 +90,12 @@ function hashString(value: string): number {
 }
 
 /** Ratio из снимка (1.6): движок уже поделил отдано на скачано. */
-function seedRatioText(ratio: number): string {
+function seedRatioText(ratio: number | null): string {
+  // `null` — данные уже лежали на диске: скачано 0 байт, а отдача идёт,
+  // поэтому коэффициент бесконечен (а не «×0,00»).
+  if (ratio === null) {
+    return "×∞";
+  }
   // Два знака и десятичная запятая — как у остальных чисел интерфейса.
   const safe = Number.isFinite(ratio) && ratio > 0 ? ratio : 0;
   return `×${safe.toFixed(2).replace(".", ",")}`;
@@ -1027,7 +1032,12 @@ export function createDetails(mount: HTMLElement, options: DetailsOptions): Deta
     setText(uploaded.sub, "за сессию");
     // Ratio из снимка (1.6): если ещё ничего не скачано, движок отдаёт 0.0 —
     // показываем прочерк, а не «×0,00».
-    setText(ratio.value, torrent.downloaded_bytes > 0 ? seedRatioText(torrent.seed_ratio) : "—");
+    setText(
+      ratio.value,
+      torrent.downloaded_bytes > 0 || torrent.uploaded_bytes > 0
+        ? seedRatioText(torrent.seed_ratio)
+        : "—",
+    );
     setText(ratio.sub, "Отдано/скачано");
     setText(left.value, remaining > 0 ? fmtBytes(remaining) : "—");
     setText(

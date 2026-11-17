@@ -79,8 +79,12 @@ function plausibleSize(seed: string): number {
  * Соотношение отдано/скачано как в движке (1.6): при нулевом скачивании — 0.0,
  * поэтому деления на ноль и NaN здесь не бывает.
  */
-function ratioOf(uploaded: number, downloaded: number): number {
-  return downloaded > 0 ? uploaded / downloaded : 0;
+function ratioOf(uploaded: number, downloaded: number): number | null {
+  if (downloaded > 0) {
+    return uploaded / downloaded;
+  }
+  // Данные уже были на диске: скачано 0, но отдача идёт — коэффициент «∞».
+  return uploaded > 0 ? null : 0;
 }
 
 function baseName(name: string): string {

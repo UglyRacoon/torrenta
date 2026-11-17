@@ -59,6 +59,12 @@ pub(crate) const REQUEST_WINDOW_MAX: usize = 512;
 /// оседают в очереди кандидатов и подключаются по мере освобождения мест.
 pub(crate) const ANNOUNCE_NUM_WANT: u32 = 200;
 /// Период тика статистики.
+/// Сколько входящих рукопожатий обслуживаем одновременно.
+///
+/// Лимит пиров действует уже после обмена handshake, поэтому без этого
+/// счётчика поток чужих TCP-подключений успевал занять память и задачи.
+const INCOMING_HANDSHAKES: usize = 64;
+
 const STATS_TICK: Duration = Duration::from_millis(500);
 /// Сколько отсчётов скорости показываем в UI (16 × 500 мс = 8 секунд).
 ///
@@ -708,7 +714,9 @@ pub struct TorrentSnapshot {
     pub up_limit_kib: u32,
     pub eta_seconds: Option<u64>,
     /// Соотношение отдано/скачано (0.0, если скачано ещё ничего).
-    pub seed_ratio: f64,
+    /// Коэффициент раздачи: None — бесконечность (данные уже были на диске,
+    /// скачано этим клиентом ноль байт).
+    pub seed_ratio: Option<f64>,
     /// Сработал лимит раздачи: торрент ждёт ручного возобновления.
     pub seed_limit_reached: bool,
     /// Последовательная загрузка включена для этого торрента.
@@ -908,6 +916,9 @@ pub enum EngineEvent {
 pub(crate) struct Flags {
     /// Работа остановлена: пауза пользователя или очередь планировщика.
     paused: AtomicBool,
+    /// Остановлено настройкой «не раздавать после завершения» (состояние
+    /// остаётся `Completed`, а не `Paused`).
+    seed_off: AtomicBool,
     /// Пользователь нажал «пауза»; такая пауза важнее лимитов очереди.
     user_paused: AtomicBool,
     /// Идёт перепроверка кусков на диске.
@@ -922,6 +933,16 @@ impl Flags {
 
     pub(crate) fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Раздача остановлена настройкой «не раздавать после завершения»:
+    /// обмен стоит, но состояние остаётся «завершён».
+    pub(crate) fn seed_off(&self) -> bool {
+        self.seed_off.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_seed_off(&self, value: bool) {
+        self.seed_off.store(value, Ordering::Relaxed);
     }
 
     pub(crate) fn user_paused(&self) -> bool {
@@ -1005,10 +1026,19 @@ impl SeedMeter {
     }
 }
 
-/// Соотношение отдано/скачано; при нулевом скачивании считается нулевым.
+/// Соотношение отдано/скачано.
+///
+/// Если данные уже лежали на диске (проверка нашла готовый торрент),
+/// скачано этим клиентом ноль байт, но отдача идёт: коэффициент тогда
+/// бесконечен, а не нулевой. Ноль означал бы «ничего не отдано» и никогда
+/// не достигал лимита раздачи.
 fn seed_ratio(uploaded: u64, downloaded: u64) -> f64 {
     if downloaded == 0 {
-        0.0
+        if uploaded == 0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
     } else {
         uploaded as f64 / downloaded as f64
     }
@@ -1410,9 +1440,14 @@ fn schedule(inner: &Arc<Inner>) {
         .collect();
     let active: std::collections::HashSet<u64> = plan(&entries, limits).into_iter().collect();
     for (handle, kind) in handles.iter().zip(kinds.iter()) {
-        // `Idle` — проверка, ошибка, пауза пользователя или выключенная раздача:
-        // слот такому торренту не нужен, и в очередь его ставить нельзя.
+        // `Idle` — проверка, ошибка, пауза пользователя, выключенная раздача
+        // или сработавший лимит раздачи: слот такому торренту не нужен.
         if *kind == PlanKind::Idle {
+            // Но «не нужен слот» не значит «можно продолжать обмен»: при
+            // выключенной раздаче или лимите торрент обязан встать, иначе
+            // session_loop продолжает отдавать блоки, а трекер и кондуктор
+            // работают, хотя интерфейс показывает паузу.
+            handle.stop_for_idle();
             continue;
         }
         if active.contains(&handle.id) {
@@ -1526,9 +1561,13 @@ impl TorrentHandle {
         if !self.flags.paused() {
             return state;
         }
-        // Очередь планировщика и пауза пользователя выглядят по-разному.
+        // Очередь планировщика, пауза пользователя и «не раздавать после
+        // завершения» выглядят по-разному.
         if state == TorrentState::Queued {
             TorrentState::Queued
+        } else if self.flags.seed_off() {
+            // Раздача выключена настройкой: обмен стоит, торрент завершён.
+            TorrentState::Completed
         } else {
             TorrentState::Paused
         }
@@ -1572,6 +1611,7 @@ impl TorrentHandle {
         };
         let was_paused = self.flags.paused();
         self.flags.set_paused(false);
+        self.flags.set_seed_off(false);
         if *lk(&self.stats.state) != target {
             self.set_state(target);
         }
@@ -1596,6 +1636,43 @@ impl TorrentHandle {
                 }
             }
         }
+    }
+
+    /// Останавливает обмен у готового торрента, которому не нужен слот:
+    /// раздача выключена в настройках или сработал лимит ratio/времени.
+    ///
+    /// В отличие от [`TorrentHandle::park`] состояние — `Paused`, а не
+    /// `Queued`: торрент не ждёт очередь, он именно остановлен до ручного
+    /// возобновления (так это и обещает CORE_API).
+    fn stop_for_idle(&self) {
+        if self.flags.removed() || self.flags.checking() || self.flags.user_paused() {
+            return;
+        }
+        if *lk(&self.stats.state) == TorrentState::Error {
+            return;
+        }
+        let Some(runtime) = self.runtime_clone() else {
+            return;
+        };
+        // Останавливаем только завершённые раздачи: незавершённый торрент без
+        // слота уже припаркован планировщиком, и трогать его не нужно.
+        if !runtime.is_complete() {
+            return;
+        }
+        let limited = self.seed_meter.limit_reached();
+        // После проверки торрент может уже стоять в паузе: причину всё равно
+        // надо зафиксировать, иначе «не раздавать» выглядит как пауза.
+        self.flags.set_seed_off(!limited);
+        self.flags.set_paused(true);
+        self.release_writes();
+        self.set_state(if limited {
+            TorrentState::Paused
+        } else {
+            // «Не раздавать после завершения»: торрент завершён, обмен стоит.
+            TorrentState::Completed
+        });
+        // Трекеру сообщаем stopped: раздача остановлена, а не упала.
+        runtime.wake_announcer();
     }
 
     /// Ставит торрент в очередь: работа замирает, файлы закрываются на запись.
@@ -1631,6 +1708,11 @@ impl TorrentHandle {
         self.flags.set_user_paused(true);
         self.flags.set_paused(true);
         self.release_writes();
+        // Будим трекер: иначе event=stopped ждал бы конца интервала announce
+        // (до 30 минут), и мы висели бы в списке пиров трекера.
+        if let Some(runtime) = self.runtime_clone() {
+            runtime.wake_announcer();
+        }
         if *lk(&self.stats.state) != TorrentState::Paused {
             self.set_state(TorrentState::Paused);
         }
@@ -1789,7 +1871,15 @@ impl TorrentHandle {
             down_limit_kib: effective_limit(self.env.now.down_kib(), limits.down_kib),
             up_limit_kib: effective_limit(self.env.now.up_kib(), limits.up_kib),
             eta_seconds: eta,
-            seed_ratio: seed_ratio(uploaded, downloaded),
+            seed_ratio: if downloaded == 0 {
+                if uploaded == 0 {
+                    Some(0.0)
+                } else {
+                    None
+                }
+            } else {
+                Some(uploaded as f64 / downloaded as f64)
+            },
             seed_limit_reached: self.seed_meter.limit_reached(),
             sequential: self.sequential.load(Ordering::Relaxed),
             save_path: self.save_dir.to_string_lossy().into_owned(),
@@ -1864,6 +1954,10 @@ struct Inner {
     limits_now: Arc<EffectiveLimits>,
     /// Момент создания менеджера: от него считается `uptime_secs`.
     started: Instant,
+    /// Слоты на входящие рукопожатия: без них поток чужих TCP-подключений
+    /// съедает память до того, как сработает лимит пиров (он действует уже
+    /// после обмена handshake).
+    incoming_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Менеджер торрентов — единственная точка входа движка для Tauri-бэкенда.
@@ -1899,6 +1993,7 @@ impl TorrentManager {
                 dht: Arc::new(RwLock::new(None)),
                 limits_now: Arc::new(EffectiveLimits::default()),
                 started: Instant::now(),
+                incoming_slots: Arc::new(tokio::sync::Semaphore::new(INCOMING_HANDSHAKES)),
             }),
         });
         // Расписание может быть активным уже на старте: считаем лимиты сразу,
@@ -2358,6 +2453,9 @@ impl TorrentManager {
         handle.flags.set_user_paused(false);
         // Ручное возобновление обнуляет лимит раздачи: сид получает новый отрезок.
         handle.seed_meter.reset();
+        if let Some(runtime) = handle.runtime_clone() {
+            runtime.wake_announcer();
+        }
         // Дальше решает планировщик: активных торрентов может быть уже достаточно,
         // и тогда торрент подождёт в очереди.
         self.schedule();
@@ -2380,6 +2478,9 @@ impl TorrentManager {
             handle.flags.set_user_paused(false);
             // Как и одиночное возобновление: лимит раздачи начинается заново.
             handle.seed_meter.reset();
+            if let Some(runtime) = handle.runtime_clone() {
+                runtime.wake_announcer();
+            }
         }
         // Очередь распределит слоты по тем же правилам, что и при старте.
         self.schedule();
@@ -2752,8 +2853,11 @@ async fn accept_loop(inner: Arc<Inner>) {
             match crate::utp::UtpListener::start(bind).await {
                 Ok((_addr, mut incoming)) => {
                     while let Some(stream) = incoming.recv().await {
+                        let Ok(slot) = utp_inner.incoming_slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
                         let inner = utp_inner.clone();
-                        tokio::spawn(async move { handle_utp_incoming(inner, stream).await });
+                        tokio::spawn(async move { handle_utp_incoming(inner, stream, slot).await });
                     }
                 }
                 Err(err) => eprintln!("[torrenta] uTP не запустился: {err}"),
@@ -2772,8 +2876,14 @@ async fn accept_loop(inner: Arc<Inner>) {
         };
         match incoming {
             Some(Ok((stream, addr))) => {
+                // Слот на рукопожатие: при потоке подключений лишние сразу
+                // закрываются, не занимая задачу и память.
+                let Ok(slot) = inner.incoming_slots.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let inner = inner.clone();
-                tokio::spawn(async move { handle_incoming(inner, stream, addr).await });
+                tokio::spawn(async move { handle_incoming(inner, stream, addr, slot).await });
             }
             Some(Err(_)) => tokio::time::sleep(Duration::from_millis(300)).await,
             None => {}
@@ -2782,7 +2892,12 @@ async fn accept_loop(inner: Arc<Inner>) {
     // Сокет освобождается вместе с `listener` здесь же.
 }
 
-async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketAddr) {
+async fn handle_incoming(
+    inner: Arc<Inner>,
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
     let _ = stream.set_nodelay(true);
     // Определяем протокол по первым байтам, не забирая их из сокета: открытый
     // BitTorrent начинается с 0x13 "BitTorrent protocol", а MSE — со случайного
@@ -2812,6 +2927,9 @@ async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketA
             Ok(remote) => remote,
             Err(_) => return,
         };
+        // Рукопожатие завершено: слот свободен, дальше соединение учитывает
+        // лимит пиров самого торрента.
+        drop(slot);
         dispatch_incoming(inner, addr, stream, remote).await;
         return;
     }
@@ -2842,12 +2960,19 @@ async fn handle_incoming(inner: Arc<Inner>, mut stream: TcpStream, addr: SocketA
         Ok(remote) => remote,
         Err(_) => return,
     };
+    // Рукопожатие завершено: слот свободен, дальше соединение учитывает
+    // лимит пиров самого торрента.
+    drop(slot);
     dispatch_incoming(inner, addr, stream, remote).await;
 }
 
 /// Входящее uTP-соединение: те же правила, что для TCP, но поток нельзя
 /// «подсмотреть», поэтому первые 20 байт читаются и передаются в разбор.
-async fn handle_utp_incoming(inner: Arc<Inner>, mut stream: crate::utp::UtpStream) {
+async fn handle_utp_incoming(
+    inner: Arc<Inner>,
+    mut stream: crate::utp::UtpStream,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
     let addr = stream.peer_addr();
     let mut head = [0u8; 20];
     if read_exact_timeout(&mut stream, &mut head, Duration::from_secs(10))
@@ -2870,6 +2995,9 @@ async fn handle_utp_incoming(inner: Arc<Inner>, mut stream: crate::utp::UtpStrea
             Ok(remote) => remote,
             Err(_) => return,
         };
+        // Рукопожатие завершено: слот свободен, дальше соединение учитывает
+        // лимит пиров самого торрента.
+        drop(slot);
         dispatch_incoming(inner, addr, stream, remote).await;
         return;
     }
@@ -2899,6 +3027,9 @@ async fn handle_utp_incoming(inner: Arc<Inner>, mut stream: crate::utp::UtpStrea
         Ok(remote) => remote,
         Err(_) => return,
     };
+    // Рукопожатие завершено: слот свободен, дальше соединение учитывает
+    // лимит пиров самого торрента.
+    drop(slot);
     dispatch_incoming(inner, addr, stream, remote).await;
 }
 
@@ -3214,8 +3345,10 @@ mod tests {
 
     #[test]
     fn seed_ratio_counts_only_downloaded_bytes() {
-        // Скачано 0 — соотношение неизвестно, показываем ноль.
-        assert_eq!(seed_ratio(5_000, 0), 0.0);
+        // Готовые данные: скачано 0, но отдано — коэффициент бесконечен,
+        // иначе лимит раздачи не срабатывал бы никогда (D11).
+        assert!(seed_ratio(5_000, 0).is_infinite());
+        assert_eq!(seed_ratio(0, 0), 0.0);
         assert_eq!(seed_ratio(0, 1_000), 0.0);
         assert_eq!(seed_ratio(1_500, 1_000), 1.5);
         // Отдали меньше, чем скачали, — доля меньше единицы.

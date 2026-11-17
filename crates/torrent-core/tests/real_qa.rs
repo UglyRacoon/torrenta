@@ -253,7 +253,7 @@ async fn real_seed_uploads_and_totals_survive_restart() {
         .find(|item| item.id == restarted_id)
         .expect("снимок есть");
     println!(
-        "QA-SEED restore uploaded={} downloaded={} ratio={}",
+        "QA-SEED restore uploaded={} downloaded={} ratio={:?}",
         after.uploaded_bytes, after.downloaded_bytes, after.seed_ratio
     );
     assert_eq!(after.uploaded_bytes, uploaded, "отданное не восстановилось");

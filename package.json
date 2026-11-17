@@ -1,7 +1,7 @@
 {
   "name": "torrenta",
   "private": true,
-  "version": "1.9.0",
+  "version": "1.9.1",
   "type": "module",
   "description": "Torrenta — лёгкий торрент-клиент на Rust + Tauri 2",
   "scripts": {
