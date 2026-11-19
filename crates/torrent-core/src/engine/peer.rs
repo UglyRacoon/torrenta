@@ -22,6 +22,9 @@ use crate::wire::{Handshake, Message, HANDSHAKE_LEN};
 /// Таймаут установки TCP-соединения.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Таймаут ожидания данных от пира.
+/// Сколько ждём отправки сообщения, прежде чем признать пира нечитающим.
+const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Период служебных действий (запросы, keep-alive).
 const TICK: Duration = Duration::from_millis(250);
@@ -390,11 +393,9 @@ where
             // протокола: запрос просто игнорируется, соединение остаётся живым.
 
             if !runtime.can_upload_now() {
-                // Лимит отдачи исчерпан: закрываем пиру кран (Choke), а не
-                // молчим на запрос — иначе он повторяет его по кругу.
-                send(writer, &Message::Choke).await?;
-                runtime.set_am_choking(id, true);
-                out.wrote();
+                // Бюджета нет — запрос не отбрасываем и не душим пира, а
+                // откладываем: он уйдёт, как только ведро пополнится (D10).
+                runtime.defer_upload(id, index, begin, length);
             } else if let Ok(data) = runtime.upload(index, begin, length) {
                 let sent = data.len();
                 send(writer, &Message::Piece { index, begin, data }).await?;
@@ -610,6 +611,19 @@ async fn tick<W: AsyncWrite + Unpin>(
         out.wrote();
     }
 
+    // Отложенные из-за лимита запросы: отдаём, пока есть бюджет.
+    while let Some((index, begin, length)) = runtime.next_pending_upload(id) {
+        match runtime.upload(index, begin, length) {
+            Ok(data) => {
+                let sent = data.len();
+                send(writer, &Message::Piece { index, begin, data }).await?;
+                out.wrote();
+                runtime.add_uploaded(id, sent);
+            }
+            Err(_) => break,
+        }
+    }
+
     if !pump_requests(runtime, id, writer, out).await? && out.last_write.elapsed() >= KEEPALIVE {
         send(writer, &Message::KeepAlive).await?;
         out.wrote();
@@ -655,9 +669,12 @@ async fn pump_requests<W: AsyncWrite + Unpin>(
 
 /// Отправляет сообщение и сбрасывает буфер.
 async fn send<W: AsyncWrite + Unpin>(writer: &mut W, message: &Message) -> Result<(), String> {
-    writer
-        .write_all(&message.encode())
+    // Пишущий, но не читающий пир не должен вешать сессию навсегда и держать
+    // слот: запись ограничена по времени (D19).
+    let encoded = message.encode();
+    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&encoded))
         .await
+        .map_err(|_| "запись: таймаут отправки (пир не читает)".to_string())?
         .map_err(|err| format!("запись: {err}"))
 }
 

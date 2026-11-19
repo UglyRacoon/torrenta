@@ -1278,6 +1278,21 @@ impl Stats {
         }
     }
 
+    /// Сбрасывает базовую линию скорости на восстановленные счётчики (D25).
+    ///
+    /// Без этого первый тик после перезапуска видит «uploaded — 0» и
+    /// показывает десятки гигабайт в секунду.
+    pub(crate) fn reset_rate_baseline(&self, uploaded: u64) {
+        self.last_up.store(uploaded, Ordering::Relaxed);
+        self.last_down
+            .store(self.wire_down.load(Ordering::Relaxed), Ordering::Relaxed);
+        lk(&self.down_window).clear();
+        lk(&self.up_window).clear();
+        lk(&self.down_long).clear();
+        self.down_rate.store(0f64.to_bits(), Ordering::Relaxed);
+        self.up_rate.store(0f64.to_bits(), Ordering::Relaxed);
+    }
+
     /// Скорость для оценки остатка, байт/с.
     ///
     /// Берём длинное окно, но пока оно не наполнилось наполовину (первые
@@ -1559,6 +1574,12 @@ impl TorrentHandle {
         }
         let state = *lk(&self.stats.state);
         if !self.flags.paused() {
+            // Ошибка (трекер отверг, диск) важнее рабочего состояния, но
+            // пользовательская пауза важнее ошибки: на паузе состояние
+            // остаётся «пауза», а текст ошибки виден в снимке.
+            if rd(&self.stats.error).is_some() {
+                return TorrentState::Error;
+            }
             return state;
         }
         // Очередь планировщика, пауза пользователя и «не раздавать после
@@ -1603,6 +1624,12 @@ impl TorrentHandle {
 
     /// Возвращает торрент в работу: планировщик выдал ему слот.
     fn activate(self: &Arc<Self>, kind: PlanKind) {
+        // Пока планировщик шёл к торренту, трекер мог сообщить об ошибке.
+        // Состояние ошибки важнее решения очереди: иначе она затрётся
+        // «скачивается» и торрент будет выглядеть живым.
+        if *lk(&self.stats.state) == TorrentState::Error {
+            return;
+        }
         let target = match kind {
             PlanKind::Download if self.runtime_clone().is_some() => TorrentState::Downloading,
             PlanKind::Download => TorrentState::Metadata,
@@ -2073,6 +2100,11 @@ impl TorrentManager {
         }
         let dir = opts.save_path.unwrap_or_else(|| self.config().download_dir);
         let layout = opts.content_layout.unwrap_or(self.config().content_layout);
+        // D22: проверяем готовые данные до создания хранилища — предвыделение
+        // создаёт файлы нужного размера, и после него «готовым» выглядит любой.
+        let existing = layout_paths(&meta.info.name, &meta.info.files, layout)
+            .iter()
+            .any(|relative| dir.join(relative).exists());
         let name = meta.info.name.clone();
         let handle = self.make_handle(hash, None, name.clone(), dir, TorrentState::Queued, layout);
         *wr(&handle.selection) = selection;
@@ -2087,6 +2119,11 @@ impl TorrentManager {
         });
         // Лимит активных торрентов мог быть уже исчерпан — новый встанет в очередь.
         self.schedule();
+        // D22: готовые данные на диске (наличие проверено до создания хранилища).
+        if existing {
+            // Рантайм создаёт задача запуска — проверку ставим в очередь.
+            tokio::spawn(Self::recheck_when_ready(self.inner.clone(), handle.clone()));
+        }
         Ok(handle.id)
     }
 
@@ -2280,6 +2317,8 @@ impl TorrentManager {
         let handle = self.find(id).ok_or(EngineError::NotFound(id))?;
         handle.stats.uploaded.store(uploaded, Ordering::Relaxed);
         handle.stats.downloaded.store(downloaded, Ordering::Relaxed);
+        // Скорость считаем от восстановленного счётчика, а не от нуля (D25).
+        handle.stats.reset_rate_baseline(uploaded);
         Ok(())
     }
 
@@ -2526,7 +2565,40 @@ impl TorrentManager {
         Ok(())
     }
 
-    /// Отдаёт карту проверенных кусков для быстрого возобновления.
+    /// Проверяет данные, как только рантайм торрента готов.
+    ///
+    /// Нужно при добавлении готового торрента (D22): сразу после `add_file_with`
+    /// рантайма ещё нет — его создаёт задача запуска, поэтому проверку ставим в
+    /// очередь и ждём готовности.
+    async fn recheck_when_ready(inner: Arc<Inner>, handle: Arc<TorrentHandle>) {
+        for _ in 0..100 {
+            if handle.flags.removed() || inner.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            if handle.flags.checking() {
+                return;
+            }
+            let Some(runtime) = handle.runtime_clone() else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+
+            handle.flags.set_checking(true);
+            handle.flags.set_paused(true);
+            handle.release_writes();
+            handle.stats.pieces_have.store(0, Ordering::Relaxed);
+            handle.set_state(TorrentState::Checking);
+            runtime.verify_all().await;
+            handle.flags.set_checking(false);
+            if handle.flags.removed() || inner.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            schedule(&inner);
+            return;
+        }
+    }
+
+    /// Отдаёт карту проверенных кусков для быстрого возобновления.    /// Отдаёт карту проверенных кусков для быстрого возобновления.
     ///
     /// `NotReady`, пока нет метаданных (magnet) или рантайма (торрент ещё ни
     /// разу не запускался): в этом случае сохранять нечего, и после перезапуска

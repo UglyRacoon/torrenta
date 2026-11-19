@@ -65,6 +65,14 @@ const BLOCK_TIMEOUT: Duration = Duration::from_secs(8);
 /// `Unchoke`, пир не отдаёт нам ничего. Один-два разчокнутых пира дают
 /// тит-фо-тат рейтинг на уровне новичка, и хорошие сиды нас игнорируют.
 const UNCHOKE_SLOTS: usize = 8;
+/// Слотов, которые всегда остаются под входящие подключения.
+const INCOMING_RESERVE: usize = 8;
+/// Как часто сид передаёт слово следующей группе пиров.
+///
+/// Тит-фо-тат по скорости скачивания для сида бессмыслен: у всех пиров
+/// down_rate = 0, ранг вырождается в «кто раньше подключился», и отдача
+/// залипает на первых восьми (D17). Сид обслуживает пиров круговым окном.
+const SEED_ROTATE: Duration = Duration::from_secs(20);
 /// Как часто пробуем нового пира «на удачу».
 ///
 /// Раз в 30 секунд разчокиваем одного случайного пира вне топ-8: без этого
@@ -147,6 +155,8 @@ pub(crate) struct PeerRecord {
     pub(crate) last_down: u64,
     pub(crate) last_up: u64,
     pub(crate) down_rate: f64,
+    /// Запросы блоков, отложенные из-за пустого ведра отдачи (D10).
+    pub(crate) pending_uploads: std::collections::VecDeque<(u32, u32, u32)>,
     pub(crate) up_rate: f64,
     pub(crate) sample_at: Instant,
 }
@@ -172,6 +182,7 @@ impl PeerRecord {
             last_down: 0,
             last_up: 0,
             down_rate: 0.0,
+            pending_uploads: std::collections::VecDeque::new(),
             up_rate: 0.0,
             sample_at: Instant::now(),
         }
@@ -249,6 +260,12 @@ pub(crate) struct RuntimeState {
     /// Адреса, забаненные за повторно испорченные куски (D15): до этого
     /// времени не подключаемся и не принимаем их в очередь.
     pub(crate) banned: HashMap<SocketAddr, Instant>,
+    /// Кому сид раздаёт прямо сейчас (круговое окно, D17).
+    pub(crate) seed_unchoked: Vec<u64>,
+    /// С какого пира начинать следующее окно круговой раздачи.
+    pub(crate) seed_cursor: usize,
+    /// Когда окно раздачи последний раз сдвигалось.
+    pub(crate) seed_turn_at: Instant,
     /// Сколько испорченных кусков пришло с адреса (бан после второго).
     pub(crate) bad_pieces: HashMap<SocketAddr, u32>,
     /// Пир, которому мы разчокиваем «на пробу» вопреки рейтингу.
@@ -419,6 +436,47 @@ fn release_piece(state: &mut RuntimeState, index: u32) {
     state.picker.release(index as usize);
 }
 
+/// Круговое окно раздачи: `ids` — заинтересованные пиры в стабильном порядке.
+///
+/// Возвращает пиров текущего окна и курсор следующего: каждый круг окно
+/// сдвигается на [`UNCHOKE_SLOTS`], поэтому за несколько кругов данные
+/// получают все, а не только первые подключившиеся (D17).
+fn seed_window(ids: &[u64], cursor: usize) -> (Vec<u64>, usize) {
+    if ids.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let len = ids.len();
+    let start = cursor % len;
+    let mut window = Vec::with_capacity(UNCHOKE_SLOTS.min(len));
+    for step in 0..UNCHOKE_SLOTS.min(len) {
+        window.push(ids[(start + step) % len]);
+    }
+    let next = (start + UNCHOKE_SLOTS) % len;
+    (window, next)
+}
+
+/// Пересчитывает окно раздачи, если торрент стал сидом или прошёл срок.
+fn refresh_seed_window(state: &mut RuntimeState) {
+    if !state.picker.is_complete() {
+        state.seed_unchoked.clear();
+        return;
+    }
+    if !state.seed_unchoked.is_empty() && state.seed_turn_at.elapsed() < SEED_ROTATE {
+        return;
+    }
+    let mut interested: Vec<u64> = state
+        .peers
+        .iter()
+        .filter(|(_, peer)| peer.peer_interested)
+        .map(|(id, _)| *id)
+        .collect();
+    interested.sort_unstable();
+    let (window, next) = seed_window(&interested, state.seed_cursor);
+    state.seed_cursor = next;
+    state.seed_unchoked = window;
+    state.seed_turn_at = Instant::now();
+}
+
 /// Позиция пира в тит-фо-тат рейтинге (0 — лучший), либо `None`, если пир не
 /// заинтересован в наших данных и разчокивать его незачем.
 ///
@@ -496,6 +554,9 @@ impl Runtime {
                 retry: HashMap::new(),
                 banned: HashMap::new(),
                 bad_pieces: HashMap::new(),
+                seed_unchoked: Vec::new(),
+                seed_cursor: 0,
+                seed_turn_at: Instant::now(),
                 optimistic: None,
                 optimistic_at: Instant::now(),
                 rng: {
@@ -788,6 +849,17 @@ impl Runtime {
         rd(&self.env.config).max_peers_per_torrent.clamp(1, 200)
     }
 
+    /// Сколько пиров можно набрать исходящими подключениями.
+    ///
+    /// Часть лимита держим под входящие: иначе исчерпанный лимит превращает
+    /// нас в «глухого» личера, которому трекер предлагает пиров, а мы
+    /// отвечаем отказом (D28).
+    fn dial_limit(&self) -> usize {
+        self.max_peers()
+            .saturating_sub((self.max_peers() / 10).max(INCOMING_RESERVE))
+            .max(1)
+    }
+
     // -- подключения --------------------------------------------------------
 
     /// Кладёт адреса пиров в очередь подключения.
@@ -925,8 +997,11 @@ impl Runtime {
             .copied()
             .filter(|addr| !active.contains(addr))
             .collect();
-        for addr in idle {
-            if !state.pending.contains(&addr) {
+        // Ограничиваем пачку и проверяем дубли через множество: при 8192
+        // известных адресах `contains` на каждый цикл давал O(n²) (D29).
+        let mut queued: HashSet<SocketAddr> = state.pending.iter().copied().collect();
+        for addr in idle.into_iter().take(PENDING_LIMIT) {
+            if queued.insert(addr) {
                 state.pending.push_front(addr);
             }
         }
@@ -936,6 +1011,12 @@ impl Runtime {
         let max = self.max_peers();
         let mut state = lk(&self.state);
         state.connecting = state.connecting.saturating_sub(1);
+        // Один адрес — одна сессия: иначе трекер/входящее соединение создают
+        // дубль и два слота уходят впустую (D23).
+        if state.peers.values().any(|peer| peer.addr == addr) {
+            state.seen.remove(&addr);
+            return None;
+        }
         if state.peers.len() >= max {
             // Мест нет — адрес не «сжигаем», а возвращаем в очередь. Иначе пир,
             // которому просто не хватило слота, пропадает до конца сессии: он
@@ -1088,7 +1169,7 @@ impl Runtime {
     /// Пора ли отдавать пиру несжатый поток: он заинтересован, мы его душим и
     /// он входит в число лучших по отдаче нам.
     pub(crate) fn should_unchoke(&self, id: u64) -> bool {
-        let state = lk(&self.state);
+        let mut state = lk(&self.state);
         let Some(peer) = state.peers.get(&id) else {
             return false;
         };
@@ -1098,21 +1179,32 @@ impl Runtime {
         if state.optimistic == Some(id) {
             return true;
         }
+        refresh_seed_window(&mut state);
+        if state.picker.is_complete() {
+            // Сид: круговое окно вместо тит-фо-тата (D17).
+            return state.seed_unchoked.contains(&id);
+        }
         matches!(unchoke_rank(&state, id), Some(rank) if rank < UNCHOKE_SLOTS)
     }
 
     /// Пора ли задушить пира: интерес потерян, либо он вылетел из числа лучших.
     pub(crate) fn should_choke(&self, id: u64) -> bool {
-        let state = lk(&self.state);
+        let mut state = lk(&self.state);
         let Some(peer) = state.peers.get(&id) else {
             return false;
         };
         if peer.am_choking {
             return false;
         }
-        !peer.peer_interested
-            || (state.optimistic != Some(id)
-                && matches!(unchoke_rank(&state, id), Some(rank) if rank >= UNCHOKE_SLOTS))
+        if !peer.peer_interested {
+            return true;
+        }
+        refresh_seed_window(&mut state);
+        if state.picker.is_complete() {
+            return state.optimistic != Some(id) && !state.seed_unchoked.contains(&id);
+        }
+        state.optimistic != Some(id)
+            && matches!(unchoke_rank(&state, id), Some(rank) if rank >= UNCHOKE_SLOTS)
     }
 
     /// Перевыбирает «пробного» пира раз в [`OPTIMISTIC_INTERVAL`].
@@ -1121,6 +1213,9 @@ impl Runtime {
     /// выбор меняется от раза к разу, а зависимости от `rand` у крейта нет.
     pub(crate) fn tick_optimistic(&self) {
         let mut state = lk(&self.state);
+        // Окно раздачи двигается по своему таймеру, независимо от «пробного»
+        // слота: тикер торрента зовёт нас каждые 500 мс.
+        refresh_seed_window(&mut state);
         if state.optimistic_at.elapsed() < OPTIMISTIC_INTERVAL {
             return;
         }
@@ -1614,6 +1709,30 @@ impl Runtime {
         })
     }
 
+    /// Откладывает запрос блока до появления бюджета отдачи.
+    ///
+    /// Молча отбросить запрос — значит получить «пачку и тишину»: пир
+    /// повторит его, а полоса так и не выйдет на выставленный лимит (D10).
+    pub(crate) fn defer_upload(&self, id: u64, index: u32, begin: u32, length: u32) {
+        const MAX_PENDING_UPLOADS: usize = 32;
+        if let Some(peer) = lk(&self.state).peers.get_mut(&id) {
+            if peer.pending_uploads.len() < MAX_PENDING_UPLOADS {
+                peer.pending_uploads.push_back((index, begin, length));
+            }
+        }
+    }
+
+    /// Берёт следующий отложенный запрос, если бюджет отдачи уже есть.
+    pub(crate) fn next_pending_upload(&self, id: u64) -> Option<(u32, u32, u32)> {
+        if !self.can_upload_now() {
+            return None;
+        }
+        lk(&self.state)
+            .peers
+            .get_mut(&id)
+            .and_then(|peer| peer.pending_uploads.pop_front())
+    }
+
     /// Есть ли в ведре отдачи место хотя бы на один блок.
     ///
     /// Нужно пиру: если лимит исчерпан, честнее разчокнуть его позже, чем
@@ -1762,7 +1881,7 @@ impl Runtime {
                 continue;
             }
             self.promote_retries();
-            let max = self.max_peers();
+            let max = self.dial_limit();
             let (active, connecting) = {
                 let state = lk(&self.state);
                 (state.peers.len(), state.connecting)
@@ -1790,6 +1909,11 @@ impl Runtime {
             poll.tick().await;
             if self.stopping() {
                 break;
+            }
+            // Пауза — это и запрет на DHT-анонс: иначе трекер/сеть видят нас
+            // активными, хотя пользователь остановил торрент (D26).
+            if self.flags.paused() {
+                continue;
             }
             let Some(node) = rd(&self.env.dht).clone() else {
                 continue;
@@ -2063,9 +2187,12 @@ impl Runtime {
             // остаток именно того, что пользователь выбрал скачать.
             let left = self.wanted_left();
             let complete = self.is_complete();
+            // Флаг завершения ставим только после успешного announce (D21):
+            // иначе первая же сетевая ошибка «съедала» event=completed навсегда.
+            let completed_now = complete && !self.completed_announced.load(Ordering::Relaxed);
             let event = if first {
                 Some(AnnounceEvent::Started)
-            } else if complete && !self.completed_announced.swap(true, Ordering::Relaxed) {
+            } else if completed_now {
                 Some(AnnounceEvent::Completed)
             } else {
                 None
@@ -2086,6 +2213,9 @@ impl Runtime {
                 Ok(response) => {
                     first = false;
                     failures = 0;
+                    if completed_now {
+                        self.completed_announced.store(true, Ordering::Relaxed);
+                    }
                     self.clear_tracker_failure();
                     self.add_candidates(response.peers);
                     // Размер роя по данным трекера: собственный счётчик пиров
@@ -2098,7 +2228,12 @@ impl Runtime {
                     if let Some(leechers) = response.leechers {
                         self.stats.swarm_leechers.store(leechers, Ordering::Relaxed);
                     }
-                    let interval = response.interval.clamp(30, 1800);
+                    // min_interval — нижняя граница от трекера: игнорировать её
+                    // значит добиться бана (D24).
+                    let interval = response
+                        .interval
+                        .max(response.min_interval.unwrap_or(0))
+                        .clamp(30, 1800);
                     // Завершение из-за смены выбора файлов будит нас раньше,
                     // чтобы `event=completed` ушёл сразу, а не через интервал.
                     wait_wake(&self.announce_pending, Duration::from_secs(interval)).await;
@@ -2206,7 +2341,18 @@ pub(crate) fn install(handle: &Arc<TorrentHandle>, meta: Metainfo) -> Result<(),
     *wr(&handle.meta) = Some(runtime.meta.clone());
     *lk(&handle.runtime) = Some(runtime.clone());
     runtime.start();
-    handle.set_state(TorrentState::Downloading);
+    // Трекер мог отказать, пока шёл запуск: не затираем Error состоянием
+    // «скачивается», иначе бейдж врёт и торрент считается активным.
+    let current = *lk(&handle.stats.state);
+    if !matches!(
+        current,
+        TorrentState::Error
+            | TorrentState::Checking
+            | TorrentState::Paused
+            | TorrentState::Completed
+    ) {
+        handle.set_state(TorrentState::Downloading);
+    }
     Ok(())
 }
 
@@ -2309,6 +2455,22 @@ async fn metadata_task(handle: Arc<TorrentHandle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_window_covers_all_peers_in_rounds() {
+        // D17: 40 заинтересованных пиров, окно 8 — за 5 кругов данные должны
+        // получить все, а не только первые восемь.
+        let peers: Vec<u64> = (1..=40).collect();
+        let mut cursor = 0usize;
+        let mut served = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let (window, next) = seed_window(&peers, cursor);
+            assert_eq!(window.len(), UNCHOKE_SLOTS);
+            served.extend(window);
+            cursor = next;
+        }
+        assert_eq!(served.len(), 40, "каждый пир получает окно за 5 кругов");
+    }
 
     #[test]
     fn retry_backoff_grows_and_caps() {
